@@ -60,7 +60,7 @@ fi
 # Install Python dependencies
 echo "Installing Python dependencies..."
 $VENV_DIR/bin/pip install --upgrade pip --quiet
-$VENV_DIR/bin/pip install requests clickhouse-connect --quiet
+$VENV_DIR/bin/pip install requests clickhouse-connect numpy numpy --quiet
 echo "  Dependencies installed"
 
 # Install Python scripts
