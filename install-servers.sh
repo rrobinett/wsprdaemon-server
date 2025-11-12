@@ -29,29 +29,39 @@ fi
 echo "Creating installation directory..."
 mkdir -p $INSTALL_DIR
 chown $INSTALL_USER:$INSTALL_USER $INSTALL_DIR
+echo "  Created $INSTALL_DIR"
 
-# Create necessary data directories
+# Create necessary data directories (but don't recursively chown if they already exist)
 echo "Creating data directories..."
-mkdir -p /var/spool/wsprdaemon
-mkdir -p /var/lib/wsprdaemon/wsprnet
-mkdir -p /var/lib/wsprdaemon/wsprdaemon
-mkdir -p /var/log/wsprdaemon
-mkdir -p /etc/wsprdaemon
-
-chown -R $INSTALL_USER:$INSTALL_USER /var/spool/wsprdaemon
-chown -R $INSTALL_USER:$INSTALL_USER /var/lib/wsprdaemon
-chown -R $INSTALL_USER:$INSTALL_USER /var/log/wsprdaemon
+for dir in /var/spool/wsprdaemon /var/lib/wsprdaemon/wsprnet /var/lib/wsprdaemon/wsprdaemon /var/log/wsprdaemon /etc/wsprdaemon; do
+    if [[ ! -d "$dir" ]]; then
+        mkdir -p "$dir"
+        chown $INSTALL_USER:$INSTALL_USER "$dir"
+        echo "  Created $dir"
+    else
+        # Just fix ownership of the directory itself, not recursively
+        chown $INSTALL_USER:$INSTALL_USER "$dir"
+        echo "  Directory $dir already exists"
+    fi
+done
+echo "  Data directories ready"
 
 # Create Python virtual environment if it doesn't exist
 if [[ ! -d $VENV_DIR ]]; then
-    echo "Creating Python virtual environment..."
-    sudo -u $INSTALL_USER python3 -m venv $VENV_DIR
+    echo "Creating Python virtual environment at $VENV_DIR..."
+    echo "  This may take a minute..."
+    python3 -m venv $VENV_DIR
+    chown -R $INSTALL_USER:$INSTALL_USER $VENV_DIR
+    echo "  Virtual environment created"
+else
+    echo "Virtual environment already exists at $VENV_DIR"
 fi
 
 # Install Python dependencies
 echo "Installing Python dependencies..."
-$VENV_DIR/bin/pip install --upgrade pip
-$VENV_DIR/bin/pip install requests clickhouse-connect
+$VENV_DIR/bin/pip install --upgrade pip --quiet
+$VENV_DIR/bin/pip install requests clickhouse-connect --quiet
+echo "  Dependencies installed"
 
 # Install Python scripts
 echo "Installing Python scripts..."
@@ -59,6 +69,7 @@ cp "$SCRIPT_DIR/wsprnet_scraper.py" /usr/local/bin/
 cp "$SCRIPT_DIR/wsprdaemon_server.py" /usr/local/bin/
 chmod +x /usr/local/bin/wsprnet_scraper.py
 chmod +x /usr/local/bin/wsprdaemon_server.py
+echo "  Python scripts installed"
 
 # Install wrapper scripts
 echo "Installing wrapper scripts..."
@@ -68,6 +79,7 @@ cp "$SCRIPT_DIR/wsprnet_cache_manager.sh" /usr/local/bin/
 chmod +x /usr/local/bin/wsprnet_scraper.sh
 chmod +x /usr/local/bin/wsprdaemon_server.sh
 chmod +x /usr/local/bin/wsprnet_cache_manager.sh
+echo "  Wrapper scripts installed"
 
 # Install systemd service files
 echo "Installing systemd service files..."
@@ -75,6 +87,7 @@ cp "$SCRIPT_DIR/wsprnet_scraper@.service" /etc/systemd/system/
 cp "$SCRIPT_DIR/wsprdaemon_server@.service" /etc/systemd/system/
 chmod 644 /etc/systemd/system/wsprnet_scraper@.service
 chmod 644 /etc/systemd/system/wsprdaemon_server@.service
+echo "  Service files installed"
 
 # Create configuration files if they don't exist
 if [[ ! -f /etc/wsprdaemon/clickhouse.conf ]]; then
@@ -96,7 +109,9 @@ CLICKHOUSE_WSPRDAEMON_READONLY_PASSWORD="CHANGEME"
 CONFEOF
     chown root:$INSTALL_USER /etc/wsprdaemon/clickhouse.conf
     chmod 640 /etc/wsprdaemon/clickhouse.conf
-    echo "WARNING: Edit /etc/wsprdaemon/clickhouse.conf and set your credentials!"
+    echo "  WARNING: Edit /etc/wsprdaemon/clickhouse.conf and set your credentials!"
+else
+    echo "Configuration file /etc/wsprdaemon/clickhouse.conf already exists"
 fi
 
 if [[ ! -f /etc/wsprdaemon/wsprnet.conf ]]; then
@@ -119,7 +134,9 @@ LOOP_INTERVAL="120"
 CONFEOF
     chown root:$INSTALL_USER /etc/wsprdaemon/wsprnet.conf
     chmod 640 /etc/wsprdaemon/wsprnet.conf
-    echo "WARNING: Edit /etc/wsprdaemon/wsprnet.conf and set your credentials!"
+    echo "  WARNING: Edit /etc/wsprdaemon/wsprnet.conf and set your credentials!"
+else
+    echo "Configuration file /etc/wsprdaemon/wsprnet.conf already exists"
 fi
 
 if [[ ! -f /etc/wsprdaemon/wsprdaemon.conf ]]; then
@@ -140,13 +157,16 @@ EXTRACTION_DIR="/tmp/wsprdaemon"
 CONFEOF
     chown root:$INSTALL_USER /etc/wsprdaemon/wsprdaemon.conf
     chmod 640 /etc/wsprdaemon/wsprdaemon.conf
+else
+    echo "Configuration file /etc/wsprdaemon/wsprdaemon.conf already exists"
 fi
 
 # Reload systemd
+echo "Reloading systemd..."
 systemctl daemon-reload
 
 echo ""
-echo "Installation complete!"
+echo "=== Installation complete! ==="
 echo ""
 echo "Installation directory: $INSTALL_DIR"
 echo "Virtual environment: $VENV_DIR"
