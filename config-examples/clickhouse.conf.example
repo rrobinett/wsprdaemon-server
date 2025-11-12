@@ -1,0 +1,22 @@
+#!/bin/bash
+# ClickHouse Connection Configuration
+# Copy to /etc/wsprdaemon/clickhouse.conf and edit values
+
+# ClickHouse server connection
+CLICKHOUSE_HOST="localhost"
+CLICKHOUSE_PORT="8123"
+
+# Default user password (set during ClickHouse installation)
+CLICKHOUSE_DEFAULT_PASSWORD="changeme_default_password"
+
+# WSPRNET database credentials
+CLICKHOUSE_WSPRNET_ADMIN_USER="wsprnet-admin"
+CLICKHOUSE_WSPRNET_ADMIN_PASSWORD="changeme_wsprnet_admin"
+CLICKHOUSE_WSPRNET_READONLY_USER="wsprnet-reader"
+CLICKHOUSE_WSPRNET_READONLY_PASSWORD="changeme_wsprnet_reader"
+
+# WSPRDAEMON database credentials
+CLICKHOUSE_WSPRDAEMON_ADMIN_USER="wsprdaemon-admin"
+CLICKHOUSE_WSPRDAEMON_ADMIN_PASSWORD="changeme_wsprdaemon_admin"
+CLICKHOUSE_WSPRDAEMON_READONLY_USER="wsprdaemon-reader"
+CLICKHOUSE_WSPRDAEMON_READONLY_PASSWORD="changeme_wsprdaemon_reader"

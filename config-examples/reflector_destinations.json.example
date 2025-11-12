@@ -1,0 +1,25 @@
+{
+  "incoming_pattern": "/home/*/uploads/*.tbz",
+  "spool_base_dir": "/var/spool/wsprdaemon/reflector",
+  "destinations": [
+    {
+      "name": "SERVER1",
+      "user": "wsprdaemon",
+      "host": "server1.example.com",
+      "path": "/var/spool/wsprdaemon/incoming"
+    },
+    {
+      "name": "SERVER2",
+      "user": "wsprdaemon",
+      "host": "server2.example.com",
+      "path": "/var/spool/wsprdaemon/incoming"
+    }
+  ],
+  "scan_interval": 10,
+  "rsync_interval": 5,
+  "rsync_bandwidth_limit": 20000,
+  "rsync_timeout": 300,
+  "log_file": "/var/log/wsprdaemon/reflector.log",
+  "log_max_mb": 10,
+  "verbosity": 1
+}

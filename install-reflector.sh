@@ -1,6 +1,5 @@
 #!/bin/bash
 # install-reflector.sh - Install WSPRDAEMON Reflector Service
-# This service distributes uploaded .tbz files to multiple destination servers
 
 set -e
 
@@ -10,12 +9,18 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-echo "Installing WSPRDAEMON Reflector as systemd service..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_USER="wsprdaemon"
+VENV_DIR="/home/$INSTALL_USER/wsprdaemon-server/venv"
+
+echo "Installing WSPRDAEMON Reflector Service..."
+echo "Script directory: $SCRIPT_DIR"
+echo "Virtual environment: $VENV_DIR"
 
 # Create wsprdaemon user if it doesn't exist
-if ! id -u wsprdaemon >/dev/null 2>&1; then
-    echo "Creating wsprdaemon user..."
-    useradd -r -s /bin/bash -d /home/wsprdaemon -m wsprdaemon
+if ! id -u $INSTALL_USER >/dev/null 2>&1; then
+    echo "Creating $INSTALL_USER user..."
+    useradd -r -s /bin/bash -d /home/$INSTALL_USER -m $INSTALL_USER
 fi
 
 # Create necessary directories
@@ -25,31 +30,29 @@ mkdir -p /var/lib/wsprdaemon
 mkdir -p /var/log/wsprdaemon
 mkdir -p /etc/wsprdaemon
 
-chown -R wsprdaemon:wsprdaemon /var/spool/wsprdaemon
-chown -R wsprdaemon:wsprdaemon /var/lib/wsprdaemon
-chown -R wsprdaemon:wsprdaemon /var/log/wsprdaemon
+chown -R $INSTALL_USER:$INSTALL_USER /var/spool/wsprdaemon
+chown -R $INSTALL_USER:$INSTALL_USER /var/lib/wsprdaemon
+chown -R $INSTALL_USER:$INSTALL_USER /var/log/wsprdaemon
 
 # Create Python virtual environment if it doesn't exist
-if [[ ! -d /home/wsprdaemon/wsprdaemon/venv ]]; then
+if [[ ! -d $VENV_DIR ]]; then
     echo "Creating Python virtual environment..."
-    mkdir -p /home/wsprdaemon/wsprdaemon
-    python3 -m venv /home/wsprdaemon/wsprdaemon/venv
-    chown -R wsprdaemon:wsprdaemon /home/wsprdaemon/wsprdaemon
+    sudo -u $INSTALL_USER python3 -m venv $VENV_DIR
 fi
 
 # Install Python scripts
 echo "Installing Python script..."
-cp wsprdaemon_reflector.py /usr/local/bin/
+cp "$SCRIPT_DIR/wsprdaemon_reflector.py" /usr/local/bin/
 chmod +x /usr/local/bin/wsprdaemon_reflector.py
 
 # Install wrapper script
 echo "Installing wrapper script..."
-cp wsprdaemon_reflector.sh /usr/local/bin/
+cp "$SCRIPT_DIR/wsprdaemon_reflector.sh" /usr/local/bin/
 chmod +x /usr/local/bin/wsprdaemon_reflector.sh
 
 # Install systemd service file
 echo "Installing systemd service file..."
-cp wsprdaemon_reflector@.service /etc/systemd/system/
+cp "$SCRIPT_DIR/wsprdaemon_reflector@.service" /etc/systemd/system/
 chmod 644 /etc/systemd/system/wsprdaemon_reflector@.service
 
 # Create example configuration if none exists
@@ -82,7 +85,7 @@ if [[ ! -f /etc/wsprdaemon/reflector_destinations.json ]]; then
   "verbosity": 1
 }
 JSONEOF
-    chown wsprdaemon:wsprdaemon /etc/wsprdaemon/reflector_destinations.json
+    chown $INSTALL_USER:$INSTALL_USER /etc/wsprdaemon/reflector_destinations.json
     chmod 644 /etc/wsprdaemon/reflector_destinations.json
     echo ""
     echo "IMPORTANT: Edit /etc/wsprdaemon/reflector_destinations.json with your actual server details"

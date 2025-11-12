@@ -1,0 +1,27 @@
+#!/bin/bash
+# WSPRNET Scraper Configuration
+# Copy to /etc/wsprdaemon/wsprnet.conf and edit values
+
+# Source ClickHouse configuration (shared with wsprdaemon)
+if [[ -f /etc/wsprdaemon/clickhouse.conf ]]; then
+    source /etc/wsprdaemon/clickhouse.conf
+fi
+
+# WSPRNET.org credentials (REQUIRED - register at wsprnet.org)
+WSPRNET_USERNAME="your_wsprnet_username"
+WSPRNET_PASSWORD="your_wsprnet_password"
+
+# Verbosity level (0=WARNING+ERROR only, 1=INFO, 2+=DEBUG)
+VERBOSITY="1"
+
+# Paths (typically don't need to change)
+SESSION_FILE="/var/lib/wsprdaemon/wsprnet_session.json"
+LOG_FILE="/var/log/wsprdaemon/wsprnet_scraper.log"
+LOG_MAX_MB="10"
+
+# Python environment
+VENV_PYTHON="/opt/wsprdaemon-server/venv/bin/python3"
+SCRAPER_SCRIPT="/usr/local/bin/wsprnet_scraper.py"
+
+# Runtime settings
+LOOP_INTERVAL="120"  # Seconds between scrape cycles

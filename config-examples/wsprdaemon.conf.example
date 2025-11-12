@@ -1,0 +1,23 @@
+#!/bin/bash
+# WSPRDAEMON Server Configuration
+# Copy to /etc/wsprdaemon/wsprdaemon.conf and edit values
+
+# Source ClickHouse configuration (shared with wsprnet)
+if [[ -f /etc/wsprdaemon/clickhouse.conf ]]; then
+    source /etc/wsprdaemon/clickhouse.conf
+fi
+
+# Verbosity level (0=WARNING+ERROR only, 1=INFO, 2+=DEBUG)
+VERBOSITY="1"
+
+# Paths (typically don't need to change)
+LOG_FILE="/var/log/wsprdaemon/wsprdaemon_server.log"
+LOG_MAX_MB="10"
+
+# Python environment
+VENV_PYTHON="/opt/wsprdaemon-server/venv/bin/python3"
+SCRAPER_SCRIPT="/usr/local/bin/wsprdaemon_server.py"
+
+# Runtime settings
+LOOP_INTERVAL="10"  # Seconds between processing cycles
+EXTRACTION_DIR="/tmp/wsprdaemon"
