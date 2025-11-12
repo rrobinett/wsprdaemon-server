@@ -11,10 +11,12 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_USER="wsprdaemon"
-VENV_DIR="/home/$INSTALL_USER/wsprdaemon-server/venv"
+INSTALL_DIR="/opt/wsprdaemon-server"
+VENV_DIR="$INSTALL_DIR/venv"
 
 echo "Installing WSPRDAEMON Server Services..."
 echo "Script directory: $SCRIPT_DIR"
+echo "Installation directory: $INSTALL_DIR"
 echo "Virtual environment: $VENV_DIR"
 
 # Create wsprdaemon user if it doesn't exist
@@ -23,7 +25,12 @@ if ! id -u $INSTALL_USER >/dev/null 2>&1; then
     useradd -r -s /bin/bash -d /home/$INSTALL_USER -m $INSTALL_USER
 fi
 
-# Create necessary directories
+# Create installation directory
+echo "Creating installation directory..."
+mkdir -p $INSTALL_DIR
+chown $INSTALL_USER:$INSTALL_USER $INSTALL_DIR
+
+# Create necessary data directories
 echo "Creating data directories..."
 mkdir -p /var/spool/wsprdaemon
 mkdir -p /var/lib/wsprdaemon/wsprnet
@@ -106,7 +113,7 @@ VERBOSITY="1"
 SESSION_FILE="/var/lib/wsprdaemon/wsprnet_session.json"
 LOG_FILE="/var/log/wsprdaemon/wsprnet_scraper.log"
 LOG_MAX_MB="10"
-VENV_PYTHON="/home/wsprdaemon/wsprdaemon-server/venv/bin/python3"
+VENV_PYTHON="/opt/wsprdaemon-server/venv/bin/python3"
 SCRAPER_SCRIPT="/usr/local/bin/wsprnet_scraper.py"
 LOOP_INTERVAL="120"
 CONFEOF
@@ -126,7 +133,7 @@ fi
 VERBOSITY="1"
 LOG_FILE="/var/log/wsprdaemon/wsprdaemon_server.log"
 LOG_MAX_MB="10"
-VENV_PYTHON="/home/wsprdaemon/wsprdaemon-server/venv/bin/python3"
+VENV_PYTHON="/opt/wsprdaemon-server/venv/bin/python3"
 SCRAPER_SCRIPT="/usr/local/bin/wsprdaemon_server.py"
 LOOP_INTERVAL="10"
 EXTRACTION_DIR="/tmp/wsprdaemon"
@@ -141,9 +148,11 @@ systemctl daemon-reload
 echo ""
 echo "Installation complete!"
 echo ""
-echo "Configuration files in /etc/wsprdaemon/"
-echo "Scripts installed in /usr/local/bin/"
-echo "Service templates installed in /etc/systemd/system/"
+echo "Installation directory: $INSTALL_DIR"
+echo "Virtual environment: $VENV_DIR"
+echo "Configuration files: /etc/wsprdaemon/"
+echo "Scripts: /usr/local/bin/"
+echo "Service templates: /etc/systemd/system/"
 echo ""
 echo "Next steps:"
 echo "1. Edit /etc/wsprdaemon/clickhouse.conf and set ClickHouse credentials"
