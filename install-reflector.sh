@@ -11,11 +11,10 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_USER="wsprdaemon"
-VENV_DIR="/home/$INSTALL_USER/wsprdaemon-server/venv"
 
 echo "Installing WSPRDAEMON Reflector Service..."
 echo "Script directory: $SCRIPT_DIR"
-echo "Virtual environment: $VENV_DIR"
+echo "Note: Reflector uses only standard Python libraries, no venv needed"
 
 # Create wsprdaemon user if it doesn't exist
 if ! id -u $INSTALL_USER >/dev/null 2>&1; then
@@ -23,37 +22,37 @@ if ! id -u $INSTALL_USER >/dev/null 2>&1; then
     useradd -r -s /bin/bash -d /home/$INSTALL_USER -m $INSTALL_USER
 fi
 
-# Create necessary directories
+# Create necessary data directories
 echo "Creating data directories..."
-mkdir -p /var/spool/wsprdaemon/reflector
-mkdir -p /var/lib/wsprdaemon
-mkdir -p /var/log/wsprdaemon
-mkdir -p /etc/wsprdaemon
-
-chown -R $INSTALL_USER:$INSTALL_USER /var/spool/wsprdaemon
-chown -R $INSTALL_USER:$INSTALL_USER /var/lib/wsprdaemon
-chown -R $INSTALL_USER:$INSTALL_USER /var/log/wsprdaemon
-
-# Create Python virtual environment if it doesn't exist
-if [[ ! -d $VENV_DIR ]]; then
-    echo "Creating Python virtual environment..."
-    sudo -u $INSTALL_USER python3 -m venv $VENV_DIR
-fi
+for dir in /var/spool/wsprdaemon/reflector /var/lib/wsprdaemon /var/log/wsprdaemon /etc/wsprdaemon; do
+    if [[ ! -d "$dir" ]]; then
+        mkdir -p "$dir"
+        chown $INSTALL_USER:$INSTALL_USER "$dir"
+        echo "  Created $dir"
+    else
+        chown $INSTALL_USER:$INSTALL_USER "$dir"
+        echo "  Directory $dir already exists"
+    fi
+done
+echo "  Data directories ready"
 
 # Install Python scripts
 echo "Installing Python script..."
 cp "$SCRIPT_DIR/wsprdaemon_reflector.py" /usr/local/bin/
 chmod +x /usr/local/bin/wsprdaemon_reflector.py
+echo "  Python script installed"
 
 # Install wrapper script
 echo "Installing wrapper script..."
 cp "$SCRIPT_DIR/wsprdaemon_reflector.sh" /usr/local/bin/
 chmod +x /usr/local/bin/wsprdaemon_reflector.sh
+echo "  Wrapper script installed"
 
 # Install systemd service file
 echo "Installing systemd service file..."
 cp "$SCRIPT_DIR/wsprdaemon_reflector@.service" /etc/systemd/system/
 chmod 644 /etc/systemd/system/wsprdaemon_reflector@.service
+echo "  Service file installed"
 
 # Create example configuration if none exists
 if [[ ! -f /etc/wsprdaemon/reflector_destinations.json ]]; then
@@ -87,15 +86,21 @@ if [[ ! -f /etc/wsprdaemon/reflector_destinations.json ]]; then
 JSONEOF
     chown $INSTALL_USER:$INSTALL_USER /etc/wsprdaemon/reflector_destinations.json
     chmod 644 /etc/wsprdaemon/reflector_destinations.json
-    echo ""
-    echo "IMPORTANT: Edit /etc/wsprdaemon/reflector_destinations.json with your actual server details"
+    echo "  IMPORTANT: Edit /etc/wsprdaemon/reflector_destinations.json with your actual server details"
+else
+    echo "Configuration file /etc/wsprdaemon/reflector_destinations.json already exists"
 fi
 
 # Reload systemd
+echo "Reloading systemd..."
 systemctl daemon-reload
 
 echo ""
-echo "Installation complete!"
+echo "=== Installation complete! ==="
+echo ""
+echo "Configuration: /etc/wsprdaemon/reflector_destinations.json"
+echo "Scripts: /usr/local/bin/"
+echo "Service: /etc/systemd/system/wsprdaemon_reflector@.service"
 echo ""
 echo "Next steps:"
 echo "  1. Edit /etc/wsprdaemon/reflector_destinations.json with your destination servers"
