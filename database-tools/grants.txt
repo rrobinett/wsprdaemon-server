@@ -1,0 +1,96 @@
+    ┌─user_name─────────┬─access_type─────────────────────┬─database───┬─table─┐
+ 1. │ wd-admin          │ SELECT                          │ system     │ parts │
+ 2. │ wd-admin          │ SYSTEM PULLING REPLICATION LOG  │ wsprdaemon │ ᴺᵁᴸᴸ  │
+ 3. │ wd-admin          │ UNDROP TABLE                    │ wsprdaemon │ ᴺᵁᴸᴸ  │
+ 4. │ wd-admin          │ SHOW                            │ wsprdaemon │ ᴺᵁᴸᴸ  │
+ 5. │ wd-admin          │ SELECT                          │ wsprdaemon │ ᴺᵁᴸᴸ  │
+ 6. │ wd-admin          │ dictGet                         │ wsprdaemon │ ᴺᵁᴸᴸ  │
+ 7. │ wd-admin          │ SYSTEM UNLOAD PRIMARY KEY       │ wsprdaemon │ ᴺᵁᴸᴸ  │
+ 8. │ wd-admin          │ SYSTEM LOAD PRIMARY KEY         │ wsprdaemon │ ᴺᵁᴸᴸ  │
+ 9. │ wd-admin          │ SYSTEM FLUSH DISTRIBUTED        │ wsprdaemon │ ᴺᵁᴸᴸ  │
+10. │ wd-admin          │ SYSTEM SYNC DATABASE REPLICA    │ wsprdaemon │ ᴺᵁᴸᴸ  │
+11. │ wd-admin          │ SYSTEM WAIT LOADING PARTS       │ wsprdaemon │ ᴺᵁᴸᴸ  │
+12. │ wd-admin          │ SYSTEM RESTORE DATABASE REPLICA │ wsprdaemon │ ᴺᵁᴸᴸ  │
+13. │ wd-admin          │ DROP TABLE                      │ wsprdaemon │ ᴺᵁᴸᴸ  │
+14. │ wd-admin          │ INSERT                          │ wsprdaemon │ ᴺᵁᴸᴸ  │
+15. │ wd-admin          │ SYSTEM SYNC REPLICA             │ wsprdaemon │ ᴺᵁᴸᴸ  │
+16. │ wd-admin          │ SYSTEM DROP REPLICA             │ wsprdaemon │ ᴺᵁᴸᴸ  │
+17. │ wd-admin          │ SYSTEM REDUCE BLOCKING PARTS    │ wsprdaemon │ ᴺᵁᴸᴸ  │
+18. │ wd-admin          │ SYSTEM VIRTUAL PARTS UPDATE     │ wsprdaemon │ ᴺᵁᴸᴸ  │
+19. │ wd-admin          │ SYSTEM REPLICATION QUEUES       │ wsprdaemon │ ᴺᵁᴸᴸ  │
+20. │ wd-admin          │ SYSTEM SENDS                    │ wsprdaemon │ ᴺᵁᴸᴸ  │
+21. │ wd-admin          │ SYSTEM VIEWS                    │ wsprdaemon │ ᴺᵁᴸᴸ  │
+22. │ wd-admin          │ SYSTEM CLEANUP                  │ wsprdaemon │ ᴺᵁᴸᴸ  │
+23. │ wd-admin          │ ALTER                           │ wsprdaemon │ ᴺᵁᴸᴸ  │
+24. │ wd-admin          │ SYSTEM MOVES                    │ wsprdaemon │ ᴺᵁᴸᴸ  │
+25. │ wd-admin          │ SYSTEM FETCHES                  │ wsprdaemon │ ᴺᵁᴸᴸ  │
+26. │ wd-admin          │ SYSTEM TTL MERGES               │ wsprdaemon │ ᴺᵁᴸᴸ  │
+27. │ wd-admin          │ SYSTEM MERGES                   │ wsprdaemon │ ᴺᵁᴸᴸ  │
+28. │ wd-admin          │ SHOW ROW POLICIES               │ wsprdaemon │ ᴺᵁᴸᴸ  │
+29. │ wd-admin          │ DROP ROW POLICY                 │ wsprdaemon │ ᴺᵁᴸᴸ  │
+30. │ wd-admin          │ ALTER ROW POLICY                │ wsprdaemon │ ᴺᵁᴸᴸ  │
+31. │ wd-admin          │ CREATE ROW POLICY               │ wsprdaemon │ ᴺᵁᴸᴸ  │
+32. │ wd-admin          │ BACKUP                          │ wsprdaemon │ ᴺᵁᴸᴸ  │
+33. │ wd-admin          │ OPTIMIZE                        │ wsprdaemon │ ᴺᵁᴸᴸ  │
+34. │ wd-admin          │ TRUNCATE                        │ wsprdaemon │ ᴺᵁᴸᴸ  │
+35. │ wd-admin          │ SYSTEM RESTART REPLICA          │ wsprdaemon │ ᴺᵁᴸᴸ  │
+36. │ wd-admin          │ DROP DICTIONARY                 │ wsprdaemon │ ᴺᵁᴸᴸ  │
+37. │ wd-admin          │ DROP VIEW                       │ wsprdaemon │ ᴺᵁᴸᴸ  │
+38. │ wd-admin          │ CHECK                           │ wsprdaemon │ ᴺᵁᴸᴸ  │
+39. │ wd-admin          │ DROP DATABASE                   │ wsprdaemon │ ᴺᵁᴸᴸ  │
+40. │ wd-admin          │ CREATE DICTIONARY               │ wsprdaemon │ ᴺᵁᴸᴸ  │
+41. │ wd-admin          │ CREATE VIEW                     │ wsprdaemon │ ᴺᵁᴸᴸ  │
+42. │ wd-admin          │ CREATE TABLE                    │ wsprdaemon │ ᴺᵁᴸᴸ  │
+43. │ wd-admin          │ CREATE DATABASE                 │ wsprdaemon │ ᴺᵁᴸᴸ  │
+44. │ wd-admin          │ SYSTEM RESTORE REPLICA          │ wsprdaemon │ ᴺᵁᴸᴸ  │
+45. │ wsprdaemon-admin  │ DROP TABLE                      │ wsprdaemon │ ᴺᵁᴸᴸ  │
+46. │ wsprdaemon-admin  │ INSERT                          │ wsprdaemon │ ᴺᵁᴸᴸ  │
+47. │ wsprdaemon-admin  │ SELECT                          │ wsprdaemon │ ᴺᵁᴸᴸ  │
+48. │ wsprdaemon-admin  │ CREATE DATABASE                 │ ᴺᵁᴸᴸ       │ ᴺᵁᴸᴸ  │
+49. │ wsprdaemon-admin  │ CREATE TABLE                    │ ᴺᵁᴸᴸ       │ ᴺᵁᴸᴸ  │
+50. │ wsprdaemon-reader │ SELECT                          │ wsprdaemon │ ᴺᵁᴸᴸ  │
+51. │ wsprnet-admin     │ dictGet                         │ wsprnet    │ ᴺᵁᴸᴸ  │
+52. │ wsprnet-admin     │ DROP DATABASE                   │ wsprnet    │ ᴺᵁᴸᴸ  │
+53. │ wsprnet-admin     │ SYSTEM LOAD PRIMARY KEY         │ wsprnet    │ ᴺᵁᴸᴸ  │
+54. │ wsprnet-admin     │ SYSTEM FLUSH DISTRIBUTED        │ wsprnet    │ ᴺᵁᴸᴸ  │
+55. │ wsprnet-admin     │ SYSTEM SYNC DATABASE REPLICA    │ wsprnet    │ ᴺᵁᴸᴸ  │
+56. │ wsprnet-admin     │ SYSTEM WAIT LOADING PARTS       │ wsprnet    │ ᴺᵁᴸᴸ  │
+57. │ wsprnet-admin     │ SYSTEM RESTORE DATABASE REPLICA │ wsprnet    │ ᴺᵁᴸᴸ  │
+58. │ wsprnet-admin     │ SYSTEM RESTORE REPLICA          │ wsprnet    │ ᴺᵁᴸᴸ  │
+59. │ wsprnet-admin     │ SYSTEM RESTART REPLICA          │ wsprnet    │ ᴺᵁᴸᴸ  │
+60. │ wsprnet-admin     │ SYSTEM SYNC REPLICA             │ wsprnet    │ ᴺᵁᴸᴸ  │
+61. │ wsprnet-admin     │ SYSTEM DROP REPLICA             │ wsprnet    │ ᴺᵁᴸᴸ  │
+62. │ wsprnet-admin     │ CHECK                           │ wsprnet    │ ᴺᵁᴸᴸ  │
+63. │ wsprnet-admin     │ SYSTEM VIRTUAL PARTS UPDATE     │ wsprnet    │ ᴺᵁᴸᴸ  │
+64. │ wsprnet-admin     │ SYSTEM REPLICATION QUEUES       │ wsprnet    │ ᴺᵁᴸᴸ  │
+65. │ wsprnet-admin     │ SYSTEM SENDS                    │ wsprnet    │ ᴺᵁᴸᴸ  │
+66. │ wsprnet-admin     │ SYSTEM VIEWS                    │ wsprnet    │ ᴺᵁᴸᴸ  │
+67. │ wsprnet-admin     │ SYSTEM CLEANUP                  │ wsprnet    │ ᴺᵁᴸᴸ  │
+68. │ wsprnet-admin     │ SYSTEM PULLING REPLICATION LOG  │ wsprnet    │ ᴺᵁᴸᴸ  │
+69. │ wsprnet-admin     │ SYSTEM MOVES                    │ wsprnet    │ ᴺᵁᴸᴸ  │
+70. │ wsprnet-admin     │ SYSTEM FETCHES                  │ wsprnet    │ ᴺᵁᴸᴸ  │
+71. │ wsprnet-admin     │ SYSTEM TTL MERGES               │ wsprnet    │ ᴺᵁᴸᴸ  │
+72. │ wsprnet-admin     │ SYSTEM MERGES                   │ wsprnet    │ ᴺᵁᴸᴸ  │
+73. │ wsprnet-admin     │ SHOW ROW POLICIES               │ wsprnet    │ ᴺᵁᴸᴸ  │
+74. │ wsprnet-admin     │ DROP ROW POLICY                 │ wsprnet    │ ᴺᵁᴸᴸ  │
+75. │ wsprnet-admin     │ ALTER ROW POLICY                │ wsprnet    │ ᴺᵁᴸᴸ  │
+76. │ wsprnet-admin     │ CREATE ROW POLICY               │ wsprnet    │ ᴺᵁᴸᴸ  │
+77. │ wsprnet-admin     │ BACKUP                          │ wsprnet    │ ᴺᵁᴸᴸ  │
+78. │ wsprnet-admin     │ OPTIMIZE                        │ wsprnet    │ ᴺᵁᴸᴸ  │
+79. │ wsprnet-admin     │ TRUNCATE                        │ wsprnet    │ ᴺᵁᴸᴸ  │
+80. │ wsprnet-admin     │ UNDROP TABLE                    │ wsprnet    │ ᴺᵁᴸᴸ  │
+81. │ wsprnet-admin     │ DROP DICTIONARY                 │ wsprnet    │ ᴺᵁᴸᴸ  │
+82. │ wsprnet-admin     │ DROP VIEW                       │ wsprnet    │ ᴺᵁᴸᴸ  │
+83. │ wsprnet-admin     │ DROP TABLE                      │ wsprnet    │ ᴺᵁᴸᴸ  │
+84. │ wsprnet-admin     │ SYSTEM REDUCE BLOCKING PARTS    │ wsprnet    │ ᴺᵁᴸᴸ  │
+85. │ wsprnet-admin     │ CREATE DICTIONARY               │ wsprnet    │ ᴺᵁᴸᴸ  │
+86. │ wsprnet-admin     │ CREATE VIEW                     │ wsprnet    │ ᴺᵁᴸᴸ  │
+87. │ wsprnet-admin     │ CREATE TABLE                    │ wsprnet    │ ᴺᵁᴸᴸ  │
+88. │ wsprnet-admin     │ CREATE DATABASE                 │ wsprnet    │ ᴺᵁᴸᴸ  │
+89. │ wsprnet-admin     │ ALTER                           │ wsprnet    │ ᴺᵁᴸᴸ  │
+90. │ wsprnet-admin     │ INSERT                          │ wsprnet    │ ᴺᵁᴸᴸ  │
+91. │ wsprnet-admin     │ SELECT                          │ wsprnet    │ ᴺᵁᴸᴸ  │
+92. │ wsprnet-admin     │ SHOW                            │ wsprnet    │ ᴺᵁᴸᴸ  │
+93. │ wsprnet-admin     │ SYSTEM UNLOAD PRIMARY KEY       │ wsprnet    │ ᴺᵁᴸᴸ  │
+94. │ wsprnet-reader    │ SELECT                          │ wsprnet    │ ᴺᵁᴸᴸ  │
+    └─user_name─────────┴─access_type─────────────────────┴─database───┴─table─┘
