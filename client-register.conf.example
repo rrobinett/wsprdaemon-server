@@ -1,0 +1,33 @@
+#!/bin/bash
+#
+# Configuration file for wd-register-client.sh
+# Location: /etc/wsprdaemon/client-register.conf
+#
+# This file contains server configuration for client registration and replication.
+# Copy this file to /etc/wsprdaemon/client-register.conf and customize for your setup.
+
+# RAC (Remote Access Channel) server hostname
+# This is the internal hostname used to SSH into RAC servers
+WD_RAC_SERVER="wd0"
+
+# Primary WSPRDAEMON server FQDN
+# This is the public hostname that clients will use for SFTP uploads
+WD_SERVER_FQDN="wd00.wsprdaemon.org"
+
+# Backup servers for automatic user replication (space-separated list)
+# When a user is created on the primary server, they will be automatically
+# replicated to all servers in this list
+# Set to empty string to disable automatic replication: WD_BACKUP_SERVERS=""
+WD_BACKUP_SERVERS="wd0.wsprdaemon.org wd1.wsprdaemon.org"
+
+# Optional: RAC base port for calculating client ports
+# Client port = WD_RAC_BASE_PORT + RAC_NUMBER
+# WD_RAC_BASE_PORT="${WD_RAC_BASE_PORT:-35800}"
+
+# Optional: SFTP port (default 22)
+# SFTP_PORT="${SFTP_PORT:-22}"
+
+# Optional: Verbosity level for debugging
+# verbosity=0   # No debug output (default)
+# verbosity=1   # Basic debug output
+# verbosity=2   # Detailed debug output
