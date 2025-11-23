@@ -1,79 +1,13 @@
 #!/bin/bash
 #
-# wd-register-client.sh v2.7.0
+# wd-register-client.sh v2.6.0
 # 
 # Script to register WSPRDAEMON client stations for SFTP uploads
 # Creates user accounts on gateway servers and configures client access
 #
-# Usage:
-#   ./wd-register-client.sh <client_rac_number> [--verbose]
-#   ./wd-register-client.sh <client_rac_number> <reporter_id>  # Manual override
-#   ./wd-register-client.sh --version
-#
-# Examples:
-#   ./wd-register-client.sh 84              # Register client RAC 84 (auto-detect ID)
-#   ./wd-register-client.sh 84 KJ6MKI       # Register with manual reporter ID
-#   ./wd-register-client.sh 84 --verbose    # Register with verbose output  
-#   ./wd-register-client.sh --version       # Show version only
-#
-# Changes in v2.7.0:
-#   - FIXED: Account lock detection now correctly distinguishes locked accounts
-#   - Only accounts with ! or !! passwords are truly locked
-#   - Accounts with * password are NOT locked (SSH keys work)
-#   - Prevents unnecessary account modifications
-#
-# Changes in v2.6.9:
-#   - FIXED: SFTP test now runs FROM CLIENT perspective via SSH
-#   - Test connects to client first, then tests SFTP from there
-#   - Provides better explanation when tests fail
-#   - Always continues configuration regardless of test results
-#
-# Changes in v2.6.8:
-#   - FIXED: Hostname detection now case-insensitive (recognizes GW2 correctly)
-#   - FIXED: SFTP test improved with better diagnostics and alternate verification
-#   - FIXED: Shows all configured servers in final output
-#   - Always continues configuration even if SFTP tests fail
-#
-# Changes in v2.6.7:
-#   - FIXED: Check and unlock locked accounts (both local and remote)
-#   - FIXED: Only configure groups/directories if not already properly set up
-#   - Checks account status with 'passwd -S' and unlocks if needed
-#   - Verifies existing directory permissions before modifying
-#
-# Changes in v2.6.6:
-#   - FIXED: SSH username is field 3, not field 4!
-#   - Format: "RAC,wd_user,ssh_user,ssh_pass,legacy,description,forwards"
-#   - Example: "84,kj6mki-rz,wsprdaemon,AUTO,..." → uses 'wsprdaemon'
-#
-# Changes in v2.6.5:
-#   - FIXED: Correctly parse .ssr.conf FRPS_REMOTE_ACCESS_LIST array format
-#   - SSH username is field 4 (first word) from comma-separated entry
-#   - Format: "RAC,wd_user,wd_pass,ssh_user ssh_pass,description,forwards"
-#
-# Changes in v2.6.4:
-#   - FIXED: Client username now extracted from .ssr.conf file for the RAC
-#   - No longer hardcoded to 'pi' or 'wsprdaemon'
-#   - Reads from format: "RAC user@host:port" in ~/.ssr.conf
-#
-# Changes in v2.6.3:
-#   - FIXED: Port calculation now uses correct formula (35800 + RAC)
-#   - Was incorrectly using 2200 + RAC
-#
-# Changes in v2.6.2:
-#   - Enhanced debugging for reporter ID extraction failures
-#   - Added manual reporter ID override option
-#   - Better error messages showing what files were checked
-#   - Tests SSH connection before attempting extraction
-#
-# Changes in v2.6.1:
-#   - FIXED: Diagnostic output from get_client_reporter_id no longer interferes with return value
-#   - All diagnostic messages now properly sent to stderr
-#
 # Changes in v2.6.0:
 #   - Extract client_reporter_id from upload_to_wsprnet_daemon.log instead of CSV
-#   - Falls back to CSV if log method fails
-#   - Added --version argument (shows version and exits)
-#   - Script always displays version at startup
+#   - Improved error handling for missing log files
 #
 # Changes in v2.5.0:
 #   - Only lock passwords for NEW users, not existing ones
@@ -83,7 +17,7 @@
 # Author: AI6VN (with assistance from Claude)
 # Date: November 2025
 
-VERSION="2.7.0"
+VERSION="2.6.0"
 SCRIPT_NAME="wd-register-client.sh"
 
 # Source bash aliases if available
@@ -176,23 +110,7 @@ function setup_local_user() {
     
     # Check if user already exists
     if id "$sanitized_username" >/dev/null 2>&1; then
-        echo "✓ User '$sanitized_username' already exists"
-        
-        # Check if account is TRULY locked (! or !! in shadow file, not * which is OK for SSH)
-        local shadow_entry=$(sudo getent shadow "$sanitized_username" | cut -d: -f2)
-        if [[ "$shadow_entry" =~ ^!+[^*] ]] || [[ "$shadow_entry" == "!" ]] || [[ "$shadow_entry" == "!!" ]]; then
-            echo "  Account is LOCKED (password field starts with !) - unlocking..."
-            sudo usermod -p '*' "$sanitized_username"
-            echo "  ✓ Account unlocked (key-only authentication enabled)"
-        else
-            # Check the passwd -S status for informational purposes
-            local passwd_status=$(sudo passwd -S "$sanitized_username" 2>/dev/null | awk '{print $2}')
-            if [[ "$passwd_status" == "L" ]] || [[ "$passwd_status" == "LK" ]]; then
-                echo "  ✓ Account shows as 'L' but has '*' password (SSH keys work) - no action needed"
-            else
-                echo "  ✓ Account status is '$passwd_status' - SSH keys enabled"
-            fi
-        fi
+        echo "✓ User '$sanitized_username' already exists - skipping password lock"
         local user_exists=1
     else
         echo "Creating user '$sanitized_username'..."
@@ -214,17 +132,13 @@ function setup_local_user() {
         echo "✓ Password disabled (key-only authentication)"
     fi
     
-    # Check if already in sftponly group
-    if groups "$sanitized_username" 2>/dev/null | grep -q sftponly; then
-        echo "✓ User already in 'sftponly' group"
-    else
-        echo "Adding user to 'sftponly' group..."
-        if ! sudo usermod -a -G sftponly "$sanitized_username"; then
-            echo "ERROR: Failed to add user to sftponly group"
-            return 1
-        fi
-        echo "✓ Added to sftponly group"
+    # Add to sftponly group
+    echo "Adding user to 'sftponly' group..."
+    if ! sudo usermod -a -G sftponly "$sanitized_username"; then
+        echo "ERROR: Failed to add user to sftponly group"
+        return 1
     fi
+    echo "✓ Added to sftponly group"
     
     # Setup SSH directory
     local ssh_dir="/home/$sanitized_username/.ssh"
@@ -284,23 +198,7 @@ function replicate_user_to_server() {
     
     # Check if user exists on remote server
     if ssh "$server" "id '$sanitized_username' 2>/dev/null" >/dev/null; then
-        echo "✓ User already exists on $server"
-        
-        # Check if account is TRULY locked on remote (! or !! in shadow, not *)
-        echo "  Checking account status on $server..."
-        local remote_shadow=$(ssh "$server" "sudo getent shadow '$sanitized_username' 2>/dev/null | cut -d: -f2")
-        if [[ "$remote_shadow" =~ ^!+[^*] ]] || [[ "$remote_shadow" == "!" ]] || [[ "$remote_shadow" == "!!" ]]; then
-            echo "  Account is LOCKED on $server (password starts with !) - unlocking..."
-            ssh "$server" "sudo usermod -p '*' '$sanitized_username'"
-            echo "  ✓ Account unlocked on $server"
-        else
-            local remote_passwd_status=$(ssh "$server" "sudo passwd -S '$sanitized_username' 2>/dev/null | awk '{print \$2}'")
-            if [[ "$remote_passwd_status" == "L" ]] || [[ "$remote_passwd_status" == "LK" ]]; then
-                echo "  ✓ Account on $server shows 'L' but has '*' password - SSH keys work, no action needed"
-            else
-                echo "  ✓ Account on $server status is '$remote_passwd_status' - SSH keys enabled"
-            fi
-        fi
+        echo "✓ User already exists on $server - skipping password operations"
         local remote_user_exists=1
     else
         echo "Creating user on $server..."
@@ -317,55 +215,25 @@ function replicate_user_to_server() {
         echo "✓ Remote password disabled"
     fi
     
-    # Check if already in sftponly group
-    echo "Checking group membership on $server..."
-    if ssh "$server" "groups '$sanitized_username' 2>/dev/null | grep -q sftponly"; then
-        echo "  ✓ User already in 'sftponly' group on $server"
-    else
-        echo "  Adding user to 'sftponly' group on $server..."
-        ssh "$server" "sudo groupadd -f sftponly 2>/dev/null || true"
-        ssh "$server" "sudo usermod -a -G sftponly '$sanitized_username'"
-        echo "  ✓ Added to sftponly group on $server"
-    fi
+    # Ensure sftponly group exists and add user
+    echo "Configuring groups on $server..."
+    ssh "$server" "sudo groupadd -f sftponly 2>/dev/null || true"
+    ssh "$server" "sudo usermod -a -G sftponly '$sanitized_username'"
+    echo "✓ Groups configured"
     
-    # Check if directories exist and have correct permissions
-    echo "Checking directories on $server..."
-    local dirs_ok=$(ssh "$server" "
-        if [[ -d /home/$sanitized_username/.ssh && -d /home/$sanitized_username/uploads ]]; then
-            # Check permissions
-            ssh_perm=\$(stat -c '%a' /home/$sanitized_username/.ssh 2>/dev/null)
-            upload_perm=\$(stat -c '%a' /home/$sanitized_username/uploads 2>/dev/null)
-            home_owner=\$(stat -c '%U' /home/$sanitized_username 2>/dev/null)
-            if [[ \"\$ssh_perm\" == \"700\" && \"\$upload_perm\" == \"755\" && \"\$home_owner\" == \"root\" ]]; then
-                echo 'ok'
-            else
-                echo 'fix_perms'
-            fi
-        else
-            echo 'create'
-        fi
-    ")
-    
-    if [[ "$dirs_ok" == "ok" ]]; then
-        echo "  ✓ Directories already configured correctly on $server"
-    else
-        if [[ "$dirs_ok" == "fix_perms" ]]; then
-            echo "  Fixing directory permissions on $server..."
-        else
-            echo "  Creating directories on $server..."
-        fi
-        ssh "$server" "
-            sudo mkdir -p /home/$sanitized_username/{.ssh,uploads}
-            sudo chmod 700 /home/$sanitized_username/.ssh
-            sudo chmod 755 /home/$sanitized_username/uploads
-            sudo touch /home/$sanitized_username/.ssh/authorized_keys
-            sudo chmod 600 /home/$sanitized_username/.ssh/authorized_keys
-            sudo chown -R $sanitized_username:$sanitized_username /home/$sanitized_username/{.ssh,uploads}
-            sudo chown root:root /home/$sanitized_username
-            sudo chmod 755 /home/$sanitized_username
-        "
-        echo "  ✓ Directories configured on $server"
-    fi
+    # Setup directories
+    echo "Setting up directories on $server..."
+    ssh "$server" "
+        sudo mkdir -p /home/$sanitized_username/{.ssh,uploads}
+        sudo chmod 700 /home/$sanitized_username/.ssh
+        sudo chmod 755 /home/$sanitized_username/uploads
+        sudo touch /home/$sanitized_username/.ssh/authorized_keys
+        sudo chmod 600 /home/$sanitized_username/.ssh/authorized_keys
+        sudo chown -R $sanitized_username:$sanitized_username /home/$sanitized_username/{.ssh,uploads}
+        sudo chown root:root /home/$sanitized_username
+        sudo chmod 755 /home/$sanitized_username
+    "
+    echo "✓ Directories configured on $server"
     
     return 0
 }
@@ -469,62 +337,59 @@ function diagnose_and_fix_authorized_keys() {
     return 0
 }
 
-# Function to test SFTP uploads from CLIENT to servers
+# Function to test SFTP uploads to all servers
 function test_sftp_uploads() {
     local sanitized_username="$1"
-    local client_rac="$2"
-    local client_user="$3"
-    local client_ip_port="$4"
-    local WD_RAC_SERVER="$5"
-    shift 5
+    shift
     local servers=("$@")
     
     echo ""
-    echo "=== Testing SFTP uploads from CLIENT to servers ==="
-    echo "NOTE: These tests run FROM the client's perspective via SSH"
+    echo "=== Testing SFTP uploads to all servers ==="
     
     local success_count=0
     local total_count=${#servers[@]}
     local working_servers=()
     
     for server_fqdn in "${servers[@]}"; do
-        echo "  Testing SFTP upload from client to $server_fqdn..."
+        echo "  Testing SFTP upload to $server_fqdn..."
         
-        # Create a unique test file name
-        local test_filename=".wd_upload_test_$$_$(date +%s)"
+        # Create a test file
+        local test_file="/tmp/.wd_upload_test_$$"
+        echo "Test upload at $(date)" > "$test_file"
         
-        # Test FROM THE CLIENT by SSHing to the client and running SFTP from there
-        echo "    Running test from client (RAC $client_rac)..."
-        if ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
-            # Create test file on client
-            echo 'Test from client at \$(date)' > /tmp/$test_filename
+        # Try SFTP upload
+        if sftp -q -o BatchMode=yes -o StrictHostKeyChecking=no "${sanitized_username}@${server_fqdn}" <<< "put $test_file uploads/" >/dev/null 2>&1; then
             
-            # Try SFTP upload from client to server
-            sftp -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no ${sanitized_username}@${server_fqdn} >/dev/null 2>&1 <<EOF
-cd uploads
-put /tmp/$test_filename
-ls $test_filename
-quit
-EOF
-            rc=\$?
-            rm -f /tmp/$test_filename
-            exit \$rc
-        " 2>/dev/null; then
-            echo "    ✓ SUCCESS: Client can upload to $server_fqdn"
-            working_servers+=("$server_fqdn")
-            ((success_count++))
+            # Verify file arrived
+            local is_local=0
+            if [[ "$server_fqdn" == *"$(hostname)"* ]] || [[ "$(hostname)" == *"${server_fqdn%%.*}"* ]]; then
+                is_local=1
+            fi
             
-            # Clean up test file on server
-            local current_hostname=$(hostname | tr '[:upper:]' '[:lower:]')
-            if [[ "$server_fqdn" == *"$current_hostname"* ]]; then
-                sudo rm -f "/home/$sanitized_username/uploads/$test_filename" 2>/dev/null
+            if [[ $is_local -eq 1 ]]; then
+                if sudo ls "/home/$sanitized_username/uploads/$(basename $test_file)" >/dev/null 2>&1; then
+                    sudo rm -f "/home/$sanitized_username/uploads/$(basename $test_file)"
+                    echo "    ✓ SUCCESS: Upload to $server_fqdn passed"
+                    working_servers+=("$server_fqdn")
+                    ((success_count++))
+                else
+                    echo "    ✗ FAILED: Upload appeared to work but file not found"
+                fi
             else
-                ssh "$server_fqdn" "sudo rm -f '/home/$sanitized_username/uploads/$test_filename'" 2>/dev/null
+                if ssh "$server_fqdn" "sudo ls '/home/$sanitized_username/uploads/$(basename $test_file)' >/dev/null 2>&1"; then
+                    ssh "$server_fqdn" "sudo rm -f '/home/$sanitized_username/uploads/$(basename $test_file)'"
+                    echo "    ✓ SUCCESS: Upload to $server_fqdn passed"
+                    working_servers+=("$server_fqdn")
+                    ((success_count++))
+                else
+                    echo "    ✗ FAILED: Upload appeared to work but file not found"
+                fi
             fi
         else
-            echo "    ✗ FAILED: Client cannot upload to $server_fqdn"
-            echo "    Note: This could be normal if client doesn't have the private key yet"
+            echo "    ✗ FAILED: SFTP upload to $server_fqdn failed"
         fi
+        
+        rm -f "$test_file"
     done
     
     echo ""
@@ -535,11 +400,10 @@ EOF
         echo "  WARNING: Only $success_count of $total_count servers passed SFTP tests"
         echo "           Working servers: ${working_servers[*]}"
         echo "           Client will be configured for ALL servers anyway"
-        return 0
+        return 0  # Return success so configuration continues
     else
-        echo "  NOTE: SFTP tests failed - this is normal if client doesn't have SSH keys yet"
-        echo "        Client has been configured and can set up keys later"
-        return 0  # Always return success to continue
+        echo "  ERROR: All SFTP upload tests failed (0/$total_count)"
+        return 1
     fi
 }
 
@@ -612,11 +476,9 @@ function configure_client_access() {
         echo "  $configured_list"
         echo ""
         echo "  Client can upload to:"
-        local is_first=1
         for server in "${servers[@]}"; do
-            if [[ "$server" == *"gw1"* && $is_first -eq 1 ]]; then
+            if [[ "$server" == *"gw1"* ]]; then
                 echo "    ${sanitized_username}@${server}  (primary)"
-                is_first=0
             else
                 echo "    ${sanitized_username}@${server}  (backup)"
             fi
@@ -636,134 +498,73 @@ function get_client_reporter_id() {
     local client_ip_port="$3"
     local WD_RAC_SERVER="$4"
     
-    echo "" >&2
-    echo "=== Extracting client reporter ID ===" >&2
-    
-    # First test the SSH connection
-    if ! ssh -o ConnectTimeout=5 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "true" 2>/dev/null; then
-        echo "  ✗ ERROR: Cannot connect to client via SSH on port ${client_ip_port}" >&2
-        echo "  Check that port forwarding is working for RAC ${client_rac}" >&2
-        return 1
-    fi
-    echo "  ✓ SSH connection to client successful" >&2
+    echo ""
+    echo "=== Extracting client reporter ID ==="
     
     # Try to get from the upload log file
     local log_path="~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log"
-    echo "  Checking log file: $log_path" >&2
+    echo "  Checking log file: $log_path"
     
-    # First check if file exists
-    local file_exists=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "[[ -f $log_path ]] && echo 'yes' || echo 'no'" 2>/dev/null)
-    
-    if [[ "$file_exists" == "yes" ]]; then
-        echo "    Log file found, extracting reporter ID..." >&2
-        local reporter_id=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
-            grep 'my call' $log_path 2>/dev/null | tail -1 | sed -n 's/.*my call \([^ ]*\) and\/or.*/\1/p'
-        " 2>/dev/null)
-        
-        if [[ -n "$reporter_id" ]]; then
-            echo "  ✓ Found reporter ID from log: $reporter_id" >&2
-            echo "$reporter_id"
-            return 0
-        else
-            echo "    No 'my call' pattern found in log file" >&2
+    local reporter_id=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+        if [[ -f $log_path ]]; then
+            grep 'my call' $log_path | tail -1 | sed -n 's/.*my call \([^ ]*\) and\/or.*/\1/p'
         fi
-    else
-        echo "    Log file not found" >&2
+    " 2>/dev/null)
+    
+    if [[ -n "$reporter_id" ]]; then
+        echo "  ✓ Found reporter ID from log: $reporter_id"
+        echo "$reporter_id"
+        return 0
     fi
     
     # Fallback to CSV method if log method fails
-    echo "  Log file method failed, trying CSV database..." >&2
+    echo "  Log file method failed, trying CSV database..."
     local csv_path="~/wsprdaemon/spots.csv"
     
-    # Check if CSV exists
-    file_exists=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "[[ -f $csv_path ]] && echo 'yes' || echo 'no'" 2>/dev/null)
-    
-    if [[ "$file_exists" == "yes" ]]; then
-        echo "    CSV file found, extracting field 7..." >&2
-        reporter_id=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
-            tail -1 $csv_path 2>/dev/null | cut -d',' -f7
-        " 2>/dev/null)
-        
-        if [[ -n "$reporter_id" ]]; then
-            echo "  ✓ Found reporter ID from CSV: $reporter_id" >&2
-            echo "$reporter_id"
-            return 0
-        else
-            echo "    CSV file empty or invalid format" >&2
+    reporter_id=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+        if [[ -f $csv_path ]]; then
+            tail -1 $csv_path | cut -d',' -f7
         fi
-    else
-        echo "    CSV file not found" >&2
-    fi
-    
-    # Last resort - try to find any spots files
-    echo "  Looking for alternative file locations..." >&2
-    local alt_files=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
-        find ~ -name 'upload_to_wsprnet_daemon.log' -o -name 'spots.csv' 2>/dev/null | head -5
     " 2>/dev/null)
     
-    if [[ -n "$alt_files" ]]; then
-        echo "    Found files at:" >&2
-        echo "$alt_files" | sed 's/^/      /' >&2
-        echo "    Please check if these paths are correct" >&2
+    if [[ -n "$reporter_id" ]]; then
+        echo "  ✓ Found reporter ID from CSV: $reporter_id"
+        echo "$reporter_id"
+        return 0
     fi
     
-    echo "  ✗ ERROR: Could not extract reporter ID from client" >&2
-    echo "    Please run: ./wd-register-client-debug.sh ${client_rac}" >&2
-    echo "    to diagnose the issue" >&2
+    echo "  ✗ ERROR: Could not extract reporter ID from client"
     return 1
 }
 
 # Main function
 function main() {
-    # Handle version argument
-    if [[ "${1:-}" == "-v" || "${1:-}" == "--version" ]]; then
-        echo "$SCRIPT_NAME version $VERSION"
-        exit 0
-    fi
-    
-    # Always show version when running
     show_version
     
     # Parse arguments
     local client_rac="${1:-}"
-    local manual_reporter_id=""
     local verbosity=0
     
-    # Check if second argument is reporter ID or verbose flag
-    if [[ -n "${2:-}" ]]; then
-        if [[ "$2" == "--verbose" || "$2" == "-v" ]]; then
-            verbosity=1
-        else
-            # Assume it's a manual reporter ID
-            manual_reporter_id="$2"
-            echo "Using manually specified reporter ID: $manual_reporter_id"
-        fi
-    fi
-    
-    # Check for verbose as third argument if manual ID was provided
-    if [[ -n "$manual_reporter_id" && "${3:-}" == "--verbose" ]]; then
+    if [[ "$2" == "-v" || "$2" == "--verbose" ]]; then
         verbosity=1
     fi
     
     if [[ -z "$client_rac" ]]; then
-        echo "Usage: $SCRIPT_NAME <client_rac_number> [<reporter_id>] [--verbose]"
-        echo "       $SCRIPT_NAME --version"
+        echo "Usage: $SCRIPT_NAME <client_rac_number> [-v|--verbose]"
         echo ""
         echo "Example: $SCRIPT_NAME 84"
-        echo "         $SCRIPT_NAME 84 KJ6MKI"
-        echo "         $SCRIPT_NAME 84 --verbose"
-        echo "         $SCRIPT_NAME --version"
+        echo "         $SCRIPT_NAME 84 -v"
         exit 1
     fi
     
-    # Auto-detect configuration based on hostname (case-insensitive)
-    local hostname=$(hostname | tr '[:upper:]' '[:lower:]')
+    # Auto-detect configuration based on hostname
+    local hostname=$(hostname)
     local WD_SERVER_FQDN=""
     local WD_BACKUP_SERVERS=""
     local WD_RAC_SERVER="gw2"  # Default RAC server
     
     echo "Detecting gateway configuration..."
-    echo "  Hostname: $(hostname)"
+    echo "  Hostname: $hostname"
     
     case "$hostname" in
         *gw1*)
@@ -796,43 +597,12 @@ function main() {
     echo "  RAC Server: $WD_RAC_SERVER"
     echo "  Client RAC: $client_rac"
     
-    # Calculate port (35800 + RAC number)
-    local client_ip_port=$((35800 + client_rac))
+    # Calculate port
+    local client_ip_port=$((2200 + client_rac))
     echo "  Client Port: $client_ip_port"
     
-    # Get client username from .ssr.conf file for this RAC
-    local ssr_conf_file="${HOME}/.ssr.conf"
-    if [[ ! -f "$ssr_conf_file" ]]; then
-        echo "ERROR: .ssr.conf file not found at $ssr_conf_file"
-        exit 1
-    fi
-    
-    # Source the .ssr.conf to load the FRPS_REMOTE_ACCESS_LIST array
-    source "$ssr_conf_file"
-    
-    # Find the entry for this RAC
-    # Format: "RAC,wd_user,wd_pass,ssh_user,ssh_pass,description,port_forwards"
-    local client_entry=""
-    for entry in "${FRPS_REMOTE_ACCESS_LIST[@]}"; do
-        if [[ "$entry" =~ ^${client_rac}, ]]; then
-            client_entry="$entry"
-            break
-        fi
-    done
-    
-    if [[ -z "$client_entry" ]]; then
-        echo "ERROR: No entry found for RAC $client_rac in .ssr.conf"
-        exit 1
-    fi
-    
-    # Parse the SSH username (field 3) from the entry
-    local client_user=$(echo "$client_entry" | cut -d',' -f3)
-    if [[ -z "$client_user" ]]; then
-        echo "ERROR: Could not extract SSH username for RAC $client_rac from: $client_entry"
-        exit 1
-    fi
-    
-    echo "  Client User: $client_user (from .ssr.conf)"
+    # Setup SSH for RAC access
+    local client_user="pi"
     
     # Ensure SSHD is configured for SFTP-only access
     if ! wd-sshd-conf-add-sftponly; then
@@ -846,24 +616,11 @@ function main() {
         exit 1
     fi
     
-    # Get client reporter ID (manual or auto-detect)
-    local client_reporter_id=""
-    if [[ -n "$manual_reporter_id" ]]; then
-        client_reporter_id="$manual_reporter_id"
-        echo "Using manual reporter ID: $client_reporter_id"
-    else
-        client_reporter_id=$(get_client_reporter_id "$client_rac" "$client_user" "$client_ip_port" "$WD_RAC_SERVER")
-        if [[ -z "$client_reporter_id" ]]; then
-            echo ""
-            echo "ERROR: Could not determine client reporter ID automatically"
-            echo ""
-            echo "You can specify the reporter ID manually:"
-            echo "  $SCRIPT_NAME $client_rac <REPORTER_ID>"
-            echo ""
-            echo "Example:"
-            echo "  $SCRIPT_NAME $client_rac KJ6MKI"
-            exit 1
-        fi
+    # Get client reporter ID
+    local client_reporter_id=$(get_client_reporter_id "$client_rac" "$client_user" "$client_ip_port" "$WD_RAC_SERVER")
+    if [[ -z "$client_reporter_id" ]]; then
+        echo "ERROR: Could not determine client reporter ID"
+        exit 1
     fi
     
     # Sanitize the reporter ID for use as Linux username
@@ -899,9 +656,9 @@ function main() {
         echo "WARNING: Key diagnosis/repair had issues (continuing anyway)"
     fi
     
-    # Test SFTP uploads to all servers (from client's perspective)
-    if ! test_sftp_uploads "$sanitized_reporter_id" "$client_rac" "$client_user" "$client_ip_port" "$WD_RAC_SERVER" "${all_servers[@]}"; then
-        echo "WARNING: Some SFTP tests had issues (continuing with configuration)"
+    # Test SFTP uploads to all servers
+    if ! test_sftp_uploads "$sanitized_reporter_id" "${all_servers[@]}"; then
+        echo "WARNING: Some SFTP tests failed (continuing with configuration)"
     fi
     
     # Configure client for multi-server access
