@@ -10,7 +10,7 @@ Simple design:
   4. Rsync workers sync queue dirs to destinations with --remove-source-files
 """
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 import argparse
 import json
@@ -132,6 +132,94 @@ def log(message: str, level: str = "INFO"):
     logger.log(level_map.get(level, logging.INFO), message)
     for handler in logger.handlers:
         handler.flush()
+
+
+def verify_destination_rsync(destination: Dict) -> bool:
+    """Check if rsync is installed on destination, install if missing. Returns True if rsync is available."""
+    name = destination['name']
+    user = destination['user']
+    host = destination['host']
+    ssh_key = destination.get('ssh_key', '/home/wsprdaemon/.ssh/id_rsa')
+    
+    ssh_base = f"ssh -i {ssh_key} -o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{host}"
+    
+    # Check if rsync exists
+    log(f"Checking rsync on {name} ({host})...", "INFO")
+    try:
+        result = subprocess.run(
+            f"{ssh_base} 'which rsync'",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=15,
+            shell=True
+        )
+        if result.returncode == 0:
+            log(f"{name}: rsync found at {result.stdout.strip()}", "INFO")
+            return True
+    except subprocess.TimeoutExpired:
+        log(f"{name}: SSH connection timed out", "ERROR")
+        return False
+    except Exception as e:
+        log(f"{name}: Error checking rsync: {e}", "ERROR")
+        return False
+    
+    # rsync not found, try to install it
+    log(f"{name}: rsync not found, attempting to install...", "WARNING")
+    
+    # Try apt-get (Debian/Ubuntu)
+    try:
+        result = subprocess.run(
+            f"{ssh_base} 'sudo apt-get update -qq && sudo apt-get install -y -qq rsync'",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=120,
+            shell=True
+        )
+        
+        if result.returncode == 0:
+            log(f"{name}: rsync installed successfully via apt-get", "INFO")
+            return True
+        else:
+            log(f"{name}: apt-get install failed: {result.stderr.strip()}", "DEBUG")
+    except subprocess.TimeoutExpired:
+        log(f"{name}: rsync installation timed out", "ERROR")
+    except Exception as e:
+        log(f"{name}: Error installing rsync via apt-get: {e}", "DEBUG")
+    
+    # Try yum as fallback (RHEL/CentOS)
+    try:
+        result = subprocess.run(
+            f"{ssh_base} 'sudo yum install -y rsync'",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=120,
+            shell=True
+        )
+        
+        if result.returncode == 0:
+            log(f"{name}: rsync installed successfully via yum", "INFO")
+            return True
+    except:
+        pass
+    
+    log(f"{name}: Could not install rsync - destination will be skipped", "ERROR")
+    return False
+
+
+def verify_all_destinations(config: Dict) -> List[Dict]:
+    """Verify rsync on all destinations, return list of valid destinations"""
+    valid_destinations = []
+    
+    for dest in config['destinations']:
+        if verify_destination_rsync(dest):
+            valid_destinations.append(dest)
+        else:
+            log(f"Destination {dest['name']} will be disabled due to missing rsync", "ERROR")
+    
+    return valid_destinations
 
 
 class FileScanner(threading.Thread):
@@ -308,6 +396,8 @@ def main():
     parser.add_argument('--log-max-mb', type=int, default=10, help='Max log file size in MB')
     parser.add_argument('--verbose', type=int, default=1, choices=range(0, 10),
                         help='Verbosity level 0-9 (0=WARNING+ERROR, 1=INFO, 2+=DEBUG)')
+    parser.add_argument('--skip-rsync-check', action='store_true',
+                        help='Skip rsync verification on destinations at startup')
     args = parser.parse_args()
 
     setup_logging(args.log_file, args.log_max_mb * 1024 * 1024, verbosity=args.verbose)
@@ -330,6 +420,18 @@ def main():
         sys.exit(1)
 
     log(f"Configured {len(config['destinations'])} destinations: {[d['name'] for d in config['destinations']]}", "INFO")
+
+    # Verify rsync on all destinations
+    if not args.skip_rsync_check:
+        log("Verifying rsync on destination servers...", "INFO")
+        valid_destinations = verify_all_destinations(config)
+        if not valid_destinations:
+            log("No valid destinations available - exiting", "ERROR")
+            sys.exit(1)
+        config['destinations'] = valid_destinations
+        log(f"Verified {len(valid_destinations)} destinations ready", "INFO")
+    else:
+        log("Skipping rsync verification (--skip-rsync-check)", "WARNING")
 
     stop_event = threading.Event()
 
