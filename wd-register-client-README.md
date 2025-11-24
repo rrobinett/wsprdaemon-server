@@ -1,10 +1,10 @@
-# wd-register-client.sh v2.7.0
+# wd-register-client.sh v2.7.4
 
-## ⚠️ Critical Fix in v2.7.0
-**Lock Detection Fixed**: Only unlocks accounts that are TRULY locked
-- `*` password = NOT locked (SSH keys work) ✓
-- `!` or `!!` password = LOCKED (needs unlocking) ✗
-- Stops unnecessary account modifications
+## ⚠️ Critical Fix in v2.7.4
+**User Detection Fixed**: No longer fails when user should exist
+- Properly checks if user exists (uses `getent passwd`)
+- Handles case where group exists but user doesn't
+- Better debugging when things go wrong
 
 ## Quick Start
 ```bash
@@ -50,9 +50,9 @@ Or specify the reporter ID manually:
 ```
 
 ## Version Info
-- Script always displays "wd-register-client.sh version 2.7.0" when running
+- Script always displays "wd-register-client.sh version 2.7.4" when running
 - Use `--version` or `-v` to show version only and exit
-- Version is stored in script as `VERSION="2.7.0"`
+- Version is stored in script as `VERSION="2.7.4"`
 
 ## Files in wsprdaemon-server repository
 - `wd-register-client.sh` - Main script (no version in filename)
@@ -62,10 +62,10 @@ Or specify the reporter ID manually:
 - `wd-register-client-README.md` - This file
 - `wd-register-client-CHANGELOG.md` - Version history
 
-## What's New in v2.7.0  
-- **FIXED**: Lock detection - only unlocks truly locked accounts (! or !!)
-- **FIXED**: No longer unnecessarily modifies accounts with * password
-- **IMPROVED**: Better status reporting explaining lock states
-- **FIXED**: SFTP tests run from client perspective
-- **FIXED**: Hostname detection case-insensitive
-- **FIXED**: Correct server replication (no self-replication)
+## What's New in v2.7.4  
+- **FIXED**: Proper user existence check (uses getent passwd)
+- **FIXED**: Handles existing groups correctly (uses -g flag)
+- **IMPROVED**: Better debugging output
+- **FIXED**: No UID/GID matching between servers
+- **FIXED**: Script aborts on critical failures
+- All fixes from v2.7.3 and earlier versions

@@ -1,5 +1,83 @@
 # wd-register-client.sh Changelog
 
+## v2.7.4 - User Existence Check Fix (November 24, 2025)
+### Fixed
+- **Proper user existence check**:
+  - Uses `getent passwd` instead of `id` (more reliable)
+  - Correctly detects if user exists vs doesn't exist
+- **Handle existing groups**:
+  - If group exists but user doesn't, use `-g` flag
+  - Fixes "group KV0S exists" error
+- **Better debugging**:
+  - Shows what exists when creation fails
+  - Checks user, group, and home directory
+
+### Example of the fix:
+```
+# Before: Failed with "group KV0S exists"
+# After: Detects group exists, uses it: useradd -g KV0S ...
+```
+
+## v2.7.3 - No UID Matching & Proper Error Handling (November 24, 2025)
+### Critical Fixes
+- **No UID/GID matching between servers**:
+  - Was trying to force same UID/GID on all servers (causes conflicts)
+  - Now lets each server assign its own UID/GID
+  - Only usernames need to match for SFTP to work
+- **Abort on critical failures**:
+  - Script now STOPS if user creation fails
+  - No more false "success" messages when things fail
+  - Clear error messages explaining what went wrong
+
+### Why UID Matching Failed
+When KV0S had UID 1019 on GW1, but UID 1019 was already used on GW2 (by G3ZIL),
+the script failed to create the user but continued anyway. Now it:
+1. Doesn't force UID matching
+2. Stops immediately on failure
+3. Provides manual fix instructions
+
+## v2.7.2 - Directory Ownership Fix & Config Cleanup (November 24, 2025)
+### Fixed
+- **CRITICAL: Directory ownership on remote servers**:
+  - `.ssh` and `uploads` directories must be owned by the user, not root
+  - This was causing SFTP failures on GW2
+  - Now sets ownership BEFORE setting restrictive permissions
+  - Checks both permissions AND ownership when validating
+
+### Changed
+- **Client configuration cleanup**:
+  - Removes ALL `WD_SERVER_USER=` lines (deprecated)
+  - Only uses `WD_SERVER_USER_LIST=()` for multi-server support
+  - Cleaner wsprdaemon.conf with no duplicate entries
+
+### Example of the fix:
+```
+# Before (on GW2):
+/home/G3ZIL/uploads owner: root:root  ✗
+/home/G3ZIL/.ssh owner: root:root     ✗
+
+# After (on GW2):
+/home/G3ZIL/uploads owner: G3ZIL:G3ZIL ✓
+/home/G3ZIL/.ssh owner: G3ZIL:G3ZIL    ✓
+```
+
+## v2.7.1 - Group Creation & Connection Handling (November 23, 2025)
+### Fixed
+- **Group creation on remote servers**:
+  - Creates group with matching GID before creating user
+  - Handles cases where GID already exists
+  - Fixes "invalid user" errors during replication
+- **Client connection failures**:
+  - Gracefully handles unreachable clients
+  - Shows manual configuration instructions
+  - Continues with partial success
+  - Better timeout and error messages
+
+### Improved
+- Shows what succeeded vs what needs manual intervention
+- Provides exact configuration lines for manual setup
+- Better error messages explaining connection failures
+
 ## v2.7.0 - Correct Lock Detection (November 23, 2025)
 ### Fixed
 - **Account lock detection now works correctly**:

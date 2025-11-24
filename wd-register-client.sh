@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# wd-register-client.sh v2.7.0
+# wd-register-client.sh v2.7.4
 # 
 # Script to register WSPRDAEMON client stations for SFTP uploads
 # Creates user accounts on gateway servers and configures client access
@@ -15,6 +15,30 @@
 #   ./wd-register-client.sh 84 KJ6MKI       # Register with manual reporter ID
 #   ./wd-register-client.sh 84 --verbose    # Register with verbose output  
 #   ./wd-register-client.sh --version       # Show version only
+#
+# Changes in v2.7.4:
+#   - FIXED: Properly detect if user already exists (use getent passwd, not id)
+#   - FIXED: Handle case where group exists but user doesn't (use -g flag)
+#   - IMPROVED: Better debugging output when user creation fails
+#   - No longer fails if user already exists on remote server
+#
+# Changes in v2.7.3:
+#   - CRITICAL: Don't force UID/GID matching between servers (causes conflicts)
+#   - CRITICAL: Abort on user creation failure (don't report false success)
+#   - Only usernames need to match between servers, not UIDs
+#   - Better error reporting when user creation fails
+#
+# Changes in v2.7.2:
+#   - FIXED: Directory ownership on remote servers (uploads/.ssh must be owned by user)
+#   - FIXED: Set ownership BEFORE setting restrictive permissions
+#   - CHANGED: Remove ALL WD_SERVER_USER lines, only use WD_SERVER_USER_LIST
+#   - IMPROVED: Better ownership checking during replication
+#
+# Changes in v2.7.1:
+#   - FIXED: Create group before user on remote servers
+#   - FIXED: Handle client connection failures gracefully
+#   - Shows manual configuration instructions if client unreachable
+#   - Continues with partial success when client config fails
 #
 # Changes in v2.7.0:
 #   - FIXED: Account lock detection now correctly distinguishes locked accounts
@@ -83,7 +107,7 @@
 # Author: AI6VN (with assistance from Claude)
 # Date: November 2025
 
-VERSION="2.7.0"
+VERSION="2.7.4"
 SCRIPT_NAME="wd-register-client.sh"
 
 # Source bash aliases if available
@@ -234,11 +258,16 @@ function setup_local_user() {
         return 1
     fi
     
-    # Set permissions
-    sudo chmod 700 "$ssh_dir"
+    # Create authorized_keys file
     sudo touch "$ssh_dir/authorized_keys"
+    
+    # Set ownership FIRST (before restrictive permissions)
+    sudo chown "$sanitized_username:$sanitized_username" "$ssh_dir"
+    sudo chown "$sanitized_username:$sanitized_username" "$ssh_dir/authorized_keys"
+    
+    # Then set permissions
+    sudo chmod 700 "$ssh_dir"
     sudo chmod 600 "$ssh_dir/authorized_keys"
-    sudo chown -R "$sanitized_username:$sanitized_username" "$ssh_dir"
     echo "✓ SSH directory configured"
     
     # Setup upload directory
@@ -249,8 +278,9 @@ function setup_local_user() {
         return 1
     fi
     
-    sudo chmod 755 "$upload_dir"
+    # Set ownership and permissions
     sudo chown "$sanitized_username:$sanitized_username" "$upload_dir"
+    sudo chmod 755 "$upload_dir"
     echo "✓ Upload directory configured"
     
     # Fix chroot directory permissions
@@ -271,20 +301,23 @@ function replicate_user_to_server() {
     echo ""
     echo "=== Replicating user to $server ==="
     
-    # Get local user's UID and GID
+    # Get local user's info (for reference only)
     local uid=$(id -u "$sanitized_username" 2>/dev/null)
     local gid=$(id -g "$sanitized_username" 2>/dev/null)
+    local groupname=$(id -gn "$sanitized_username" 2>/dev/null)
     
     if [[ -z "$uid" || -z "$gid" ]]; then
         echo "ERROR: Could not get UID/GID for user '$sanitized_username'"
         return 1
     fi
     
-    echo "Local user $sanitized_username: UID=$uid, GID=$gid"
+    echo "Local user $sanitized_username: UID=$uid, GID=$gid, Group=$groupname"
+    echo "Note: Remote server will use its own available UID/GID"
     
-    # Check if user exists on remote server
-    if ssh "$server" "id '$sanitized_username' 2>/dev/null" >/dev/null; then
-        echo "✓ User already exists on $server"
+    # Check if user exists on remote server (more thorough check)
+    echo "Checking if user exists on $server..."
+    if ssh "$server" "getent passwd '$sanitized_username' >/dev/null 2>&1"; then
+        echo "✓ User '$sanitized_username' already exists on $server"
         
         # Check if account is TRULY locked on remote (! or !! in shadow, not *)
         echo "  Checking account status on $server..."
@@ -303,10 +336,37 @@ function replicate_user_to_server() {
         fi
         local remote_user_exists=1
     else
-        echo "Creating user on $server..."
-        if ! ssh "$server" "sudo useradd -m -u $uid -g $gid -d '/home/$sanitized_username' -s /usr/sbin/nologin '$sanitized_username' 2>/dev/null || true"; then
-            echo "WARNING: useradd reported an issue (user might already exist)"
+        echo "User does not exist on $server, creating..."
+        
+        # Check if a group with the same name already exists
+        local group_exists=$(ssh "$server" "getent group '$sanitized_username' >/dev/null 2>&1 && echo 'yes' || echo 'no'")
+        
+        if [[ "$group_exists" == "yes" ]]; then
+            echo "  Group '$sanitized_username' already exists on $server"
+            echo "  Creating user '$sanitized_username' using existing group..."
+            if ! ssh "$server" "sudo useradd -m -g '$sanitized_username' -d '/home/$sanitized_username' -s /usr/sbin/nologin '$sanitized_username'"; then
+                echo "ERROR: Failed to create user on $server even with existing group"
+                echo "Debugging: Checking what exists on $server..."
+                ssh "$server" "
+                    echo '  User check:' && getent passwd '$sanitized_username' || echo '    User does not exist'
+                    echo '  Group check:' && getent group '$sanitized_username' || echo '    Group does not exist'
+                    echo '  Home dir:' && ls -ld '/home/$sanitized_username' 2>/dev/null || echo '    No home directory'
+                "
+                return 1
+            fi
+        else
+            echo "  Creating new user '$sanitized_username' (server will assign UID/GID)..."
+            if ! ssh "$server" "sudo useradd -m -d '/home/$sanitized_username' -s /usr/sbin/nologin '$sanitized_username'"; then
+                echo "ERROR: Failed to create user on $server"
+                echo "Debugging: Checking what exists on $server..."
+                ssh "$server" "
+                    echo '  User check:' && getent passwd '$sanitized_username' || echo '    User does not exist'
+                    echo '  Group check:' && getent group '$sanitized_username' || echo '    Group does not exist'
+                "
+                return 1
+            fi
         fi
+        echo "  ✓ User created successfully on $server"
         local remote_user_exists=0
     fi
     
@@ -332,11 +392,14 @@ function replicate_user_to_server() {
     echo "Checking directories on $server..."
     local dirs_ok=$(ssh "$server" "
         if [[ -d /home/$sanitized_username/.ssh && -d /home/$sanitized_username/uploads ]]; then
-            # Check permissions
+            # Check ownership and permissions
+            ssh_owner=\$(stat -c '%U:%G' /home/$sanitized_username/.ssh 2>/dev/null)
+            upload_owner=\$(stat -c '%U:%G' /home/$sanitized_username/uploads 2>/dev/null)
             ssh_perm=\$(stat -c '%a' /home/$sanitized_username/.ssh 2>/dev/null)
             upload_perm=\$(stat -c '%a' /home/$sanitized_username/uploads 2>/dev/null)
             home_owner=\$(stat -c '%U' /home/$sanitized_username 2>/dev/null)
-            if [[ \"\$ssh_perm\" == \"700\" && \"\$upload_perm\" == \"755\" && \"\$home_owner\" == \"root\" ]]; then
+            
+            if [[ \"\$ssh_perm\" == \"700\" && \"\$upload_perm\" == \"755\" && \"\$home_owner\" == \"root\" && \"\$ssh_owner\" == \"$sanitized_username:$sanitized_username\" && \"\$upload_owner\" == \"$sanitized_username:$sanitized_username\" ]]; then
                 echo 'ok'
             else
                 echo 'fix_perms'
@@ -350,21 +413,27 @@ function replicate_user_to_server() {
         echo "  ✓ Directories already configured correctly on $server"
     else
         if [[ "$dirs_ok" == "fix_perms" ]]; then
-            echo "  Fixing directory permissions on $server..."
+            echo "  Fixing directory ownership and permissions on $server..."
         else
             echo "  Creating directories on $server..."
         fi
         ssh "$server" "
             sudo mkdir -p /home/$sanitized_username/{.ssh,uploads}
-            sudo chmod 700 /home/$sanitized_username/.ssh
-            sudo chmod 755 /home/$sanitized_username/uploads
             sudo touch /home/$sanitized_username/.ssh/authorized_keys
-            sudo chmod 600 /home/$sanitized_username/.ssh/authorized_keys
-            sudo chown -R $sanitized_username:$sanitized_username /home/$sanitized_username/{.ssh,uploads}
+            
+            # Set ownership FIRST (before setting restrictive permissions)
+            sudo chown $sanitized_username:$sanitized_username /home/$sanitized_username/.ssh
+            sudo chown $sanitized_username:$sanitized_username /home/$sanitized_username/.ssh/authorized_keys
+            sudo chown $sanitized_username:$sanitized_username /home/$sanitized_username/uploads
             sudo chown root:root /home/$sanitized_username
+            
+            # Then set permissions
             sudo chmod 755 /home/$sanitized_username
+            sudo chmod 700 /home/$sanitized_username/.ssh
+            sudo chmod 600 /home/$sanitized_username/.ssh/authorized_keys
+            sudo chmod 755 /home/$sanitized_username/uploads
         "
-        echo "  ✓ Directories configured on $server"
+        echo "  ✓ Directories configured with correct ownership on $server"
     fi
     
     return 0
@@ -591,19 +660,40 @@ function configure_client_access() {
     done
     
     echo "  Writing configuration to client..."
-    ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
-        # Handle WD_SERVER_USER (backward compatibility)
+    if ! ssh -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+        # Remove ALL old WD_SERVER_USER lines (both single and list)
         sed -i '/^[[:space:]]*WD_SERVER_USER=/d' ${config_file}
-        echo 'WD_SERVER_USER=\"${sanitized_username}@${primary_server}\"' >> ${config_file}
-        
-        # Handle WD_SERVER_USER_LIST
         sed -i '/^[[:space:]]*WD_SERVER_USER_LIST=/d' ${config_file}
+        
+        # Add the new WD_SERVER_USER_LIST line
         echo 'WD_SERVER_USER_LIST=($server_list)' >> ${config_file}
-    "
+        
+        # Verify the changes
+        echo 'Configuration updated:'
+        grep -E '^WD_SERVER_USER' ${config_file} || echo 'No WD_SERVER_USER lines found'
+    " 2>/dev/null; then
+        echo "  ⚠ WARNING: Could not write configuration to client"
+        echo "    Possible causes:"
+        echo "    - Client may be offline or unreachable"
+        echo "    - SSH port forwarding may have issues"
+        echo "    - Connection on port ${client_ip_port} may be blocked"
+        echo ""
+        echo "    Manual configuration needed on client:"
+        echo "    1. Remove any existing WD_SERVER_USER lines from ${config_file}"
+        echo "    2. Add this line:"
+        echo "       WD_SERVER_USER_LIST=($server_list)"
+        return 1
+    fi
     
     # Verify configuration
     echo "  Verifying configuration..."
-    local configured_list=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "grep '^WD_SERVER_USER_LIST=' ${config_file} 2>/dev/null")
+    if ! ssh -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "grep '^WD_SERVER_USER_LIST=' ${config_file} 2>/dev/null" 2>/dev/null; then
+        echo "  ⚠ WARNING: Could not verify configuration on client"
+        echo "    Client may need manual configuration"
+        local configured_list=""
+    else
+        local configured_list=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "grep '^WD_SERVER_USER_LIST=' ${config_file} 2>/dev/null")
+    fi
     
     if [[ -n "$configured_list" ]]; then
         echo ""
@@ -890,7 +980,27 @@ function main() {
     # Replicate to backup servers
     for backup_server in $WD_BACKUP_SERVERS; do
         if ! replicate_user_to_server "$client_reporter_id" "$sanitized_reporter_id" "$backup_server"; then
-            echo "WARNING: Failed to replicate to $backup_server (continuing anyway)"
+            echo ""
+            echo "========================================="
+            echo "✗ CRITICAL ERROR: Failed to replicate user to $backup_server"
+            echo "========================================="
+            echo ""
+            echo "The user account could not be created on $backup_server."
+            echo "This is a critical failure - both servers must have the user account."
+            echo ""
+            echo "Common causes:"
+            echo "  1. User already exists with different settings"
+            echo "  2. SSH connection issues to $backup_server"
+            echo "  3. Permission problems on $backup_server"
+            echo ""
+            echo "To fix manually:"
+            echo "  ssh $backup_server"
+            echo "  sudo useradd -m -s /usr/sbin/nologin '$sanitized_reporter_id'"
+            echo "  sudo usermod -p '*' '$sanitized_reporter_id'"
+            echo "  sudo usermod -a -G sftponly '$sanitized_reporter_id'"
+            echo ""
+            echo "Then re-run this script."
+            exit 1
         fi
     done
     
@@ -907,15 +1017,32 @@ function main() {
     # Configure client for multi-server access
     # ALWAYS configure for all servers regardless of test results
     if ! configure_client_access "$client_rac" "$client_user" "$client_ip_port" "$sanitized_reporter_id" "$WD_RAC_SERVER" "${all_servers[@]}"; then
-        echo "ERROR: Failed to configure client access"
-        exit 1
+        echo "WARNING: Could not configure client automatically"
+        echo ""
+        echo "========================================="
+        echo "⚠ Server setup completed, client needs manual config!"
+        echo "========================================="
+        echo ""
+        echo "Server-side configuration:"
+        echo "  ✓ User accounts created on all servers"
+        echo "  ✓ SSH keys installed"
+        echo "  ✓ Directories configured"
+        echo ""
+        echo "Client-side configuration needed:"
+        echo "  1. SSH to client: ssh -p ${client_ip_port} ${client_user}@${WD_RAC_SERVER}"
+        echo "  2. Edit ~/wsprdaemon/wsprdaemon.conf"
+        echo "  3. Remove any existing WD_SERVER_USER or WD_SERVER_USER_LIST lines"
+        echo "  4. Add this line:"
+        echo "     WD_SERVER_USER_LIST=(\"${sanitized_reporter_id}@gw1.wsprdaemon.org\" \"${sanitized_reporter_id}@gw2.wsprdaemon.org\")"
+        echo ""
+    else
+        echo ""
+        echo "========================================="
+        echo "✓ Client registration completed!"
+        echo "========================================="
+        echo ""
     fi
     
-    echo ""
-    echo "========================================="
-    echo "✓ Client registration completed!"
-    echo "========================================="
-    echo ""
     echo "Reporter: $client_reporter_id"
     echo "Username: $sanitized_reporter_id"
     echo "Servers configured: ${#all_servers[@]}"
