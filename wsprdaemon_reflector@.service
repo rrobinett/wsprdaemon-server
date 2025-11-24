@@ -4,8 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=wsprdaemon
-Group=wsprdaemon
+User=root
+Group=root
 ExecStart=/usr/local/bin/wsprdaemon_reflector.sh /etc/wsprdaemon/%i_destinations.json
 Restart=always
 RestartSec=10
