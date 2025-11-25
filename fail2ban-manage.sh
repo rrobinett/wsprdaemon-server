@@ -1,183 +1,387 @@
 #!/bin/bash
-# Fail2ban management script v2.0
-# Protected networks: 10.0.0.0/8, 172.30.31.0/24
+# fail2ban-manage.sh - Comprehensive fail2ban management tool
+# Version: 1.1
+# Includes permanent unban with database cleanup
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+VERSION="1.1"
 
-# Function to check if IP is in protected range
-is_protected_ip() {
-    local ip=$1
-    # Check if IP is in 10.0.0.0/8 or 172.30.31.0/24
-    if [[ $ip =~ ^10\. ]] || [[ $ip =~ ^172\.30\.31\. ]] || [[ $ip == "127.0.0.1" ]]; then
-        return 0  # Protected
+# Database location
+DB_FILE="/var/lib/fail2ban/fail2ban.sqlite3"
+
+# Function to check if running with sudo
+check_sudo() {
+    if [ "$EUID" -ne 0 ]; then 
+        echo "This command requires sudo privileges"
+        exit 1
     fi
-    return 1  # Not protected
+}
+
+# Function to get all active jails
+get_jails() {
+    fail2ban-client status 2>/dev/null | grep "Jail list" | sed 's/.*://;s/,/ /g'
 }
 
 case "$1" in
+    version)
+        echo "fail2ban-manage version $VERSION"
+        ;;
+    
     status)
-        echo -e "${GREEN}=== Fail2ban Status ===${NC}"
-        sudo systemctl is-active fail2ban
+        check_sudo
+        echo "=== Fail2ban Status ==="
+        echo "Service: $(systemctl is-active fail2ban)"
+        echo "Uptime: $(systemctl show fail2ban -p ActiveEnterTimestamp --value)"
         echo ""
-        sudo fail2ban-client status
+        fail2ban-client status
         echo ""
-        echo -e "${YELLOW}Protected Networks:${NC} 10.0.0.0/8, 172.30.31.0/24"
-        echo ""
-        for jail in $(sudo fail2ban-client status | grep "Jail list" | sed 's/.*://;s/,//g'); do
-            echo -e "${YELLOW}[$jail]${NC}"
-            sudo fail2ban-client status "$jail" | grep -E "Currently failed|Total failed|Currently banned|Total banned"
-            bans=$(sudo fail2ban-client status "$jail" | grep "Banned IP list:" | sed 's/.*Banned IP list://')
+        
+        for jail in $(get_jails); do
+            echo "[$jail]"
+            status=$(fail2ban-client status "$jail" 2>/dev/null)
+            echo "$status" | grep -E "Currently failed|Total failed|Currently banned|Total banned" | sed 's/^/  /'
+            bans=$(echo "$status" | grep "Banned IP list:" | sed 's/.*Banned IP list://')
             if [ ! -z "$bans" ] && [ "$bans" != "" ]; then
-                echo "  Banned IPs: $bans"
+                echo "  Banned IPs:$bans"
             fi
             echo ""
         done
         ;;
     
     banned)
-        echo -e "${GREEN}=== All Banned IPs ===${NC}"
-        for jail in $(sudo fail2ban-client status | grep "Jail list" | sed -E 's/^[^:]+:[ \t]+//' | sed 's/,//g'); do
-            echo -e "${YELLOW}Jail: $jail${NC}"
-            banned_list=$(sudo fail2ban-client status "$jail" | grep "Banned IP list:" | sed 's/.*://')
-            if [ ! -z "$banned_list" ]; then
-                for ip in $banned_list; do
-                    if is_protected_ip "$ip"; then
-                        echo -e "  ${RED}$ip (WARNING: LOCAL IP SHOULD NOT BE BANNED!)${NC}"
-                    else
-                        echo "  $ip"
-                    fi
-                done
+        check_sudo
+        echo "=== All Banned IPs ==="
+        total=0
+        for jail in $(get_jails); do
+            bans=$(fail2ban-client status "$jail" 2>/dev/null | grep "Banned IP list:" | sed 's/.*Banned IP list://')
+            if [ ! -z "$bans" ] && [ "$bans" != "" ]; then
+                echo "$jail:$bans"
+                count=$(echo "$bans" | wc -w)
+                total=$((total + count))
             fi
         done
+        echo ""
+        echo "Total banned IPs: $total"
         ;;
     
     unban)
+        check_sudo
         if [ -z "$2" ]; then
-            echo "Usage: $0 unban <ip>"
-            echo "   or: $0 unban <jail> <ip>"
+            echo "Usage: $0 unban <ip> [jail]"
+            echo "   or: $0 unban all  (unban all IPs)"
             exit 1
         fi
-        if [ -z "$3" ]; then
-            # Unban from all jails
-            ip="$2"
-            if is_protected_ip "$ip"; then
-                echo -e "${YELLOW}Note: $ip is in protected range and should never be banned${NC}"
-            fi
-            echo "Unbanning $ip from all jails..."
-            for jail in $(sudo fail2ban-client status | grep "Jail list" | sed 's/.*://;s/,//g'); do
-                sudo fail2ban-client set "$jail" unbanip "$ip" 2>/dev/null && \
-                    echo -e "${GREEN}  Unbanned from $jail${NC}"
+        
+        if [ "$2" = "all" ]; then
+            echo "Unbanning all IPs from all jails..."
+            for jail in $(get_jails); do
+                ips=$(fail2ban-client status "$jail" 2>/dev/null | grep "Banned IP list:" | sed 's/.*Banned IP list://;s/\s\+/\n/g')
+                for ip in $ips; do
+                    [ ! -z "$ip" ] && fail2ban-client set "$jail" unbanip "$ip" 2>/dev/null && \
+                        echo "  ✓ Unbanned $ip from $jail"
+                done
             done
-        else
-            # Unban from specific jail
-            if is_protected_ip "$3"; then
-                echo -e "${YELLOW}Note: $3 is in protected range and should never be banned${NC}"
+            if [ -f "$DB_FILE" ]; then
+                count=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM bans;" 2>/dev/null)
+                sqlite3 "$DB_FILE" "DELETE FROM bans;" 2>/dev/null
+                echo "  ✓ Removed $count entries from database"
             fi
-            sudo fail2ban-client set "$2" unbanip "$3"
-            echo -e "${GREEN}Unbanned $3 from $2${NC}"
+        else
+            ip="$2"
+            jail="$3"
+            
+            echo "Unbanning $ip..."
+            
+            # Remove from specific jail or all jails
+            if [ ! -z "$jail" ]; then
+                fail2ban-client set "$jail" unbanip "$ip" 2>/dev/null && \
+                    echo "  ✓ Removed from $jail"
+            else
+                for j in $(get_jails); do
+                    fail2ban-client set "$j" unbanip "$ip" 2>/dev/null && \
+                        echo "  ✓ Removed from $j"
+                done
+            fi
+            
+            # Remove from database - CRITICAL for permanent unbans
+            if [ -f "$DB_FILE" ]; then
+                count=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM bans WHERE ip='$ip';" 2>/dev/null)
+                if [ "$count" -gt "0" ]; then
+                    sqlite3 "$DB_FILE" "DELETE FROM bans WHERE ip='$ip';" 2>/dev/null
+                    echo "  ✓ Removed $count database entries"
+                else
+                    echo "  ℹ No database entries found"
+                fi
+            fi
+            
+            # Verify removal
+            if ! iptables -L -n 2>/dev/null | grep -q "$ip"; then
+                echo "✓ IP $ip completely unbanned"
+            else
+                echo "⚠ Warning: IP may still be in iptables"
+            fi
         fi
         ;;
     
     ban)
+        check_sudo
         if [ -z "$2" ] || [ -z "$3" ]; then
             echo "Usage: $0 ban <jail> <ip>"
             exit 1
         fi
-        if is_protected_ip "$3"; then
-            echo -e "${RED}ERROR: Cannot ban $3 - IP is in protected range${NC}"
-            echo "Protected ranges: 10.0.0.0/8, 172.30.31.0/24"
-            exit 1
-        fi
-        sudo fail2ban-client set "$2" banip "$3"
-        echo -e "${GREEN}Banned $3 in $2${NC}"
-        ;;
-    
-    check-local)
-        echo -e "${GREEN}=== Checking for Banned Local IPs ===${NC}"
-        found=0
-        for jail in $(sudo fail2ban-client status | grep "Jail list" | sed 's/.*://;s/,//g'); do
-            banned_ips=$(sudo fail2ban-client status "$jail" | grep "Banned IP list:" | sed 's/.*://')
-            for ip in $banned_ips; do
-                if is_protected_ip "$ip"; then
-                    echo -e "${RED}WARNING: Local IP $ip is banned in $jail!${NC}"
-                    echo "  Run: $0 unban $ip"
-                    found=1
-                fi
-            done
-        done
-        if [ $found -eq 0 ]; then
-            echo -e "${GREEN}✓ No local IPs are banned${NC}"
-        fi
+        fail2ban-client set "$2" banip "$3"
+        echo "✓ Banned $3 in $2"
         ;;
     
     whitelist)
-        echo -e "${GREEN}=== Current Whitelist Configuration ===${NC}"
-        echo "Protected Networks: 10.0.0.0/8, 172.30.31.0/24"
+        check_sudo
+        if [ -z "$2" ]; then
+            echo "Usage: $0 whitelist <ip> [add|remove|check]"
+            echo "   or: $0 whitelist list"
+            exit 1
+        fi
+        
+        if [ "$2" = "list" ]; then
+            echo "=== Whitelisted IPs ==="
+            grep -h "ignoreip" /etc/fail2ban/jail.local /etc/fail2ban/jail.d/*.conf 2>/dev/null | \
+                sort -u | sed 's/ignoreip.*=//' | tr ' ' '\n' | sort -u | grep -v "^$\|127.0.0.1\|::1"
+            exit 0
+        fi
+        
+        IP="$2"
+        ACTION="${3:-add}"
+        
+        case "$ACTION" in
+            add)
+                echo "Adding $IP to whitelist..."
+                
+                # First unban from all active jails
+                for jail in $(get_jails); do
+                    fail2ban-client set "$jail" unbanip "$IP" 2>/dev/null
+                done
+                
+                # Remove from database
+                if [ -f "$DB_FILE" ]; then
+                    sqlite3 "$DB_FILE" "DELETE FROM bans WHERE ip='$IP';" 2>/dev/null
+                fi
+                
+                # Add to config files
+                for conf in /etc/fail2ban/jail.local /etc/fail2ban/jail.d/*.conf; do
+                    if [ -f "$conf" ] && grep -q "^ignoreip" "$conf"; then
+                        if ! grep -q "ignoreip.*$IP" "$conf"; then
+                            sed -i "/^ignoreip/s/$/ $IP/" "$conf"
+                            echo "  ✓ Added to $(basename $conf)"
+                        fi
+                    fi
+                done
+                
+                systemctl reload fail2ban
+                echo "✓ IP $IP is now whitelisted"
+                ;;
+                
+            remove)
+                echo "Removing $IP from whitelist..."
+                for conf in /etc/fail2ban/jail.local /etc/fail2ban/jail.d/*.conf; do
+                    if [ -f "$conf" ]; then
+                        sed -i "s/ $IP//g; s/$IP //g" "$conf" 2>/dev/null
+                    fi
+                done
+                systemctl reload fail2ban
+                echo "✓ IP $IP removed from whitelist"
+                ;;
+                
+            check)
+                echo "Checking if $IP is whitelisted..."
+                found=0
+                for conf in /etc/fail2ban/jail.local /etc/fail2ban/jail.d/*.conf; do
+                    if [ -f "$conf" ] && grep -q "$IP" "$conf" 2>/dev/null; then
+                        echo "  ✓ Found in $(basename $conf)"
+                        found=1
+                    fi
+                done
+                if [ $found -eq 0 ]; then
+                    echo "  ✗ Not whitelisted"
+                fi
+                ;;
+        esac
+        ;;
+    
+    investigate)
+        check_sudo
+        if [ -z "$2" ]; then
+            echo "Usage: $0 investigate <ip>"
+            exit 1
+        fi
+        
+        IP="$2"
+        echo "=== Investigating $IP ==="
+        
+        # Check which jails have it banned
         echo ""
-        echo "Configuration files:"
-        grep -h "^ignoreip" /etc/fail2ban/jail.local /etc/fail2ban/jail.d/*.conf 2>/dev/null | sort -u
+        echo "Current Status:"
+        banned_in=""
+        for jail in $(get_jails); do
+            if fail2ban-client status "$jail" 2>/dev/null | grep -q "$IP"; then
+                echo "  ✗ BANNED in $jail"
+                banned_in="$banned_in $jail"
+            fi
+        done
+        if [ -z "$banned_in" ]; then
+            echo "  ✓ Not currently banned"
+        fi
+        
+        # Check database
+        if [ -f "$DB_FILE" ]; then
+            echo ""
+            echo "Database Records:"
+            sqlite3 "$DB_FILE" -header -column \
+                "SELECT jail, datetime(timeofban, 'unixepoch', 'localtime') as banned_at,
+                 datetime(timeofban + bantime, 'unixepoch', 'localtime') as expires_at
+                 FROM bans WHERE ip='$IP';" 2>/dev/null || echo "  No database records"
+        fi
+        
+        # Check fail2ban logs
+        echo ""
+        echo "Fail2ban Events:"
+        grep "$IP" /var/log/fail2ban.log 2>/dev/null | tail -5 | sed 's/^/  /'
+        
+        # Check SSH attempts
+        echo ""
+        echo "SSH Authentication Attempts:"
+        attempts=$(journalctl -u sshd.service 2>/dev/null | grep -c "$IP")
+        echo "  Total attempts: $attempts"
+        
+        if [ $attempts -gt 0 ]; then
+            echo ""
+            echo "Recent SSH Logs:"
+            journalctl -u sshd.service 2>/dev/null | grep "$IP" | tail -5 | sed 's/^/  /'
+            
+            echo ""
+            echo "Usernames Attempted:"
+            journalctl -u sshd.service 2>/dev/null | grep "$IP" | \
+                grep -oE "(Invalid user |Failed password for )[^ ]+" | \
+                sed 's/Invalid user //;s/Failed password for //' | \
+                sort | uniq -c | sort -rn | sed 's/^/  /'
+        fi
         ;;
     
     test)
-        echo -e "${GREEN}=== Testing Configuration ===${NC}"
-        sudo fail2ban-client -d 2>&1 | head -20
+        check_sudo
+        echo "=== Testing Configuration ==="
+        fail2ban-client -t
         ;;
     
     logs)
-        sudo journalctl -u fail2ban.service -f
+        check_sudo
+        echo "=== Following fail2ban logs (Ctrl+C to stop) ==="
+        journalctl -u fail2ban.service -f
         ;;
     
     watch)
-        echo -e "${GREEN}=== Watching for Invalid Login Attempts ===${NC}"
-        echo "Monitoring for: root, admin, test, ubuntu, and non-existent users"
-        echo -e "${YELLOW}Protected networks: 10.0.0.0/8, 172.30.31.0/24${NC}"
-        echo "Press Ctrl+C to stop"
+        check_sudo
+        echo "=== Watching for SSH attacks (Ctrl+C to stop) ==="
+        echo "Monitoring for: root, admin, test, ubuntu, and invalid users"
         echo ""
-        sudo journalctl -fu sshd.service | while read line; do
+        
+        journalctl -fu sshd.service | while read line; do
             if echo "$line" | grep -qE "Invalid user"; then
-                echo -e "${RED}[INVALID USER]${NC} $line"
+                echo "[INVALID USER] $line"
             elif echo "$line" | grep -qE "Failed password for root"; then
-                echo -e "${RED}[ROOT ATTEMPT]${NC} $line"
+                echo "[ROOT ATTEMPT] $line"
             elif echo "$line" | grep -qE "Failed password for (admin|test|ubuntu)"; then
-                echo -e "${YELLOW}[RESERVED USER]${NC} $line"
+                echo "[RESERVED USER] $line"
+            elif echo "$line" | grep -qE "Accepted publickey"; then
+                echo "[LOGIN OK] $line"
+            elif echo "$line" | grep -qE "Failed password"; then
+                echo "[FAILED LOGIN] $line"
             fi
         done
         ;;
     
     stats)
-        echo -e "${GREEN}=== Fail2ban Statistics ===${NC}"
-        echo "Uptime: $(sudo fail2ban-client status | grep "Number of jail" | head -1)"
-        echo -e "${YELLOW}Protected Networks:${NC} 10.0.0.0/8, 172.30.31.0/24"
+        check_sudo
+        echo "=== Fail2ban Statistics ==="
+        
+        # Service info
         echo ""
+        echo "Service Status:"
+        echo "  Status: $(systemctl is-active fail2ban)"
+        echo "  Started: $(systemctl show fail2ban -p ActiveEnterTimestamp --value)"
+        
+        # Calculate totals
         total_banned=0
         total_failed=0
-        for jail in $(sudo fail2ban-client status | grep "Jail list" | sed 's/.*://;s/,//g'); do
-            banned=$(sudo fail2ban-client status "$jail" | grep "Total banned:" | awk '{print $NF}')
-            failed=$(sudo fail2ban-client status "$jail" | grep "Total failed:" | awk '{print $NF}')
+        active_bans=0
+        
+        for jail in $(get_jails); do
+            status=$(fail2ban-client status "$jail" 2>/dev/null)
+            banned=$(echo "$status" | grep "Total banned:" | awk '{print $NF}')
+            failed=$(echo "$status" | grep "Total failed:" | awk '{print $NF}')
+            current=$(echo "$status" | grep "Currently banned:" | awk '{print $NF}')
+            
             [ ! -z "$banned" ] && total_banned=$((total_banned + banned))
             [ ! -z "$failed" ] && total_failed=$((total_failed + failed))
+            [ ! -z "$current" ] && active_bans=$((active_bans + current))
         done
-        echo "Total Failed Attempts: $total_failed"
-        echo "Total Banned IPs: $total_banned"
+        
+        echo ""
+        echo "Totals:"
+        echo "  Total Failed Attempts: $total_failed"
+        echo "  Total Banned IPs: $total_banned"
+        echo "  Currently Banned: $active_bans"
+        
+        if [ -f "$DB_FILE" ]; then
+            db_count=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM bans;" 2>/dev/null)
+            echo "  Database Entries: $db_count"
+        fi
+        
+        # Top banned IPs today
+        echo ""
+        echo "Today's Activity:"
+        today_bans=$(grep "$(date +%Y-%m-%d)" /var/log/fail2ban.log 2>/dev/null | grep -c "Ban")
+        echo "  Bans today: $today_bans"
+        ;;
+    
+    reload)
+        check_sudo
+        echo "Reloading fail2ban..."
+        systemctl reload fail2ban
+        echo "✓ Fail2ban reloaded"
+        ;;
+    
+    restart)
+        check_sudo
+        echo "Restarting fail2ban..."
+        systemctl restart fail2ban
+        sleep 2
+        echo "✓ Fail2ban restarted"
+        $0 status
         ;;
     
     *)
-        echo "Usage: $0 {status|banned|unban|ban|check-local|whitelist|test|logs|watch|stats}"
+        echo "fail2ban-manage v$VERSION - Comprehensive fail2ban management"
         echo ""
-        echo "  status       - Show all jails and their status"
-        echo "  banned       - List all banned IPs"
-        echo "  unban        - Unban IP from all jails"
-        echo "  ban          - Manually ban an IP (blocked for local IPs)"
-        echo "  check-local  - Check if any local IPs are banned"
-        echo "  whitelist    - Show whitelist configuration"
-        echo "  test         - Test configuration"
-        echo "  logs         - Follow fail2ban logs"
-        echo "  watch        - Watch for invalid login attempts"
-        echo "  stats        - Show statistics"
+        echo "Usage: $0 <command> [options]"
         echo ""
-        echo -e "${YELLOW}Protected networks: 10.0.0.0/8, 172.30.31.0/24${NC}"
+        echo "Commands:"
+        echo "  status              - Show all jails and their status"
+        echo "  banned              - List all banned IPs"
+        echo "  unban <ip>          - Permanently unban IP (removes from DB)"
+        echo "  unban all           - Unban all IPs"
+        echo "  ban <jail> <ip>     - Manually ban an IP"
+        echo "  whitelist <ip> add  - Add IP to whitelist"
+        echo "  whitelist list      - Show all whitelisted IPs"
+        echo "  investigate <ip>    - Show why IP was banned"
+        echo "  test                - Test configuration"
+        echo "  logs                - Follow fail2ban logs"
+        echo "  watch               - Watch for SSH attacks"
+        echo "  stats               - Show statistics"
+        echo "  reload              - Reload fail2ban"
+        echo "  restart             - Restart fail2ban"
+        echo "  version             - Show version"
+        echo ""
+        echo "Examples:"
+        echo "  $0 unban 192.168.1.100"
+        echo "  $0 whitelist 10.0.0.5 add"
+        echo "  $0 investigate 45.78.219.24"
         ;;
 esac
