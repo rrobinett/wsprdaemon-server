@@ -19,7 +19,7 @@ import clickhouse_connect
 import logging
 
 # Version
-VERSION = "2.10.0"  # Added retry logic with exponential backoff for ClickHouse insert failures
+VERSION = "2.11.0"  # Made incoming_tbz_dirs configurable via --incoming-dirs argument
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -30,7 +30,7 @@ DEFAULT_CONFIG = {
     'clickhouse_database': 'wsprdaemon',
     'clickhouse_spots_table': 'spots_extended',
     'clickhouse_noise_table': 'noise',
-    'incoming_tbz_dirs': ['/var/spool/wsprdaemon/from-wd0', '/var/spool/wsprdaemon/from-wd00'],
+    'incoming_tbz_dirs': [],  # Must be specified via --incoming-dirs
     'extraction_dir': '/var/lib/wsprdaemon/extraction',
     'processed_tbz_file': '/var/lib/wsprdaemon/wsprdaemon/processed_tbz_list.txt',
     'max_processed_file_size': 1000000,
@@ -938,6 +938,8 @@ def main():
     parser.add_argument('--log-max-mb', type=int, default=10, help='Max log file size in MB before truncation')
     parser.add_argument('--verbose', type=int, default=0, choices=range(0, 10), metavar='LEVEL',
                        help='Verbosity level 0-9 (0=WARNING+ERROR, 1=INFO, 2+=DEBUG)')
+    parser.add_argument('--incoming-dirs', required=True,
+                       help='Comma-separated list of directories to scan for .tbz files')
     args = parser.parse_args()
 
     if args.log_file:
@@ -959,6 +961,12 @@ def main():
     # Override with command line credentials
     config['clickhouse_user'] = args.clickhouse_user
     config['clickhouse_password'] = args.clickhouse_password
+
+    # Parse incoming directories from command line
+    config['incoming_tbz_dirs'] = [d.strip() for d in args.incoming_dirs.split(',') if d.strip()]
+    if not config['incoming_tbz_dirs']:
+        log("ERROR: No valid incoming directories specified", "ERROR")
+        sys.exit(1)
 
     log(f"Incoming directories: {config['incoming_tbz_dirs']}", "INFO")
 

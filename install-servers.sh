@@ -1,5 +1,6 @@
 #!/bin/bash
 # install-servers.sh - Install WSPRNET Scraper and WSPRDAEMON Server Services
+# Version: 1.2.0 - Added configurable INCOMING_DIRS
 
 set -e
 
@@ -33,7 +34,7 @@ echo "  Created $INSTALL_DIR"
 
 # Create necessary data directories (but don't recursively chown if they already exist)
 echo "Creating data directories..."
-for dir in /var/spool/wsprdaemon /var/lib/wsprdaemon/wsprnet /var/lib/wsprdaemon/wsprdaemon /var/log/wsprdaemon /etc/wsprdaemon; do
+for dir in /var/spool/wsprdaemon /var/spool/wsprdaemon/from-gw1 /var/spool/wsprdaemon/from-gw2 /var/lib/wsprdaemon/wsprnet /var/lib/wsprdaemon/wsprdaemon /var/log/wsprdaemon /etc/wsprdaemon /tmp/wsprdaemon; do
     if [[ ! -d "$dir" ]]; then
         mkdir -p "$dir"
         chown $INSTALL_USER:$INSTALL_USER "$dir"
@@ -60,7 +61,7 @@ fi
 # Install Python dependencies
 echo "Installing Python dependencies..."
 $VENV_DIR/bin/pip install --upgrade pip --quiet
-$VENV_DIR/bin/pip install requests clickhouse-connect numpy numpy --quiet
+$VENV_DIR/bin/pip install requests clickhouse-connect numpy --quiet
 echo "  Dependencies installed"
 
 # Install Python scripts
@@ -81,13 +82,80 @@ chmod +x /usr/local/bin/wsprdaemon_server.sh
 chmod +x /usr/local/bin/wsprnet_cache_manager.sh
 echo "  Wrapper scripts installed"
 
-# Install systemd service files
-echo "Installing systemd service files..."
-cp "$SCRIPT_DIR/wsprnet_scraper@.service" /etc/systemd/system/
-cp "$SCRIPT_DIR/wsprdaemon_server@.service" /etc/systemd/system/
+# Create systemd service files inline (to ensure correct content)
+echo "Creating systemd service files..."
+
+cat > /etc/systemd/system/wsprnet_scraper@.service << 'SERVICEEOF'
+[Unit]
+Description=WSPRNET Scraper (%i)
+After=network.target clickhouse-server.service
+Wants=clickhouse-server.service
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=wsprdaemon
+ExecStart=/usr/local/bin/wsprnet_scraper.sh /etc/wsprdaemon/%i.conf
+Restart=on-failure
+RestartSec=60
+
+# Memory limits
+MemoryMax=1G
+MemoryHigh=768M
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/wsprdaemon /var/lib/wsprdaemon
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wsprnet-scraper-%i
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+cat > /etc/systemd/system/wsprdaemon_server@.service << 'SERVICEEOF'
+[Unit]
+Description=WSPRDAEMON Server (%i)
+After=network.target clickhouse-server.service
+Wants=clickhouse-server.service
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=wsprdaemon
+ExecStart=/usr/local/bin/wsprdaemon_server.sh /etc/wsprdaemon/%i.conf
+Restart=on-failure
+RestartSec=60
+
+# Memory limits
+MemoryMax=2G
+MemoryHigh=1.5G
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/log/wsprdaemon /var/lib/wsprdaemon /var/spool/wsprdaemon /tmp/wsprdaemon
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wsprdaemon-server-%i
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
 chmod 644 /etc/systemd/system/wsprnet_scraper@.service
 chmod 644 /etc/systemd/system/wsprdaemon_server@.service
-echo "  Service files installed"
+echo "  Service files created"
 
 # Create configuration files if they don't exist
 if [[ ! -f /etc/wsprdaemon/clickhouse.conf ]]; then
@@ -154,6 +222,8 @@ VENV_PYTHON="/opt/wsprdaemon-server/venv/bin/python3"
 SCRAPER_SCRIPT="/usr/local/bin/wsprdaemon_server.py"
 LOOP_INTERVAL="10"
 EXTRACTION_DIR="/tmp/wsprdaemon"
+# Comma-separated list of directories to scan for incoming .tbz files
+INCOMING_DIRS="/var/spool/wsprdaemon/from-gw1,/var/spool/wsprdaemon/from-gw2"
 CONFEOF
     chown root:$INSTALL_USER /etc/wsprdaemon/wsprdaemon.conf
     chmod 640 /etc/wsprdaemon/wsprdaemon.conf

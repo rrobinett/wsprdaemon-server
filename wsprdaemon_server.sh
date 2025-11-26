@@ -1,8 +1,9 @@
 #!/bin/bash
 #
 # wsprdaemon_server.sh - Wrapper script for WSPRDAEMON Server
-# Version: 3.0
-# Date: 2025-11-04
+# Version: 4.0
+# Date: 2025-11-26
+# Changes: Added INCOMING_DIRS configuration
 
 set -e
 
@@ -34,6 +35,7 @@ required_vars=(
     "SCRAPER_SCRIPT"
     "LOG_FILE"
     "LOOP_INTERVAL"
+    "INCOMING_DIRS"
 )
 
 missing_vars=()
@@ -70,6 +72,7 @@ echo "Python: ${VENV_PYTHON}"
 echo "Script: ${SCRAPER_SCRIPT}"
 echo "Log: ${LOG_FILE}"
 echo "Loop interval: ${LOOP_INTERVAL} seconds"
+echo "Incoming dirs: ${INCOMING_DIRS}"
 
 exec "${VENV_PYTHON}" "${SCRAPER_SCRIPT}" \
     --clickhouse-user "${CLICKHOUSE_WSPRDAEMON_ADMIN_USER}" \
@@ -77,4 +80,5 @@ exec "${VENV_PYTHON}" "${SCRAPER_SCRIPT}" \
     --log-file "${LOG_FILE}" \
     --log-max-mb "${LOG_MAX_MB:-10}" \
     --loop "${LOOP_INTERVAL}" \
-    --verbose "${VERBOSITY:-1}"
+    --verbose "${VERBOSITY:-1}" \
+    --incoming-dirs "${INCOMING_DIRS}"
