@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# wd-register-client.sh v2.7.4
+# wd-register-client.sh v2.7.6
 # 
 # Script to register WSPRDAEMON client stations for SFTP uploads
 # Creates user accounts on gateway servers and configures client access
@@ -8,13 +8,27 @@
 # Usage:
 #   ./wd-register-client.sh <client_rac_number> [--verbose]
 #   ./wd-register-client.sh <client_rac_number> <reporter_id>  # Manual override
+#   ./wd-register-client.sh <client_rac_number> --user <username>  # Override SSH user
 #   ./wd-register-client.sh --version
 #
 # Examples:
 #   ./wd-register-client.sh 84              # Register client RAC 84 (auto-detect ID)
 #   ./wd-register-client.sh 84 KJ6MKI       # Register with manual reporter ID
+#   ./wd-register-client.sh 84 --user rob   # Use 'rob' instead of config file username
+#   ./wd-register-client.sh 84 KJ6MKI --user rob  # Both overrides
 #   ./wd-register-client.sh 84 --verbose    # Register with verbose output  
 #   ./wd-register-client.sh --version       # Show version only
+#
+# Changes in v2.7.6:
+#   - ADDED: --user option to override SSH username from config file
+#   - Example: ./wd-register-client.sh 84 --user rob
+#
+# Changes in v2.7.5:
+#   - IMPROVED: Now searches all three config files for RAC entries:
+#     - ~/.ssr.conf (main config)
+#     - ~/.ssr.conf.local (local overrides and additions)
+#     - ~/.ssr.conf.hamsci (HamSCI stations)
+#   - Shows which config file the RAC entry was found in
 #
 # Changes in v2.7.4:
 #   - FIXED: Properly detect if user already exists (use getent passwd, not id)
@@ -107,7 +121,7 @@
 # Author: AI6VN (with assistance from Claude)
 # Date: November 2025
 
-VERSION="2.7.4"
+VERSION="2.7.6"
 SCRIPT_NAME="wd-register-client.sh"
 
 # Source bash aliases if available
@@ -815,32 +829,66 @@ function main() {
     show_version
     
     # Parse arguments
-    local client_rac="${1:-}"
+    local client_rac=""
     local manual_reporter_id=""
+    local manual_ssh_user=""
     local verbosity=0
     
-    # Check if second argument is reporter ID or verbose flag
-    if [[ -n "${2:-}" ]]; then
-        if [[ "$2" == "--verbose" || "$2" == "-v" ]]; then
-            verbosity=1
-        else
-            # Assume it's a manual reporter ID
-            manual_reporter_id="$2"
-            echo "Using manually specified reporter ID: $manual_reporter_id"
-        fi
+    # Process all arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --verbose|-v)
+                verbosity=1
+                shift
+                ;;
+            --user)
+                if [[ -n "${2:-}" && ! "$2" =~ ^-- ]]; then
+                    manual_ssh_user="$2"
+                    shift 2
+                else
+                    echo "ERROR: --user requires a username argument"
+                    exit 1
+                fi
+                ;;
+            --version)
+                echo "$SCRIPT_NAME version $VERSION"
+                exit 0
+                ;;
+            -*)
+                echo "ERROR: Unknown option: $1"
+                exit 1
+                ;;
+            *)
+                # Positional arguments: first is RAC, second (if present) is reporter ID
+                if [[ -z "$client_rac" ]]; then
+                    client_rac="$1"
+                elif [[ -z "$manual_reporter_id" ]]; then
+                    manual_reporter_id="$1"
+                else
+                    echo "ERROR: Too many positional arguments"
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    if [[ -n "$manual_reporter_id" ]]; then
+        echo "Using manually specified reporter ID: $manual_reporter_id"
     fi
     
-    # Check for verbose as third argument if manual ID was provided
-    if [[ -n "$manual_reporter_id" && "${3:-}" == "--verbose" ]]; then
-        verbosity=1
+    if [[ -n "$manual_ssh_user" ]]; then
+        echo "Using manually specified SSH user: $manual_ssh_user"
     fi
     
     if [[ -z "$client_rac" ]]; then
-        echo "Usage: $SCRIPT_NAME <client_rac_number> [<reporter_id>] [--verbose]"
+        echo "Usage: $SCRIPT_NAME <client_rac_number> [<reporter_id>] [--user <username>] [--verbose]"
         echo "       $SCRIPT_NAME --version"
         echo ""
         echo "Example: $SCRIPT_NAME 84"
         echo "         $SCRIPT_NAME 84 KJ6MKI"
+        echo "         $SCRIPT_NAME 84 --user rob"
+        echo "         $SCRIPT_NAME 84 KJ6MKI --user rob"
         echo "         $SCRIPT_NAME 84 --verbose"
         echo "         $SCRIPT_NAME --version"
         exit 1
@@ -890,39 +938,88 @@ function main() {
     local client_ip_port=$((35800 + client_rac))
     echo "  Client Port: $client_ip_port"
     
-    # Get client username from .ssr.conf file for this RAC
-    local ssr_conf_file="${HOME}/.ssr.conf"
-    if [[ ! -f "$ssr_conf_file" ]]; then
-        echo "ERROR: .ssr.conf file not found at $ssr_conf_file"
+    # Get client username from .ssr.conf files for this RAC
+    # Search all three config files: .ssr.conf, .ssr.conf.local, .ssr.conf.hamsci
+    local ssr_conf_files=(
+        "${HOME}/.ssr.conf"
+        "${HOME}/.ssr.conf.local"
+        "${HOME}/.ssr.conf.hamsci"
+    )
+    
+    # Initialize empty array - will accumulate entries from all files
+    FRPS_REMOTE_ACCESS_LIST=()
+    local found_any_config=0
+    local loaded_files=""
+    
+    echo "Loading RAC configuration files..."
+    for ssr_conf_file in "${ssr_conf_files[@]}"; do
+        if [[ -f "$ssr_conf_file" ]]; then
+            source "$ssr_conf_file"
+            loaded_files+="  ✓ Loaded: $ssr_conf_file"$'\n'
+            found_any_config=1
+        else
+            loaded_files+="  - Not found: $ssr_conf_file"$'\n'
+        fi
+    done
+    
+    echo "$loaded_files"
+    
+    if [[ $found_any_config -eq 0 ]]; then
+        echo "ERROR: No .ssr.conf files found"
+        echo "Expected at least one of:"
+        for f in "${ssr_conf_files[@]}"; do
+            echo "  $f"
+        done
         exit 1
     fi
     
-    # Source the .ssr.conf to load the FRPS_REMOTE_ACCESS_LIST array
-    source "$ssr_conf_file"
+    echo "  Total RAC entries loaded: ${#FRPS_REMOTE_ACCESS_LIST[@]}"
     
     # Find the entry for this RAC
-    # Format: "RAC,wd_user,wd_pass,ssh_user,ssh_pass,description,port_forwards"
+    # Format: "RAC,wd_user,ssh_user,ssh_pass,description,port_forwards"
     local client_entry=""
+    local found_in_file=""
     for entry in "${FRPS_REMOTE_ACCESS_LIST[@]}"; do
         if [[ "$entry" =~ ^${client_rac}, ]]; then
             client_entry="$entry"
+            # Determine which file this entry came from (for informational purposes)
+            for ssr_conf_file in "${ssr_conf_files[@]}"; do
+                if [[ -f "$ssr_conf_file" ]] && grep -q "^[[:space:]]*\"${client_rac}," "$ssr_conf_file" 2>/dev/null; then
+                    found_in_file="$ssr_conf_file"
+                    break
+                fi
+            done
             break
         fi
     done
     
     if [[ -z "$client_entry" ]]; then
-        echo "ERROR: No entry found for RAC $client_rac in .ssr.conf"
+        echo "ERROR: No entry found for RAC $client_rac in any config file"
+        echo "Searched files:"
+        for f in "${ssr_conf_files[@]}"; do
+            [[ -f "$f" ]] && echo "  $f"
+        done
         exit 1
     fi
     
+    echo "  ✓ Found RAC $client_rac in: ${found_in_file:-unknown}"
+    
     # Parse the SSH username (field 3) from the entry
-    local client_user=$(echo "$client_entry" | cut -d',' -f3)
-    if [[ -z "$client_user" ]]; then
+    local config_user=$(echo "$client_entry" | cut -d',' -f3)
+    if [[ -z "$config_user" ]]; then
         echo "ERROR: Could not extract SSH username for RAC $client_rac from: $client_entry"
         exit 1
     fi
     
-    echo "  Client User: $client_user (from .ssr.conf)"
+    # Use manual override if provided, otherwise use config file value
+    local client_user
+    if [[ -n "$manual_ssh_user" ]]; then
+        client_user="$manual_ssh_user"
+        echo "  Client User: $client_user (manual override, config had: $config_user)"
+    else
+        client_user="$config_user"
+        echo "  Client User: $client_user (from config file)"
+    fi
     
     # Ensure SSHD is configured for SFTP-only access
     if ! wd-sshd-conf-add-sftponly; then
