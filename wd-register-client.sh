@@ -8,27 +8,24 @@
 # Usage:
 #   ./wd-register-client.sh <client_rac_number> [--verbose]
 #   ./wd-register-client.sh <client_rac_number> <reporter_id>  # Manual override
-#   ./wd-register-client.sh <client_rac_number> --user <username>  # Override SSH user
 #   ./wd-register-client.sh --version
 #
 # Examples:
 #   ./wd-register-client.sh 84              # Register client RAC 84 (auto-detect ID)
 #   ./wd-register-client.sh 84 KJ6MKI       # Register with manual reporter ID
-#   ./wd-register-client.sh 84 --user rob   # Use 'rob' instead of config file username
-#   ./wd-register-client.sh 84 KJ6MKI --user rob  # Both overrides
 #   ./wd-register-client.sh 84 --verbose    # Register with verbose output  
 #   ./wd-register-client.sh --version       # Show version only
 #
 # Changes in v2.7.6:
-#   - ADDED: --user option to override SSH username from config file
-#   - Example: ./wd-register-client.sh 84 --user rob
+#   - IMPROVED: Add warning comment to wsprdaemon.conf configuration line
+#   - Line now includes: "### WARNING: DO NOT REMOVE OR CHANGE THIS LINE..."
+#   - Makes it clear the line is managed by the WD SERVER
 #
 # Changes in v2.7.5:
-#   - IMPROVED: Now searches all three config files for RAC entries:
-#     - ~/.ssr.conf (main config)
-#     - ~/.ssr.conf.local (local overrides and additions)
-#     - ~/.ssr.conf.hamsci (HamSCI stations)
-#   - Shows which config file the RAC entry was found in
+#   - CRITICAL: Check if client has SSH keys, create them if missing
+#   - CRITICAL: Abort on SSH key issues (don't report false success)
+#   - NEW: ensure_client_ssh_keys() function creates keys if missing
+#   - FIXED: Script now stops if keys can't be created or installed
 #
 # Changes in v2.7.4:
 #   - FIXED: Properly detect if user already exists (use getent passwd, not id)
@@ -453,6 +450,58 @@ function replicate_user_to_server() {
     return 0
 }
 
+# Function to ensure client has SSH keys (create if missing)
+function ensure_client_ssh_keys() {
+    local client_rac="$1"
+    local client_user="$2"
+    local client_ip_port="$3"
+    local WD_RAC_SERVER="$4"
+    
+    echo ""
+    echo "=== Ensuring client has SSH keys ==="
+    
+    # Check if client has SSH keys
+    echo "  Checking for existing SSH keys on client..."
+    local has_keys=$(ssh -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+        if [[ -f ~/.ssh/id_rsa.pub ]] || [[ -f ~/.ssh/id_ed25519.pub ]]; then
+            echo 'yes'
+        else
+            echo 'no'
+        fi
+    " 2>/dev/null)
+    
+    if [[ "$has_keys" == "yes" ]]; then
+        echo "  ✓ Client already has SSH keys"
+        return 0
+    fi
+    
+    echo "  ✗ Client has no SSH keys - creating them..."
+    
+    # Create SSH keys on the client
+    if ! ssh -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+        # Create .ssh directory if it doesn't exist
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        
+        # Generate SSH key pair (ed25519 is modern and secure)
+        ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N '' -C 'wsprdaemon-client' >/dev/null 2>&1
+        
+        # Also create RSA key for compatibility
+        ssh-keygen -t rsa -b 2048 -f ~/.ssh/id_rsa -N '' -C 'wsprdaemon-client' >/dev/null 2>&1
+        
+        echo 'Keys created successfully'
+    " 2>/dev/null; then
+        echo "  ✗ ERROR: Failed to create SSH keys on client"
+        echo "    Manual intervention required:"
+        echo "    1. SSH to client: ssh -p ${client_ip_port} ${client_user}@${WD_RAC_SERVER}"
+        echo "    2. Run: ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519"
+        return 1
+    fi
+    
+    echo "  ✓ SSH keys created on client"
+    return 0
+}
+
 # Function to diagnose and fix authorized_keys on all servers
 function diagnose_and_fix_authorized_keys() {
     local client_rac="$1"
@@ -471,7 +520,20 @@ function diagnose_and_fix_authorized_keys() {
     local client_key=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "cat ~/.ssh/id_rsa.pub 2>/dev/null || cat ~/.ssh/id_ecdsa.pub 2>/dev/null || cat ~/.ssh/id_ed25519.pub 2>/dev/null" 2>/dev/null | head -1)
     
     if [[ -z "$client_key" ]]; then
-        echo "    ✗ ERROR: Could not get client's public key from RAC"
+        echo "    ✗ ERROR: Client has no SSH keys!"
+        echo ""
+        echo "========================================="
+        echo "✗ CRITICAL ERROR: No SSH keys on client"
+        echo "========================================="
+        echo ""
+        echo "The client at RAC $client_rac has no SSH keys."
+        echo "Without keys, the client cannot upload to the servers."
+        echo ""
+        echo "This should have been detected and fixed earlier."
+        echo "Manual fix required:"
+        echo "  1. SSH to client: ssh -p ${client_ip_port} ${client_user}@${WD_RAC_SERVER}"
+        echo "  2. Generate keys: ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519"
+        echo "  3. Re-run this script"
         return 1
     fi
     
@@ -679,12 +741,13 @@ function configure_client_access() {
         sed -i '/^[[:space:]]*WD_SERVER_USER=/d' ${config_file}
         sed -i '/^[[:space:]]*WD_SERVER_USER_LIST=/d' ${config_file}
         
-        # Add the new WD_SERVER_USER_LIST line
+        # Add the new WD_SERVER_USER_LIST line with warning comment
+        echo '### WARNING: DO NOT REMOVE OR CHANGE THIS LINE which was added by the WD SERVER!' >> ${config_file}
         echo 'WD_SERVER_USER_LIST=($server_list)' >> ${config_file}
         
         # Verify the changes
         echo 'Configuration updated:'
-        grep -E '^WD_SERVER_USER' ${config_file} || echo 'No WD_SERVER_USER lines found'
+        grep -E '^WD_SERVER_USER|^###.*WD SERVER' ${config_file} || echo 'No WD_SERVER_USER lines found'
     " 2>/dev/null; then
         echo "  ⚠ WARNING: Could not write configuration to client"
         echo "    Possible causes:"
@@ -694,14 +757,15 @@ function configure_client_access() {
         echo ""
         echo "    Manual configuration needed on client:"
         echo "    1. Remove any existing WD_SERVER_USER lines from ${config_file}"
-        echo "    2. Add this line:"
+        echo "    2. Add these lines:"
+        echo "       ### WARNING: DO NOT REMOVE OR CHANGE THIS LINE which was added by the WD SERVER!"
         echo "       WD_SERVER_USER_LIST=($server_list)"
         return 1
     fi
     
     # Verify configuration
     echo "  Verifying configuration..."
-    if ! ssh -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "grep '^WD_SERVER_USER_LIST=' ${config_file} 2>/dev/null" 2>/dev/null; then
+    if ! ssh -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "grep -E '^WD_SERVER_USER_LIST=|^###.*WD SERVER' ${config_file} 2>/dev/null" 2>/dev/null; then
         echo "  ⚠ WARNING: Could not verify configuration on client"
         echo "    Client may need manual configuration"
         local configured_list=""
@@ -829,66 +893,32 @@ function main() {
     show_version
     
     # Parse arguments
-    local client_rac=""
+    local client_rac="${1:-}"
     local manual_reporter_id=""
-    local manual_ssh_user=""
     local verbosity=0
     
-    # Process all arguments
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --verbose|-v)
-                verbosity=1
-                shift
-                ;;
-            --user)
-                if [[ -n "${2:-}" && ! "$2" =~ ^-- ]]; then
-                    manual_ssh_user="$2"
-                    shift 2
-                else
-                    echo "ERROR: --user requires a username argument"
-                    exit 1
-                fi
-                ;;
-            --version)
-                echo "$SCRIPT_NAME version $VERSION"
-                exit 0
-                ;;
-            -*)
-                echo "ERROR: Unknown option: $1"
-                exit 1
-                ;;
-            *)
-                # Positional arguments: first is RAC, second (if present) is reporter ID
-                if [[ -z "$client_rac" ]]; then
-                    client_rac="$1"
-                elif [[ -z "$manual_reporter_id" ]]; then
-                    manual_reporter_id="$1"
-                else
-                    echo "ERROR: Too many positional arguments"
-                    exit 1
-                fi
-                shift
-                ;;
-        esac
-    done
-    
-    if [[ -n "$manual_reporter_id" ]]; then
-        echo "Using manually specified reporter ID: $manual_reporter_id"
+    # Check if second argument is reporter ID or verbose flag
+    if [[ -n "${2:-}" ]]; then
+        if [[ "$2" == "--verbose" || "$2" == "-v" ]]; then
+            verbosity=1
+        else
+            # Assume it's a manual reporter ID
+            manual_reporter_id="$2"
+            echo "Using manually specified reporter ID: $manual_reporter_id"
+        fi
     fi
     
-    if [[ -n "$manual_ssh_user" ]]; then
-        echo "Using manually specified SSH user: $manual_ssh_user"
+    # Check for verbose as third argument if manual ID was provided
+    if [[ -n "$manual_reporter_id" && "${3:-}" == "--verbose" ]]; then
+        verbosity=1
     fi
     
     if [[ -z "$client_rac" ]]; then
-        echo "Usage: $SCRIPT_NAME <client_rac_number> [<reporter_id>] [--user <username>] [--verbose]"
+        echo "Usage: $SCRIPT_NAME <client_rac_number> [<reporter_id>] [--verbose]"
         echo "       $SCRIPT_NAME --version"
         echo ""
         echo "Example: $SCRIPT_NAME 84"
         echo "         $SCRIPT_NAME 84 KJ6MKI"
-        echo "         $SCRIPT_NAME 84 --user rob"
-        echo "         $SCRIPT_NAME 84 KJ6MKI --user rob"
         echo "         $SCRIPT_NAME 84 --verbose"
         echo "         $SCRIPT_NAME --version"
         exit 1
@@ -938,88 +968,39 @@ function main() {
     local client_ip_port=$((35800 + client_rac))
     echo "  Client Port: $client_ip_port"
     
-    # Get client username from .ssr.conf files for this RAC
-    # Search all three config files: .ssr.conf, .ssr.conf.local, .ssr.conf.hamsci
-    local ssr_conf_files=(
-        "${HOME}/.ssr.conf"
-        "${HOME}/.ssr.conf.local"
-        "${HOME}/.ssr.conf.hamsci"
-    )
-    
-    # Initialize empty array - will accumulate entries from all files
-    FRPS_REMOTE_ACCESS_LIST=()
-    local found_any_config=0
-    local loaded_files=""
-    
-    echo "Loading RAC configuration files..."
-    for ssr_conf_file in "${ssr_conf_files[@]}"; do
-        if [[ -f "$ssr_conf_file" ]]; then
-            source "$ssr_conf_file"
-            loaded_files+="  ✓ Loaded: $ssr_conf_file"$'\n'
-            found_any_config=1
-        else
-            loaded_files+="  - Not found: $ssr_conf_file"$'\n'
-        fi
-    done
-    
-    echo "$loaded_files"
-    
-    if [[ $found_any_config -eq 0 ]]; then
-        echo "ERROR: No .ssr.conf files found"
-        echo "Expected at least one of:"
-        for f in "${ssr_conf_files[@]}"; do
-            echo "  $f"
-        done
+    # Get client username from .ssr.conf file for this RAC
+    local ssr_conf_file="${HOME}/.ssr.conf"
+    if [[ ! -f "$ssr_conf_file" ]]; then
+        echo "ERROR: .ssr.conf file not found at $ssr_conf_file"
         exit 1
     fi
     
-    echo "  Total RAC entries loaded: ${#FRPS_REMOTE_ACCESS_LIST[@]}"
+    # Source the .ssr.conf to load the FRPS_REMOTE_ACCESS_LIST array
+    source "$ssr_conf_file"
     
     # Find the entry for this RAC
-    # Format: "RAC,wd_user,ssh_user,ssh_pass,description,port_forwards"
+    # Format: "RAC,wd_user,wd_pass,ssh_user,ssh_pass,description,port_forwards"
     local client_entry=""
-    local found_in_file=""
     for entry in "${FRPS_REMOTE_ACCESS_LIST[@]}"; do
         if [[ "$entry" =~ ^${client_rac}, ]]; then
             client_entry="$entry"
-            # Determine which file this entry came from (for informational purposes)
-            for ssr_conf_file in "${ssr_conf_files[@]}"; do
-                if [[ -f "$ssr_conf_file" ]] && grep -q "^[[:space:]]*\"${client_rac}," "$ssr_conf_file" 2>/dev/null; then
-                    found_in_file="$ssr_conf_file"
-                    break
-                fi
-            done
             break
         fi
     done
     
     if [[ -z "$client_entry" ]]; then
-        echo "ERROR: No entry found for RAC $client_rac in any config file"
-        echo "Searched files:"
-        for f in "${ssr_conf_files[@]}"; do
-            [[ -f "$f" ]] && echo "  $f"
-        done
+        echo "ERROR: No entry found for RAC $client_rac in .ssr.conf"
         exit 1
     fi
     
-    echo "  ✓ Found RAC $client_rac in: ${found_in_file:-unknown}"
-    
     # Parse the SSH username (field 3) from the entry
-    local config_user=$(echo "$client_entry" | cut -d',' -f3)
-    if [[ -z "$config_user" ]]; then
+    local client_user=$(echo "$client_entry" | cut -d',' -f3)
+    if [[ -z "$client_user" ]]; then
         echo "ERROR: Could not extract SSH username for RAC $client_rac from: $client_entry"
         exit 1
     fi
     
-    # Use manual override if provided, otherwise use config file value
-    local client_user
-    if [[ -n "$manual_ssh_user" ]]; then
-        client_user="$manual_ssh_user"
-        echo "  Client User: $client_user (manual override, config had: $config_user)"
-    else
-        client_user="$config_user"
-        echo "  Client User: $client_user (from config file)"
-    fi
+    echo "  Client User: $client_user (from .ssr.conf)"
     
     # Ensure SSHD is configured for SFTP-only access
     if ! wd-sshd-conf-add-sftponly; then
@@ -1101,9 +1082,31 @@ function main() {
         fi
     done
     
+    # Ensure client has SSH keys (create if missing)
+    if ! ensure_client_ssh_keys "$client_rac" "$client_user" "$client_ip_port" "$WD_RAC_SERVER"; then
+        echo ""
+        echo "========================================="
+        echo "✗ CRITICAL ERROR: Client SSH key setup failed"
+        echo "========================================="
+        echo ""
+        echo "Cannot continue without SSH keys on the client."
+        echo "The client needs SSH keys to upload WSPR data to the servers."
+        echo ""
+        exit 1
+    fi
+    
     # Diagnose and fix authorized_keys on all servers
     if ! diagnose_and_fix_authorized_keys "$client_rac" "$client_user" "$client_ip_port" "$sanitized_reporter_id" "$WD_RAC_SERVER" "${all_servers[@]}"; then
-        echo "WARNING: Key diagnosis/repair had issues (continuing anyway)"
+        echo ""
+        echo "========================================="
+        echo "✗ CRITICAL ERROR: SSH key installation failed"
+        echo "========================================="
+        echo ""
+        echo "Could not install client's SSH key on the servers."
+        echo "Without this, the client cannot upload WSPR data."
+        echo ""
+        echo "Manual intervention required - see error messages above."
+        exit 1
     fi
     
     # Test SFTP uploads to all servers (from client's perspective)
@@ -1129,7 +1132,8 @@ function main() {
         echo "  1. SSH to client: ssh -p ${client_ip_port} ${client_user}@${WD_RAC_SERVER}"
         echo "  2. Edit ~/wsprdaemon/wsprdaemon.conf"
         echo "  3. Remove any existing WD_SERVER_USER or WD_SERVER_USER_LIST lines"
-        echo "  4. Add this line:"
+        echo "  4. Add these lines:"
+        echo "     ### WARNING: DO NOT REMOVE OR CHANGE THIS LINE which was added by the WD SERVER!"
         echo "     WD_SERVER_USER_LIST=(\"${sanitized_reporter_id}@gw1.wsprdaemon.org\" \"${sanitized_reporter_id}@gw2.wsprdaemon.org\")"
         echo ""
     else
