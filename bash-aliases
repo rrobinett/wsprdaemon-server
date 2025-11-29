@@ -4,6 +4,23 @@
 alias chc='clickhouse-client'
 alias ch=chc
 
+function wd-ch-count_tables() {
+    local host="${1:-localhost}"
+
+    clickhouse-client --user chadmin --host "$host" --query "
+        SELECT
+            database,
+            table,
+            formatReadableQuantity(sum(rows)) as row_count,
+            sum(rows) as raw_count
+        FROM system.parts
+        WHERE active = 1 AND database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')
+        GROUP BY database, table
+        ORDER BY raw_count DESC
+        FORMAT PrettyCompact
+    "
+}
+
 function wd-sftp-wd-test()
 {
     local rc
