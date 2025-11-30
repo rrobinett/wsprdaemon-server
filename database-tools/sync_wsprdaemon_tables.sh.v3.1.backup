@@ -1,12 +1,12 @@
 #!/bin/bash
 #
 # sync_wsprdaemon_tables.sh - Bidirectional sync and deduplication for wsprdaemon tables
-# Version: 3.2 - Monthly chunked deduplication to handle large datasets efficiently
+# Version: 3.1 - Uses EXCEPT for robust row comparison across different table schemas
 # Run as user wsprdaemon on either WD1 or WD2
 
 set -e
 
-SCRIPT_VERSION="3.2"
+SCRIPT_VERSION="3.1"
 
 # Colors for output
 RED='\033[0;31m'
@@ -34,8 +34,6 @@ Usage: $0 [OPTIONS]
 Efficiently sync and deduplicate wsprdaemon tables between WD1 and WD2 using 
 ClickHouse's native remote() function for direct server-to-server transfers.
 
-VERSION 3.2: Now deduplicates one month at a time for better performance!
-
 OPTIONS:
     spots       Sync only wsprdaemon.spots_extended table
     noise       Sync only wsprdaemon.noise table
@@ -51,8 +49,8 @@ EXAMPLES:
     $0 --version    # Show version
 
 NOTES:
-    This version deduplicates data one month at a time to avoid memory issues
-    with large datasets. Uses ClickHouse EXCEPT operator for robust comparison.
+    This version uses ClickHouse EXCEPT operator for robust comparison
+    of all columns, working correctly with different table schemas.
 
 EOF
     exit 0
@@ -152,11 +150,11 @@ get_row_count() {
     fi
 }
 
-# Function to deduplicate table one month at a time
-deduplicate_table_monthly() {
+# Function to deduplicate table
+deduplicate_table() {
     local host=$1
     local table=$2
-    log_info "Deduplicating ${CH_DB}.${table} on $host (monthly chunks)..."
+    log_info "Deduplicating ${CH_DB}.${table} on $host..."
     
     local before_count
     if [[ "$host" == "$LOCAL_HOST" ]]; then
@@ -166,16 +164,6 @@ deduplicate_table_monthly() {
     fi
     
     log_info "Row count before deduplication on $host: $before_count"
-    
-    # Get the date range of data
-    local date_range
-    if [[ "$host" == "$LOCAL_HOST" ]]; then
-        date_range=$(run_local_query "SELECT min(toStartOfMonth(toDateTime(epoch))) as min_month, max(toStartOfMonth(toDateTime(epoch))) as max_month FROM ${CH_DB}.${table} FORMAT TSV")
-    else
-        date_range=$(run_remote_query "SELECT min(toStartOfMonth(toDateTime(epoch))) as min_month, max(toStartOfMonth(toDateTime(epoch))) as max_month FROM ${CH_DB}.${table} FORMAT TSV")
-    fi
-    
-    log_info "Date range: $date_range"
     
     # Get the original table schema
     local create_stmt
@@ -192,22 +180,8 @@ deduplicate_table_monthly() {
         run_local_query "DROP TABLE IF EXISTS ${CH_DB}.${table}_temp" 2>/dev/null || true
         run_local_query "$temp_create"
         
-        log_info "Processing data month by month..."
-        
-        # Get list of months
-        local months=$(run_local_query "SELECT DISTINCT toStartOfMonth(toDateTime(epoch)) as month FROM ${CH_DB}.${table} ORDER BY month FORMAT TSV")
-        
-        local month_count=0
-        while IFS= read -r month; do
-            month_count=$((month_count + 1))
-            log_info "  Processing month $month_count: $month"
-            
-            run_local_query "
-                INSERT INTO ${CH_DB}.${table}_temp 
-                SELECT DISTINCT * FROM ${CH_DB}.${table}
-                WHERE toStartOfMonth(toDateTime(epoch)) = toDateTime('$month')
-            "
-        done <<< "$months"
+        log_info "Inserting distinct rows into temp table on $host..."
+        run_local_query "INSERT INTO ${CH_DB}.${table}_temp SELECT DISTINCT * FROM ${CH_DB}.${table}"
         
         log_info "Swapping tables on $host..."
         run_local_query "RENAME TABLE ${CH_DB}.${table} TO ${CH_DB}.${table}_old, ${CH_DB}.${table}_temp TO ${CH_DB}.${table}"
@@ -218,22 +192,8 @@ deduplicate_table_monthly() {
         run_remote_query "DROP TABLE IF EXISTS ${CH_DB}.${table}_temp" 2>/dev/null || true
         run_remote_query "$temp_create"
         
-        log_info "Processing data month by month..."
-        
-        # Get list of months
-        local months=$(run_remote_query "SELECT DISTINCT toStartOfMonth(toDateTime(epoch)) as month FROM ${CH_DB}.${table} ORDER BY month FORMAT TSV")
-        
-        local month_count=0
-        while IFS= read -r month; do
-            month_count=$((month_count + 1))
-            log_info "  Processing month $month_count: $month"
-            
-            run_remote_query "
-                INSERT INTO ${CH_DB}.${table}_temp 
-                SELECT DISTINCT * FROM ${CH_DB}.${table}
-                WHERE toStartOfMonth(toDateTime(epoch)) = toDateTime('$month')
-            "
-        done <<< "$months"
+        log_info "Inserting distinct rows into temp table on $host..."
+        run_remote_query "INSERT INTO ${CH_DB}.${table}_temp SELECT DISTINCT * FROM ${CH_DB}.${table}"
         
         log_info "Swapping tables on $host..."
         run_remote_query "RENAME TABLE ${CH_DB}.${table} TO ${CH_DB}.${table}_old, ${CH_DB}.${table}_temp TO ${CH_DB}.${table}"
@@ -300,7 +260,7 @@ main() {
     log_info "=== WSPRDAEMON Table Sync v${SCRIPT_VERSION} Started ==="
     log_info "Local: $LOCAL_HOST, Remote: $REMOTE_HOST"
     log_info "Tables to sync: ${TABLES_TO_SYNC[*]}"
-    log_info "Using monthly chunked deduplication for efficiency"
+    log_info "Using ClickHouse remote() with EXCEPT for schema-agnostic sync"
     
     # Stop services once at the beginning
     stop_services
@@ -319,9 +279,9 @@ main() {
         log_info "  $LOCAL_HOST: $local_count rows"
         log_info "  $REMOTE_HOST: $remote_count rows"
         
-        # Deduplicate both tables first (monthly chunks)
-        deduplicate_table_monthly "$LOCAL_HOST" "$CH_TABLE"
-        deduplicate_table_monthly "$REMOTE_HOST" "$CH_TABLE"
+        # Deduplicate both tables first
+        deduplicate_table "$LOCAL_HOST" "$CH_TABLE"
+        deduplicate_table "$REMOTE_HOST" "$CH_TABLE"
         
         # Get counts after deduplication
         log_info "Row counts after deduplication:"
@@ -339,10 +299,10 @@ main() {
         # Sync from remote to local
         sync_missing_rows_efficient "$REMOTE_HOST" "$LOCAL_HOST" "$CH_TABLE"
         
-        # Final deduplication to clean up any edge cases (monthly chunks)
+        # Final deduplication to clean up any edge cases
         log_info "Final deduplication pass..."
-        deduplicate_table_monthly "$LOCAL_HOST" "$CH_TABLE"
-        deduplicate_table_monthly "$REMOTE_HOST" "$CH_TABLE"
+        deduplicate_table "$LOCAL_HOST" "$CH_TABLE"
+        deduplicate_table "$REMOTE_HOST" "$CH_TABLE"
         
         # Get final counts
         log_info "Final row counts for ${CH_TABLE}:"
