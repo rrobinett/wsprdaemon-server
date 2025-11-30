@@ -1,21 +1,23 @@
 #!/bin/bash
 #
 # wsprnet_scraper.sh - Wrapper script for WSPRNET Scraper
-# Version: 3.0
-# Date: 2025-11-04
+# Version: 4.1
+# Date: 2025-11-29
+# Changes: Fixed argument names to match wsprnet_scraper.py argparse
+#          Added missing --session-file, --setup-readonly-user, --setup-readonly-password
 
 set -e
 
-# Load wsprnet configuration
-if [[ ! -f /etc/wsprdaemon/wsprnet.conf ]]; then
-    echo "ERROR: Config file not found: /etc/wsprdaemon/wsprnet.conf" >&2
+CONFIG_FILE="$1"
+if [[ -z "${CONFIG_FILE}" ]] || [[ ! -f "${CONFIG_FILE}" ]]; then
+    echo "ERROR: Config file not found: ${CONFIG_FILE}" >&2
+    echo "Usage: $0 /path/to/config.conf" >&2
     exit 1
 fi
 
-echo "Loading configuration from: /etc/wsprdaemon/wsprnet.conf"
-source /etc/wsprdaemon/wsprnet.conf
+echo "Loading configuration from: ${CONFIG_FILE}"
+source "${CONFIG_FILE}"
 
-# Source ClickHouse configuration
 if [[ -f /etc/wsprdaemon/clickhouse.conf ]]; then
     source /etc/wsprdaemon/clickhouse.conf
 else
@@ -23,22 +25,24 @@ else
     exit 1
 fi
 
-# Required variables check
 required_vars=(
+    "CLICKHOUSE_ROOT_ADMIN_USER"
+    "CLICKHOUSE_ROOT_ADMIN_PASSWORD"
+    "CLICKHOUSE_WSPRNET_READONLY_USER"
+    "CLICKHOUSE_WSPRNET_READONLY_PASSWORD"
     "WSPRNET_USERNAME"
     "WSPRNET_PASSWORD"
-    "WSPRNET_VENV_PYTHON"
-    "WSPRNET_SCRAPER_SCRIPT"
-    "WSPRNET_SESSION_FILE"
-    "WSPRNET_LOG_FILE"
-    "WSPRNET_LOOP_INTERVAL"
-    "CLICKHOUSE_WSPRDAEMON_ADMIN_USER"
-    "CLICKHOUSE_WSPRDAEMON_ADMIN_PASSWORD"
+    "VENV_PYTHON"
+    "SCRAPER_SCRIPT"
+    "LOG_FILE"
+    "LOOP_INTERVAL"
+    "WSPRNET_CACHE_DIR"
+    "SESSION_FILE"
 )
 
 missing_vars=()
 for var in "${required_vars[@]}"; do
-    if [[ -z "${!var+x}" ]]; then
+    if [[ -z "${!var+x}" ]] || [[ -z "${!var}" ]]; then
         missing_vars+=("  $var")
     fi
 done
@@ -49,38 +53,40 @@ if [[ ${#missing_vars[@]} -gt 0 ]]; then
     exit 1
 fi
 
-# Verify Python executable exists
-if [[ ! -x "${WSPRNET_VENV_PYTHON}" ]]; then
-    echo "ERROR: Python executable not found or not executable: ${WSPRNET_VENV_PYTHON}" >&2
+if [[ ! -x "${VENV_PYTHON}" ]]; then
+    echo "ERROR: Python executable not found: ${VENV_PYTHON}" >&2
     exit 1
 fi
 
-# Verify script exists
-if [[ ! -f "${WSPRNET_SCRAPER_SCRIPT}" ]]; then
-    echo "ERROR: Scraper script not found: ${WSPRNET_SCRAPER_SCRIPT}" >&2
+if [[ ! -f "${SCRAPER_SCRIPT}" ]]; then
+    echo "ERROR: Scraper script not found: ${SCRAPER_SCRIPT}" >&2
     exit 1
 fi
 
-# Create directories if needed
-mkdir -p "$(dirname "${WSPRNET_LOG_FILE}")"
-mkdir -p "$(dirname "${WSPRNET_SESSION_FILE}")"
+mkdir -p "$(dirname "${LOG_FILE}")"
+mkdir -p "$(dirname "${SESSION_FILE}")"
+mkdir -p "${WSPRNET_CACHE_DIR}"
 
-# Start the scraper
 echo "Starting WSPRNET Scraper..."
-echo "Python: ${WSPRNET_VENV_PYTHON}"
-echo "Script: ${WSPRNET_SCRAPER_SCRIPT}"
-echo "Log: ${WSPRNET_LOG_FILE}"
-echo "Loop interval: ${WSPRNET_LOOP_INTERVAL} seconds"
+echo "Python: ${VENV_PYTHON}"
+echo "Script: ${SCRAPER_SCRIPT}"
+echo "Log: ${LOG_FILE}"
+echo "Session: ${SESSION_FILE}"
+echo "Loop interval: ${LOOP_INTERVAL} seconds"
+echo "Cache dir: ${WSPRNET_CACHE_DIR}"
 
-exec "${WSPRNET_VENV_PYTHON}" "${WSPRNET_SCRAPER_SCRIPT}" \
-    --clickhouse-user "${CLICKHOUSE_WSPRDAEMON_ADMIN_USER}" \
-    --clickhouse-password "${CLICKHOUSE_WSPRDAEMON_ADMIN_PASSWORD}" \
-    --setup-readonly-user "default" \
-    --setup-readonly-password "" \
+# Note: Python script uses --username/--password (not --wsprnet-user/--wsprnet-password)
+# Uses root admin to create wsprnet-admin and wsprnet-reader users
+exec "${VENV_PYTHON}" "${SCRAPER_SCRIPT}" \
+    --session-file "${SESSION_FILE}" \
     --username "${WSPRNET_USERNAME}" \
     --password "${WSPRNET_PASSWORD}" \
-    --session-file "${WSPRNET_SESSION_FILE}" \
-    --log-file "${WSPRNET_LOG_FILE}" \
-    --log-max-mb "${WSPRNET_LOG_MAX_MB:-10}" \
-    --loop "${WSPRNET_LOOP_INTERVAL}" \
-    --verbose "${WSPRNET_VERBOSITY:-1}"
+    --clickhouse-user "${CLICKHOUSE_ROOT_ADMIN_USER}" \
+    --clickhouse-password "${CLICKHOUSE_ROOT_ADMIN_PASSWORD}" \
+    --setup-readonly-user "${CLICKHOUSE_WSPRNET_READONLY_USER}" \
+    --setup-readonly-password "${CLICKHOUSE_WSPRNET_READONLY_PASSWORD}" \
+    --log-file "${LOG_FILE}" \
+    --log-max-mb "${LOG_MAX_MB:-10}" \
+    --loop "${LOOP_INTERVAL}" \
+    --verbose "${VERBOSITY:-1}" \
+    --cache-dir "${WSPRNET_CACHE_DIR}"
