@@ -21,7 +21,7 @@ import threading
 import glob
 
 # Version
-VERSION = "2.2.4"  # Fixed: spotnum_start should be last_spotnum, not last_spotnum + 1
+VERSION = "2.3.0"  # Quote usernames in SQL, CHANGEME validation, default loop=20
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -37,7 +37,7 @@ DEFAULT_CONFIG = {
     'wsprnet_login_url': 'http://www.wsprnet.org/drupal/rest/user/login',
     'band': 'All',
     'exclude_special': 0,
-    'loop_interval': 120,
+    'loop_interval': 20,
     'cache_dir': '/var/lib/wsprnet/cache'
 }
 
@@ -597,8 +597,8 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
             
             if readonly_user not in user_names:
                 log(f"Creating read-only user {readonly_user}...")
-                admin_client.command(f"CREATE USER IF NOT EXISTS {readonly_user} IDENTIFIED BY '{readonly_password}'")
-                admin_client.command(f"GRANT SELECT ON {config['clickhouse_database']}.* TO {readonly_user}")
+                admin_client.command(f"CREATE USER IF NOT EXISTS `{readonly_user}` IDENTIFIED BY '{readonly_password}'")
+                admin_client.command(f"GRANT SELECT ON {config['clickhouse_database']}.* TO `{readonly_user}`")
                 log(f"Read-only user {readonly_user} created")
         except Exception as e:
             log(f"Could not check/create readonly user: {e}", "WARNING")
@@ -690,6 +690,30 @@ def main():
                         help='Verbosity level (ignored, for compatibility)')
     
     args = parser.parse_args()
+    
+    # Validate credentials are not placeholder values
+    def check_changeme(value, name):
+        if value and value.upper() in ('CHANGEME', 'CHANGE_ME', 'CHANGE-ME', 'CHANGME'):
+            return name
+        return None
+    
+    placeholder_errors = []
+    if err := check_changeme(args.username, 'WSPRNET username (--username)'):
+        placeholder_errors.append(err)
+    if err := check_changeme(args.password, 'WSPRNET password (--password)'):
+        placeholder_errors.append(err)
+    if err := check_changeme(args.clickhouse_user, 'ClickHouse user (--clickhouse-user)'):
+        placeholder_errors.append(err)
+    if err := check_changeme(args.clickhouse_password, 'ClickHouse password (--clickhouse-password)'):
+        placeholder_errors.append(err)
+    
+    if placeholder_errors:
+        print("ERROR: The following credentials still have placeholder values:", file=sys.stderr)
+        for err in placeholder_errors:
+            print(f"  - {err}", file=sys.stderr)
+        print("\nPlease edit /etc/wsprdaemon/wsprnet.conf and /etc/wsprdaemon/clickhouse.conf", file=sys.stderr)
+        print("and replace 'CHANGEME' with actual credentials.", file=sys.stderr)
+        sys.exit(1)
     
     if args.log_file:
         setup_logging(args.log_file, args.log_max_mb * 1024 * 1024)

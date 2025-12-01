@@ -1,8 +1,59 @@
 #!/bin/bash
 # install-servers.sh - Install WSPRNET Scraper and WSPRDAEMON Server Services
-# Version: 1.2.0 - Added configurable INCOMING_DIRS
+# Version: 1.5.0 - ClickHouse user management via command-line args, fixed wrapper argument names
+#
+# Usage: sudo ./install-servers.sh --ch-admin USERNAME --ch-admin-password PASSWORD
+#
+# This script:
+#   - Creates ClickHouse root admin user (credentials from command line, not stored in git)
+#   - Configures ClickHouse 'default' user as read-only with password 'wsprdaemon'
+#   - Installs Python scripts and wrapper scripts
+#   - Creates systemd service files
+#   - Creates configuration file templates
 
 set -e
+
+# Parse command line arguments
+CH_ADMIN_USER=""
+CH_ADMIN_PASSWORD=""
+
+usage() {
+    echo "Usage: $0 --ch-admin USERNAME --ch-admin-password PASSWORD"
+    echo ""
+    echo "Required arguments:"
+    echo "  --ch-admin USERNAME           ClickHouse root admin username"
+    echo "  --ch-admin-password PASSWORD  ClickHouse root admin password"
+    echo ""
+    echo "Example:"
+    echo "  sudo $0 --ch-admin chadmin --ch-admin-password 'MySecretPass123'"
+    exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --ch-admin)
+            CH_ADMIN_USER="$2"
+            shift 2
+            ;;
+        --ch-admin-password)
+            CH_ADMIN_PASSWORD="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            ;;
+    esac
+done
+
+if [[ -z "$CH_ADMIN_USER" ]] || [[ -z "$CH_ADMIN_PASSWORD" ]]; then
+    echo "ERROR: Both --ch-admin and --ch-admin-password are required"
+    echo ""
+    usage
+fi
 
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
@@ -19,6 +70,7 @@ echo "Installing WSPRDAEMON Server Services..."
 echo "Script directory: $SCRIPT_DIR"
 echo "Installation directory: $INSTALL_DIR"
 echo "Virtual environment: $VENV_DIR"
+echo "ClickHouse admin user: $CH_ADMIN_USER"
 
 # Create wsprdaemon user if it doesn't exist
 if ! id -u $INSTALL_USER >/dev/null 2>&1; then
@@ -34,7 +86,7 @@ echo "  Created $INSTALL_DIR"
 
 # Create necessary data directories (but don't recursively chown if they already exist)
 echo "Creating data directories..."
-for dir in /var/spool/wsprdaemon /var/spool/wsprdaemon/from-gw1 /var/spool/wsprdaemon/from-gw2 /var/lib/wsprdaemon/wsprnet /var/lib/wsprdaemon/wsprdaemon /var/log/wsprdaemon /etc/wsprdaemon /tmp/wsprdaemon; do
+for dir in /var/spool/wsprdaemon /var/spool/wsprdaemon/from-gw1 /var/spool/wsprdaemon/from-gw2 /var/lib/wsprdaemon /var/lib/wsprdaemon/wsprnet /var/lib/wsprdaemon/wsprnet/cache /var/lib/wsprdaemon/wsprdaemon /var/log/wsprdaemon /etc/wsprdaemon /tmp/wsprdaemon; do
     if [[ ! -d "$dir" ]]; then
         mkdir -p "$dir"
         chown $INSTALL_USER:$INSTALL_USER "$dir"
@@ -72,17 +124,283 @@ chmod +x /usr/local/bin/wsprnet_scraper.py
 chmod +x /usr/local/bin/wsprdaemon_server.py
 echo "  Python scripts installed"
 
-# Install wrapper scripts
-echo "Installing wrapper scripts..."
-cp "$SCRIPT_DIR/wsprnet_scraper.sh" /usr/local/bin/
-cp "$SCRIPT_DIR/wsprdaemon_server.sh" /usr/local/bin/
-cp "$SCRIPT_DIR/wsprnet_cache_manager.sh" /usr/local/bin/
+# ============================================================================
+# Configure ClickHouse users
+# ============================================================================
+echo "Configuring ClickHouse users..."
+
+# Check if ClickHouse is installed
+if [[ ! -d /etc/clickhouse-server ]]; then
+    echo "  WARNING: /etc/clickhouse-server not found - skipping ClickHouse user configuration"
+    echo "  You will need to manually create ClickHouse users"
+else
+    # Create users.d directory if it doesn't exist
+    mkdir -p /etc/clickhouse-server/users.d
+
+    # Create root admin user XML file
+    echo "  Creating ClickHouse root admin user: $CH_ADMIN_USER"
+    cat > /etc/clickhouse-server/users.d/${CH_ADMIN_USER}.xml << CHADMINEOF
+<?xml version="1.0"?>
+<clickhouse>
+    <users>
+        <${CH_ADMIN_USER}>
+            <password>${CH_ADMIN_PASSWORD}</password>
+            <networks>
+                <ip>::1</ip>
+                <ip>127.0.0.1</ip>
+            </networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>1</access_management>
+            <named_collection_control>1</named_collection_control>
+            <show_named_collections>1</show_named_collections>
+            <show_named_collections_secrets>1</show_named_collections_secrets>
+        </${CH_ADMIN_USER}>
+    </users>
+</clickhouse>
+CHADMINEOF
+    chmod 600 /etc/clickhouse-server/users.d/${CH_ADMIN_USER}.xml
+    chown clickhouse:clickhouse /etc/clickhouse-server/users.d/${CH_ADMIN_USER}.xml
+    echo "    Created /etc/clickhouse-server/users.d/${CH_ADMIN_USER}.xml"
+
+    # Configure default user as read-only with password
+    echo "  Configuring 'default' user as read-only with password 'wsprdaemon'"
+    cat > /etc/clickhouse-server/users.d/default-readonly.xml << 'DEFAULTEOF'
+<?xml version="1.0"?>
+<clickhouse>
+    <users>
+        <default>
+            <password>wsprdaemon</password>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <profile>readonly</profile>
+            <quota>default</quota>
+            <!-- No access_management = read-only -->
+        </default>
+    </users>
+    <profiles>
+        <readonly>
+            <readonly>1</readonly>
+        </readonly>
+    </profiles>
+</clickhouse>
+DEFAULTEOF
+    chmod 644 /etc/clickhouse-server/users.d/default-readonly.xml
+    chown clickhouse:clickhouse /etc/clickhouse-server/users.d/default-readonly.xml
+    echo "    Created /etc/clickhouse-server/users.d/default-readonly.xml"
+
+    # Restart ClickHouse to apply user changes
+    if systemctl is-active --quiet clickhouse-server; then
+        echo "  Restarting ClickHouse to apply user changes..."
+        systemctl restart clickhouse-server
+        sleep 2
+        if systemctl is-active --quiet clickhouse-server; then
+            echo "    ClickHouse restarted successfully"
+        else
+            echo "    WARNING: ClickHouse failed to restart - check configuration"
+        fi
+    else
+        echo "  NOTE: ClickHouse is not running - user changes will apply on next start"
+    fi
+fi
+
+# ============================================================================
+# Create wrapper scripts inline (to ensure correct content)
+# ============================================================================
+echo "Creating wrapper scripts..."
+
+cat > /usr/local/bin/wsprnet_scraper.sh << 'WRAPPEREOF'
+#!/bin/bash
+#
+# wsprnet_scraper.sh - Wrapper script for WSPRNET Scraper
+# Version: 4.1
+# Date: 2025-11-29
+# Changes: Fixed argument names to match wsprnet_scraper.py argparse
+#          Added missing --session-file, --setup-readonly-user, --setup-readonly-password
+
+set -e
+
+CONFIG_FILE="$1"
+if [[ -z "${CONFIG_FILE}" ]] || [[ ! -f "${CONFIG_FILE}" ]]; then
+    echo "ERROR: Config file not found: ${CONFIG_FILE}" >&2
+    echo "Usage: $0 /path/to/config.conf" >&2
+    exit 1
+fi
+
+echo "Loading configuration from: ${CONFIG_FILE}"
+source "${CONFIG_FILE}"
+
+if [[ -f /etc/wsprdaemon/clickhouse.conf ]]; then
+    source /etc/wsprdaemon/clickhouse.conf
+else
+    echo "ERROR: ClickHouse config not found: /etc/wsprdaemon/clickhouse.conf" >&2
+    exit 1
+fi
+
+required_vars=(
+    "CLICKHOUSE_ROOT_ADMIN_USER"
+    "CLICKHOUSE_ROOT_ADMIN_PASSWORD"
+    "CLICKHOUSE_WSPRNET_READONLY_USER"
+    "CLICKHOUSE_WSPRNET_READONLY_PASSWORD"
+    "WSPRNET_USERNAME"
+    "WSPRNET_PASSWORD"
+    "VENV_PYTHON"
+    "SCRAPER_SCRIPT"
+    "LOG_FILE"
+    "LOOP_INTERVAL"
+    "WSPRNET_CACHE_DIR"
+    "SESSION_FILE"
+)
+
+missing_vars=()
+for var in "${required_vars[@]}"; do
+    if [[ -z "${!var+x}" ]] || [[ -z "${!var}" ]]; then
+        missing_vars+=("  $var")
+    fi
+done
+
+if [[ ${#missing_vars[@]} -gt 0 ]]; then
+    echo "ERROR: Missing required configuration variables:" >&2
+    printf '%s\n' "${missing_vars[@]}" >&2
+    exit 1
+fi
+
+if [[ ! -x "${VENV_PYTHON}" ]]; then
+    echo "ERROR: Python executable not found: ${VENV_PYTHON}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${SCRAPER_SCRIPT}" ]]; then
+    echo "ERROR: Scraper script not found: ${SCRAPER_SCRIPT}" >&2
+    exit 1
+fi
+
+mkdir -p "$(dirname "${LOG_FILE}")"
+mkdir -p "$(dirname "${SESSION_FILE}")"
+mkdir -p "${WSPRNET_CACHE_DIR}"
+
+echo "Starting WSPRNET Scraper..."
+echo "Python: ${VENV_PYTHON}"
+echo "Script: ${SCRAPER_SCRIPT}"
+echo "Log: ${LOG_FILE}"
+echo "Session: ${SESSION_FILE}"
+echo "Loop interval: ${LOOP_INTERVAL} seconds"
+echo "Cache dir: ${WSPRNET_CACHE_DIR}"
+
+# Note: Python script uses --username/--password (not --wsprnet-user/--wsprnet-password)
+# Uses root admin to create wsprnet-admin and wsprnet-reader users
+exec "${VENV_PYTHON}" "${SCRAPER_SCRIPT}" \
+    --session-file "${SESSION_FILE}" \
+    --username "${WSPRNET_USERNAME}" \
+    --password "${WSPRNET_PASSWORD}" \
+    --clickhouse-user "${CLICKHOUSE_ROOT_ADMIN_USER}" \
+    --clickhouse-password "${CLICKHOUSE_ROOT_ADMIN_PASSWORD}" \
+    --setup-readonly-user "${CLICKHOUSE_WSPRNET_READONLY_USER}" \
+    --setup-readonly-password "${CLICKHOUSE_WSPRNET_READONLY_PASSWORD}" \
+    --log-file "${LOG_FILE}" \
+    --log-max-mb "${LOG_MAX_MB:-10}" \
+    --loop "${LOOP_INTERVAL}" \
+    --verbose "${VERBOSITY:-1}" \
+    --cache-dir "${WSPRNET_CACHE_DIR}"
+WRAPPEREOF
+
+cat > /usr/local/bin/wsprdaemon_server.sh << 'WRAPPEREOF'
+#!/bin/bash
+#
+# wsprdaemon_server.sh - Wrapper script for WSPRDAEMON Server
+# Version: 4.1
+# Date: 2025-11-29
+# Changes: Uses root admin credentials for initial setup
+
+set -e
+
+CONFIG_FILE="$1"
+if [[ -z "${CONFIG_FILE}" ]] || [[ ! -f "${CONFIG_FILE}" ]]; then
+    echo "ERROR: Config file not found: ${CONFIG_FILE}" >&2
+    echo "Usage: $0 /path/to/config.conf" >&2
+    exit 1
+fi
+
+echo "Loading configuration from: ${CONFIG_FILE}"
+source "${CONFIG_FILE}"
+
+if [[ -f /etc/wsprdaemon/clickhouse.conf ]]; then
+    source /etc/wsprdaemon/clickhouse.conf
+else
+    echo "ERROR: ClickHouse config not found: /etc/wsprdaemon/clickhouse.conf" >&2
+    exit 1
+fi
+
+required_vars=(
+    "CLICKHOUSE_ROOT_ADMIN_USER"
+    "CLICKHOUSE_ROOT_ADMIN_PASSWORD"
+    "CLICKHOUSE_WSPRDAEMON_READONLY_USER"
+    "CLICKHOUSE_WSPRDAEMON_READONLY_PASSWORD"
+    "VENV_PYTHON"
+    "SCRAPER_SCRIPT"
+    "LOG_FILE"
+    "LOOP_INTERVAL"
+    "INCOMING_DIRS"
+)
+
+missing_vars=()
+for var in "${required_vars[@]}"; do
+    if [[ -z "${!var+x}" ]] || [[ -z "${!var}" ]]; then
+        missing_vars+=("  $var")
+    fi
+done
+
+if [[ ${#missing_vars[@]} -gt 0 ]]; then
+    echo "ERROR: Missing required configuration variables:" >&2
+    printf '%s\n' "${missing_vars[@]}" >&2
+    exit 1
+fi
+
+if [[ ! -x "${VENV_PYTHON}" ]]; then
+    echo "ERROR: Python executable not found: ${VENV_PYTHON}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${SCRAPER_SCRIPT}" ]]; then
+    echo "ERROR: Server script not found: ${SCRAPER_SCRIPT}" >&2
+    exit 1
+fi
+
+mkdir -p "$(dirname "${LOG_FILE}")"
+
+echo "Starting WSPRDAEMON Server with config: ${CONFIG_FILE}"
+echo "Python: ${VENV_PYTHON}"
+echo "Script: ${SCRAPER_SCRIPT}"
+echo "Log: ${LOG_FILE}"
+echo "Loop interval: ${LOOP_INTERVAL} seconds"
+echo "Incoming dirs: ${INCOMING_DIRS}"
+
+exec "${VENV_PYTHON}" "${SCRAPER_SCRIPT}" \
+    --clickhouse-user "${CLICKHOUSE_ROOT_ADMIN_USER}" \
+    --clickhouse-password "${CLICKHOUSE_ROOT_ADMIN_PASSWORD}" \
+    --setup-readonly-user "${CLICKHOUSE_WSPRDAEMON_READONLY_USER}" \
+    --setup-readonly-password "${CLICKHOUSE_WSPRDAEMON_READONLY_PASSWORD}" \
+    --log-file "${LOG_FILE}" \
+    --log-max-mb "${LOG_MAX_MB:-10}" \
+    --loop "${LOOP_INTERVAL}" \
+    --verbose "${VERBOSITY:-1}" \
+    --incoming-dirs "${INCOMING_DIRS}"
+WRAPPEREOF
+
 chmod +x /usr/local/bin/wsprnet_scraper.sh
 chmod +x /usr/local/bin/wsprdaemon_server.sh
-chmod +x /usr/local/bin/wsprnet_cache_manager.sh
+
+# Install cache manager if it exists in script dir
+if [[ -f "$SCRIPT_DIR/wsprnet_cache_manager.sh" ]]; then
+    cp "$SCRIPT_DIR/wsprnet_cache_manager.sh" /usr/local/bin/
+    chmod +x /usr/local/bin/wsprnet_cache_manager.sh
+fi
 echo "  Wrapper scripts installed"
 
-# Create systemd service files inline (to ensure correct content)
+# ============================================================================
+# Create systemd service files
+# ============================================================================
 echo "Creating systemd service files..."
 
 cat > /etc/systemd/system/wsprnet_scraper@.service << 'SERVICEEOF'
@@ -157,29 +475,47 @@ chmod 644 /etc/systemd/system/wsprnet_scraper@.service
 chmod 644 /etc/systemd/system/wsprdaemon_server@.service
 echo "  Service files created"
 
+# ============================================================================
 # Create configuration files if they don't exist
+# ============================================================================
 if [[ ! -f /etc/wsprdaemon/clickhouse.conf ]]; then
     echo "Creating /etc/wsprdaemon/clickhouse.conf..."
-    cat > /etc/wsprdaemon/clickhouse.conf << 'CONFEOF'
+    cat > /etc/wsprdaemon/clickhouse.conf << CONFEOF
 #!/bin/bash
 # ClickHouse Connection Configuration
+# File: /etc/wsprdaemon/clickhouse.conf
+# Permissions: chmod 640, chown root:wsprdaemon
+#
+# This file contains ALL ClickHouse credentials.
+# Do NOT commit real passwords to git.
+
+# ClickHouse server connection
 CLICKHOUSE_HOST="localhost"
 CLICKHOUSE_PORT="8123"
-CLICKHOUSE_DEFAULT_PASSWORD="CHANGEME"
-CLICKHOUSE_WSPRNET_ADMIN_USER="wsprnet-admin"
-CLICKHOUSE_WSPRNET_ADMIN_PASSWORD="CHANGEME"
+
+# Default user - read-only access (configured in ClickHouse users.d)
+CLICKHOUSE_DEFAULT_PASSWORD="wsprdaemon"
+
+# Root admin user - full access to all databases
+# Created by install-servers.sh in /etc/clickhouse-server/users.d/
+CLICKHOUSE_ROOT_ADMIN_USER="${CH_ADMIN_USER}"
+CLICKHOUSE_ROOT_ADMIN_PASSWORD="${CH_ADMIN_PASSWORD}"
+
+# WSPRNET database read-only user (created by wsprnet_scraper.py)
 CLICKHOUSE_WSPRNET_READONLY_USER="wsprnet-reader"
-CLICKHOUSE_WSPRNET_READONLY_PASSWORD="CHANGEME"
-CLICKHOUSE_WSPRDAEMON_ADMIN_USER="wsprdaemon-admin"
-CLICKHOUSE_WSPRDAEMON_ADMIN_PASSWORD="CHANGEME"
+CLICKHOUSE_WSPRNET_READONLY_PASSWORD="wsprdaemon"
+
+# WSPRDAEMON database read-only user (created by wsprdaemon_server.py)
 CLICKHOUSE_WSPRDAEMON_READONLY_USER="wsprdaemon-reader"
-CLICKHOUSE_WSPRDAEMON_READONLY_PASSWORD="CHANGEME"
+CLICKHOUSE_WSPRDAEMON_READONLY_PASSWORD="wsprdaemon"
 CONFEOF
     chown root:$INSTALL_USER /etc/wsprdaemon/clickhouse.conf
     chmod 640 /etc/wsprdaemon/clickhouse.conf
-    echo "  WARNING: Edit /etc/wsprdaemon/clickhouse.conf and set your credentials!"
+    echo "  Created /etc/wsprdaemon/clickhouse.conf with root admin credentials"
+    echo "  WARNING: Edit and set WSPRNET/WSPRDAEMON admin passwords!"
 else
     echo "Configuration file /etc/wsprdaemon/clickhouse.conf already exists"
+    echo "  NOTE: Root admin credentials NOT updated - edit manually if needed"
 fi
 
 if [[ ! -f /etc/wsprdaemon/wsprnet.conf ]]; then
@@ -199,10 +535,12 @@ LOG_MAX_MB="10"
 VENV_PYTHON="/opt/wsprdaemon-server/venv/bin/python3"
 SCRAPER_SCRIPT="/usr/local/bin/wsprnet_scraper.py"
 LOOP_INTERVAL="120"
+# Path to cache directory for downloaded spot files
+WSPRNET_CACHE_DIR="/var/lib/wsprdaemon/wsprnet/cache"
 CONFEOF
     chown root:$INSTALL_USER /etc/wsprdaemon/wsprnet.conf
     chmod 640 /etc/wsprdaemon/wsprnet.conf
-    echo "  WARNING: Edit /etc/wsprdaemon/wsprnet.conf and set your credentials!"
+    echo "  WARNING: Edit /etc/wsprdaemon/wsprnet.conf and set your WSPRNET credentials!"
 else
     echo "Configuration file /etc/wsprdaemon/wsprnet.conf already exists"
 fi
@@ -238,6 +576,10 @@ systemctl daemon-reload
 echo ""
 echo "=== Installation complete! ==="
 echo ""
+echo "ClickHouse users configured:"
+echo "  - Root admin: $CH_ADMIN_USER (localhost only, full access)"
+echo "  - default: read-only with password 'wsprdaemon' (any host)"
+echo ""
 echo "Installation directory: $INSTALL_DIR"
 echo "Virtual environment: $VENV_DIR"
 echo "Configuration files: /etc/wsprdaemon/"
@@ -245,14 +587,13 @@ echo "Scripts: /usr/local/bin/"
 echo "Service templates: /etc/systemd/system/"
 echo ""
 echo "Next steps:"
-echo "1. Edit /etc/wsprdaemon/clickhouse.conf and set ClickHouse credentials"
-echo "2. Edit /etc/wsprdaemon/wsprnet.conf and set WSPRNET credentials"
-echo "3. Enable services:"
+echo "1. Edit /etc/wsprdaemon/wsprnet.conf and set WSPRNET credentials"
+echo "2. Enable services:"
 echo "     sudo systemctl enable wsprnet_scraper@wsprnet"
 echo "     sudo systemctl enable wsprdaemon_server@wsprdaemon"
-echo "4. Start services:"
+echo "3. Start services:"
 echo "     sudo systemctl start wsprnet_scraper@wsprnet"
 echo "     sudo systemctl start wsprdaemon_server@wsprdaemon"
-echo "5. Check status:"
+echo "4. Check status:"
 echo "     sudo systemctl status wsprnet_scraper@wsprnet"
 echo "     sudo systemctl status wsprdaemon_server@wsprdaemon"
