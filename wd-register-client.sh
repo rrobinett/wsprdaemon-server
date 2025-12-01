@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# wd-register-client.sh v2.7.6
+# wd-register-client.sh v2.9.0
 # 
 # Script to register WSPRDAEMON client stations for SFTP uploads
 # Creates user accounts on gateway servers and configures client access
@@ -8,13 +8,30 @@
 # Usage:
 #   ./wd-register-client.sh <client_rac_number> [--verbose]
 #   ./wd-register-client.sh <client_rac_number> <reporter_id>  # Manual override
+#   ./wd-register-client.sh --config <reporter_id> <psk>       # Create accounts (PSK=SSH pubkey)
+#   ./wd-register-client.sh --scan-racs                        # Scan all RACs
 #   ./wd-register-client.sh --version
 #
 # Examples:
 #   ./wd-register-client.sh 84              # Register client RAC 84 (auto-detect ID)
 #   ./wd-register-client.sh 84 KJ6MKI       # Register with manual reporter ID
 #   ./wd-register-client.sh 84 --verbose    # Register with verbose output  
+#   ./wd-register-client.sh --config KJ6MKI "ssh-rsa AAAAB3..."  # Create accounts + output config
+#   ./wd-register-client.sh --scan-racs     # Check connectivity to all RACs
 #   ./wd-register-client.sh --version       # Show version only
+#
+# Changes in v2.9.0:
+#   - NEW: --config <reporter_id> <psk> mode for manual client setup
+#   - Creates user accounts on both gw1 and gw2 servers
+#   - Adds PSK to user's .ssh/authorized_keys on both servers
+#   - Outputs WD_SERVER_USER_LIST line for client's wsprdaemon.conf
+#   - Does not require RAC tunnel or SSH access to client
+#
+# Changes in v2.8.0:
+#   - NEW: --scan-racs option to check connectivity to all RACs
+#   - Uses nc (netcat) to test TCP ports for each RAC
+#   - Shows active vs inactive clients with SSH test
+#   - Reports summary of all RACs in .ssr.conf
 #
 # Changes in v2.7.6:
 #   - IMPROVED: Add warning comment to wsprdaemon.conf configuration line
@@ -118,7 +135,7 @@
 # Author: AI6VN (with assistance from Claude)
 # Date: November 2025
 
-VERSION="2.7.6"
+VERSION="2.9.0"
 SCRIPT_NAME="wd-register-client.sh"
 
 # Source bash aliases if available
@@ -131,6 +148,143 @@ function show_version() {
     echo "$SCRIPT_NAME version $VERSION"
     echo "WSPRDAEMON Client Registration Tool"
     echo ""
+}
+
+# Function to generate wsprdaemon.conf lines (--config mode)
+# Usage: generate_config_output <reporter_id> <psk>
+# Creates user accounts on gw1 and gw2, adds PSK to authorized_keys, and outputs config lines
+function generate_config_output() {
+    local reporter_id="$1"
+    local psk="$2"
+    
+    if [[ -z "$reporter_id" || -z "$psk" ]]; then
+        echo "ERROR: --config requires both reporter_id and psk arguments"
+        echo ""
+        echo "Usage: $SCRIPT_NAME --config <reporter_id> <psk>"
+        echo ""
+        echo "Example: $SCRIPT_NAME --config KJ6MKI 'ssh-rsa AAAAB3Nza... user@host'"
+        echo ""
+        echo "The PSK is the client's SSH public key (contents of ~/.ssh/id_rsa.pub)"
+        echo ""
+        echo "This creates user accounts on both gateway servers, adds the PSK to"
+        echo "authorized_keys, and outputs the line for the client's wsprdaemon.conf."
+        return 1
+    fi
+    
+    # Sanitize the reporter ID for use as Linux username
+    local sanitized_reporter_id=$(echo "$reporter_id" | tr '/' '_' | tr '.' '_' | tr '-' '_' | tr '@' '_')
+    
+    if [[ "$reporter_id" != "$sanitized_reporter_id" ]]; then
+        echo ""
+        echo "NOTE: Reporter ID '$reporter_id' contains invalid characters for Linux username"
+        echo "      Using sanitized username: '$sanitized_reporter_id'"
+    fi
+    
+    echo ""
+    echo "=== Creating user accounts for $reporter_id ==="
+    echo ""
+    
+    # Ensure SSHD is configured for SFTP-only access
+    if ! wd-sshd-conf-add-sftponly; then
+        echo "ERROR: Failed to configure SSHD"
+        return 1
+    fi
+    
+    # Ensure sftponly group exists
+    if ! ensure_sftponly_group; then
+        echo "ERROR: Failed to ensure sftponly group"
+        return 1
+    fi
+    
+    # Setup local user
+    if ! setup_local_user "$reporter_id" "$sanitized_reporter_id"; then
+        echo "ERROR: Failed to setup local user"
+        return 1
+    fi
+    
+    # Add the PSK to the user's authorized_keys file
+    echo ""
+    echo "=== Adding PSK to authorized_keys ==="
+    local auth_keys_file="/home/${sanitized_reporter_id}/.ssh/authorized_keys"
+    
+    # Check if PSK already exists in authorized_keys
+    if sudo grep -qF "$psk" "$auth_keys_file" 2>/dev/null; then
+        echo "✓ PSK already exists in $auth_keys_file"
+    else
+        echo "Adding PSK to $auth_keys_file..."
+        if ! echo "$psk" | sudo tee -a "$auth_keys_file" > /dev/null; then
+            echo "ERROR: Failed to add PSK to authorized_keys"
+            return 1
+        fi
+        # Ensure correct ownership and permissions
+        sudo chown "${sanitized_reporter_id}:${sanitized_reporter_id}" "$auth_keys_file"
+        sudo chmod 600 "$auth_keys_file"
+        echo "✓ PSK added to local authorized_keys"
+    fi
+    
+    # Determine backup server
+    local hostname=$(hostname | tr '[:upper:]' '[:lower:]')
+    local backup_server=""
+    
+    case "$hostname" in
+        *gw1*)
+            backup_server="gw2.wsprdaemon.org"
+            ;;
+        *gw2*)
+            backup_server="gw1.wsprdaemon.org"
+            ;;
+        *)
+            backup_server="gw2.wsprdaemon.org"
+            ;;
+    esac
+    
+    # Replicate to backup server
+    echo ""
+    if ! replicate_user_to_server "$reporter_id" "$sanitized_reporter_id" "$backup_server"; then
+        echo ""
+        echo "WARNING: Failed to replicate user to $backup_server"
+        echo "You may need to manually create the user on $backup_server"
+    else
+        # Add the PSK to authorized_keys on the backup server too
+        echo "Adding PSK to authorized_keys on $backup_server..."
+        local remote_auth_keys="/home/${sanitized_reporter_id}/.ssh/authorized_keys"
+        
+        # Check if PSK already exists on remote
+        if ssh "$backup_server" "sudo grep -qF '$psk' '$remote_auth_keys'" 2>/dev/null; then
+            echo "✓ PSK already exists on $backup_server"
+        else
+            if ssh "$backup_server" "echo '$psk' | sudo tee -a '$remote_auth_keys' > /dev/null && sudo chown '${sanitized_reporter_id}:${sanitized_reporter_id}' '$remote_auth_keys' && sudo chmod 600 '$remote_auth_keys'" 2>/dev/null; then
+                echo "✓ PSK added to authorized_keys on $backup_server"
+            else
+                echo "WARNING: Could not add PSK on $backup_server"
+                echo "You may need to manually add the PSK to $remote_auth_keys"
+            fi
+        fi
+    fi
+    
+    echo ""
+    echo "========================================="
+    echo "✓ User accounts created on both servers!"
+    echo "========================================="
+    echo ""
+    echo "# ============================================================"
+    echo "# WSPRDAEMON Server Upload Configuration"
+    echo "# Generated by $SCRIPT_NAME v$VERSION"
+    echo "# Date: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "# Reporter ID: $reporter_id"
+    if [[ "$reporter_id" != "$sanitized_reporter_id" ]]; then
+        echo "# Sanitized Username: $sanitized_reporter_id"
+    fi
+    echo "# ============================================================"
+    echo ""
+    echo "# Add this line to the client's ~/wsprdaemon/wsprdaemon.conf file:"
+    echo "# (Remove any existing WD_SERVER_USER or WD_SERVER_USER_LIST lines first)"
+    echo ""
+    echo "### WARNING: DO NOT REMOVE OR CHANGE THIS LINE which was added by the WD SERVER!"
+    echo "WD_SERVER_USER_LIST=(\"${sanitized_reporter_id}@gw1.wsprdaemon.org\" \"${sanitized_reporter_id}@gw2.wsprdaemon.org\")"
+    echo ""
+    
+    return 0
 }
 
 # Function to add SFTP-only configuration to sshd_config
@@ -448,6 +602,175 @@ function replicate_user_to_server() {
     fi
     
     return 0
+}
+
+# Function to scan all RACs for connectivity
+function scan_all_racs() {
+    echo ""
+    echo "========================================="
+    echo "WSPRDAEMON RAC Connectivity Scanner"
+    echo "========================================="
+    echo ""
+    
+    # Check for .ssr.conf file
+    local ssr_conf_file="${HOME}/.ssr.conf"
+    if [[ ! -f "$ssr_conf_file" ]]; then
+        echo "ERROR: .ssr.conf file not found at $ssr_conf_file"
+        exit 1
+    fi
+    
+    # Check if nc is available
+    if ! command -v nc >/dev/null 2>&1; then
+        echo "ERROR: 'nc' (netcat) is not installed."
+        echo "Install with: sudo apt-get install netcat-openbsd"
+        exit 1
+    fi
+    
+    # Source the .ssr.conf file
+    source "$ssr_conf_file"
+    
+    if [[ ${#FRPS_REMOTE_ACCESS_LIST[@]} -eq 0 ]]; then
+        echo "ERROR: No RAC entries found in .ssr.conf"
+        exit 1
+    fi
+    
+    echo "Configuration: $ssr_conf_file"
+    echo "Total RAC entries: ${#FRPS_REMOTE_ACCESS_LIST[@]}"
+    echo ""
+    
+    # Determine which gateway we're using for tests
+    local WD_RAC_SERVER="gw2"  # Default to gw2
+    local hostname=$(hostname | tr '[:upper:]' '[:lower:]')
+    if [[ "$hostname" == *"gw1"* ]]; then
+        WD_RAC_SERVER="gw1"
+    fi
+    echo "Testing from: $(hostname) (using $WD_RAC_SERVER for connections)"
+    echo "Port formula: 35800 + RAC number"
+    echo ""
+    
+    # Track statistics
+    local total_racs=0
+    local active_racs=0
+    local inactive_racs=0
+    local ssh_ok=0
+    local ssh_fail=0
+    local active_list=()
+    local inactive_list=()
+    
+    # Header
+    printf "%-4s | %-6s | %-10s | %-8s | %-15s | %s\n" "RAC" "Port" "TCP Status" "SSH Test" "Reporter ID" "Description"
+    printf "%-4s-+-%-6s-+-%-10s-+-%-8s-+-%-15s-+-%s\n" "----" "------" "----------" "--------" "---------------" "--------------------"
+    
+    # Test each RAC
+    for entry in "${FRPS_REMOTE_ACCESS_LIST[@]}"; do
+        # Parse the entry
+        local rac=$(echo "$entry" | cut -d',' -f1)
+        local wd_user=$(echo "$entry" | cut -d',' -f2)
+        local ssh_user=$(echo "$entry" | cut -d',' -f3)
+        local description=$(echo "$entry" | cut -d',' -f6)
+        
+        # Skip comment lines or empty RACs
+        if [[ -z "$rac" ]] || [[ "$rac" =~ ^# ]] || [[ ! "$rac" =~ ^[0-9]+$ ]]; then
+            continue
+        fi
+        
+        # Calculate port
+        local port=$((35800 + rac))
+        
+        # Test TCP connectivity with nc (netcat) - 2 second timeout
+        local tcp_status="CLOSED"
+        local tcp_symbol="✗"
+        if nc -z -w 2 "$WD_RAC_SERVER" "$port" 2>/dev/null; then
+            tcp_status="OPEN"
+            tcp_symbol="✓"
+            ((active_racs++))
+            active_list+=("$rac:$wd_user:$port")
+            
+            # Test SSH access for active connections
+            local ssh_status="N/A"
+            if [[ "$tcp_status" == "OPEN" ]]; then
+                if timeout 2 ssh -o ConnectTimeout=2 -o BatchMode=yes -o StrictHostKeyChecking=no -p "$port" "${ssh_user}@${WD_RAC_SERVER}" "exit" 2>/dev/null; then
+                    ssh_status="✓ OK"
+                    ((ssh_ok++))
+                else
+                    ssh_status="✗ Fail"
+                    ((ssh_fail++))
+                fi
+            fi
+        else
+            ((inactive_racs++))
+            inactive_list+=("$rac:$wd_user:$port")
+            ssh_status="-"
+        fi
+        
+        # Format output
+        printf "%3s  | %6s | %-10s | %-8s | %-15s | %s\n" \
+            "$rac" \
+            "$port" \
+            "$tcp_symbol $tcp_status" \
+            "$ssh_status" \
+            "${wd_user:0:15}" \
+            "${description:0:30}"
+        
+        ((total_racs++))
+    done
+    
+    # Summary statistics
+    echo ""
+    echo "========================================="
+    echo "SUMMARY STATISTICS"
+    echo "========================================="
+    printf "Total RACs tested:     %3d\n" "$total_racs"
+    printf "TCP Ports OPEN:        %3d (%.1f%%)\n" "$active_racs" $(echo "scale=1; $active_racs * 100 / $total_racs" | bc 2>/dev/null || echo "0")
+    printf "TCP Ports CLOSED:      %3d (%.1f%%)\n" "$inactive_racs" $(echo "scale=1; $inactive_racs * 100 / $total_racs" | bc 2>/dev/null || echo "0")
+    
+    if [[ $active_racs -gt 0 ]]; then
+        printf "SSH Access OK:         %3d (%.1f%% of active)\n" "$ssh_ok" $(echo "scale=1; $ssh_ok * 100 / $active_racs" | bc 2>/dev/null || echo "0")
+        printf "SSH Access Failed:     %3d (%.1f%% of active)\n" "$ssh_fail" $(echo "scale=1; $ssh_fail * 100 / $active_racs" | bc 2>/dev/null || echo "0")
+    fi
+    
+    echo ""
+    echo "========================================="
+    echo "ACTIVE RACS (TCP Port OPEN)"
+    echo "========================================="
+    if [[ ${#active_list[@]} -gt 0 ]]; then
+        for item in "${active_list[@]}"; do
+            IFS=':' read -r rac user port <<< "$item"
+            printf "  RAC %3s (port %s): %s\n" "$rac" "$port" "$user"
+        done
+    else
+        echo "  None"
+    fi
+    
+    echo ""
+    echo "========================================="
+    echo "INACTIVE RACS (TCP Port CLOSED)"
+    echo "========================================="
+    if [[ ${#inactive_list[@]} -gt 0 ]]; then
+        if [[ ${#inactive_list[@]} -gt 20 ]]; then
+            echo "  Showing first 20 of ${#inactive_list[@]} inactive RACs:"
+            for i in {0..19}; do
+                [[ $i -ge ${#inactive_list[@]} ]] && break
+                IFS=':' read -r rac user port <<< "${inactive_list[$i]}"
+                printf "  RAC %3s (port %s): %s\n" "$rac" "$port" "$user"
+            done
+            echo "  ... and $((${#inactive_list[@]} - 20)) more"
+        else
+            for item in "${inactive_list[@]}"; do
+                IFS=':' read -r rac user port <<< "$item"
+                printf "  RAC %3s (port %s): %s\n" "$rac" "$port" "$user"
+            done
+        fi
+    else
+        echo "  None"
+    fi
+    
+    echo ""
+    echo "========================================="
+    echo "Test completed at $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo ""
+    
+    exit 0
 }
 
 # Function to ensure client has SSH keys (create if missing)
@@ -889,6 +1212,19 @@ function main() {
         exit 0
     fi
     
+    # Handle scan-racs argument
+    if [[ "${1:-}" == "--scan-racs" || "${1:-}" == "--scan" ]]; then
+        scan_all_racs
+        exit 0
+    fi
+    
+    # Handle --config argument (generate config lines only, no SSH required)
+    if [[ "${1:-}" == "--config" ]]; then
+        show_version
+        generate_config_output "${2:-}" "${3:-}"
+        exit $?
+    fi
+    
     # Always show version when running
     show_version
     
@@ -915,12 +1251,20 @@ function main() {
     
     if [[ -z "$client_rac" ]]; then
         echo "Usage: $SCRIPT_NAME <client_rac_number> [<reporter_id>] [--verbose]"
+        echo "       $SCRIPT_NAME --config <reporter_id> <psk>"
         echo "       $SCRIPT_NAME --version"
+        echo "       $SCRIPT_NAME --scan-racs"
         echo ""
-        echo "Example: $SCRIPT_NAME 84"
-        echo "         $SCRIPT_NAME 84 KJ6MKI"
-        echo "         $SCRIPT_NAME 84 --verbose"
-        echo "         $SCRIPT_NAME --version"
+        echo "Examples:"
+        echo "  $SCRIPT_NAME 84                        # Register RAC 84 (auto-detect ID)"
+        echo "  $SCRIPT_NAME 84 KJ6MKI                 # Register with manual reporter ID"
+        echo "  $SCRIPT_NAME 84 --verbose              # Register with verbose output"
+        echo "  $SCRIPT_NAME --config KJ6MKI 'ssh-rsa AAA...'  # Create accounts + output config"
+        echo "  $SCRIPT_NAME --scan-racs               # Check all RACs for connectivity"
+        echo "  $SCRIPT_NAME --version                 # Show version"
+        echo ""
+        echo "The --config mode creates user accounts on both servers, adds the client's"
+        echo "SSH public key (PSK) to authorized_keys, and outputs the wsprdaemon.conf line."
         exit 1
     fi
     
