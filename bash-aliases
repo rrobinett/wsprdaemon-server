@@ -1,6 +1,13 @@
 #!/bin/bash 
 ### This file ~/wsprdaemon/bash-aliases  includes functions and aliases which are helpful in running and debugging WD systems
 #
+
+function wd-systemclt-server()
+{
+    local service=${1-wsprdaemon_server}
+    local action=${1-status}
+}
+
 alias chc='clickhouse-client'
 alias ch=chc
 
@@ -1628,7 +1635,7 @@ alias h=history
 alias hg='history | grep'
 alias j=jobs
 
-alias cdw='cd ~/wsprdaemon/'
+alias cdw='cd ~/wsprdaemon-server/'
 alias cdk='cd ~/wsprdaemon/ka9q-radio'
 alias cdr='cd /etc/radio'
 alias cdrf='cd /run/ft8'
@@ -1667,14 +1674,15 @@ alias vir='vi ~/wsprdaemon/radiod@rx888-wsprdaemon.conf'
 alias virr='vi /etc/radio/radiod@rx888-wsprdaemon.conf'
 
 alias tf='tail -F -n 40'
-alias tfd='tf decoding_daemon.log'
+alias tfd='tf /var/log/wsprdaemon/wsprdaemon_server.log'
+alias tfn='tf /var/log/wsprdaemon/wsprnet_scraper.log'
 alias tfr='tf wav_recording_daemon.log'
 alias tfw='tf ~/wsprdaemon/watchdog_daemon.log'
 
 alias g='git'
 alias gc='git commit'
 alias gd='git diff'
-alias gs='git status | grep -B 100 "Untracked files"'
+alias gs='git status"
 alias gl='git log | head'
 
 ### Get pub file for a copy/past to remote server's .ssh/authorized_keys file
@@ -2577,7 +2585,7 @@ function wd-ssh-to-wdclient() {
 alias wdssr=wd-ssh-to-wdclient
 
 ###  Reloads these functions and aliases into the users running bash (must be an alias)
-alias wd-bash_aliases='source ~/wsprdaemon/bash-aliases'
+alias wd-bash_aliases='source ~/wsprdaemon-server/bash-aliases'
 alias wdba='wd-bash_aliases'
 
 function wd-help()
