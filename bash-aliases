@@ -1673,7 +1673,10 @@ alias vic='vi ~/wsprdaemon/wsprdaemon.conf'
 alias vir='vi ~/wsprdaemon/radiod@rx888-wsprdaemon.conf'
 alias virr='vi /etc/radio/radiod@rx888-wsprdaemon.conf'
 
-### sprdaemon-server alias
+### sprdaemon-server aliases
+
+alias cdq='cd /var/spool/wsprdaemon'
+
 alias tf='tail -F -n 80'
 alias tfd='tf /var/log/wsprdaemon/wsprdaemon_server.log'    ### There are two WD services running on WD10/20/30/...: the server which records extended spots to Clickhouse
 alias tfn='tf /var/log/wsprdaemon/wsprnet_scraper.log'      ### And the scraper which gets spots from wsprnet.org and saves the in Clickhouse
