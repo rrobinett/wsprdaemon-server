@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# wd-register-client.sh v2.9.0
+# wd-register-client.sh v2.10.10
 # 
 # Script to register WSPRDAEMON client stations for SFTP uploads
 # Creates user accounts on gateway servers and configures client access
@@ -10,6 +10,9 @@
 #   ./wd-register-client.sh <client_rac_number> <reporter_id>  # Manual override
 #   ./wd-register-client.sh --config <reporter_id> <psk>       # Create accounts (PSK=SSH pubkey)
 #   ./wd-register-client.sh --scan-racs                        # Scan all RACs
+#   ./wd-register-client.sh --register-batch                   # Register all RACs from need-reg file
+#   ./wd-register-client.sh --update-clients                   # SSH to RACs with old versions
+#   ./wd-register-client.sh --update-ssr                       # Update .ssr.conf with REPORTER_IDs
 #   ./wd-register-client.sh --version
 #
 # Examples:
@@ -18,7 +21,86 @@
 #   ./wd-register-client.sh 84 --verbose    # Register with verbose output  
 #   ./wd-register-client.sh --config KJ6MKI "ssh-rsa AAAAB3..."  # Create accounts + output config
 #   ./wd-register-client.sh --scan-racs     # Check connectivity to all RACs
+#   ./wd-register-client.sh --register-batch # Register all RACs needing config
+#   ./wd-register-client.sh --update-clients # Update RACs with old WD versions
+#   ./wd-register-client.sh --update-ssr    # Generate .ssr.conf.updated with REPORTER_IDs
 #   ./wd-register-client.sh --version       # Show version only
+#
+# Changes in v2.10.10:
+#   - FIXED: SSH no longer consumes file content in while loop
+#   - Uses file descriptor 3 to read update file, preventing stdin conflict
+#   - Added -t flag to SSH for proper terminal allocation
+#
+# Changes in v2.10.9:
+#   - FIXED: --update-clients properly calculates SSH port (35800 + RAC)
+#   - Removed confusing ssr command detection, always uses direct SSH
+#   - Shows "Connecting to port 35884 as user wsprdaemon..." for clarity
+#
+# Changes in v2.10.8:
+#   - FIXED: --update-clients now properly iterates through all RACs (was stopping after first)
+#   - NEW: Added ssr() function for simple RAC connections: ssr <RAC_number>
+#   - IMPROVED: Shows progress counter [1/5] when updating multiple RACs
+#   - Uses "ssr RAC" command if available, falls back to direct SSH
+#
+# Changes in v2.10.7:
+#   - NEW: Added RECEIVER_LIST fallback for Reporter ID (for new RACs without uploads)
+#   - Gets third field from first RECEIVER_LIST element in wsprdaemon.conf
+#   - Helps with RACs like #64 that haven't decoded/uploaded spots yet
+#
+# Changes in v2.10.6:
+#   - FIXED: Reporter ID now extracted using same method as Linux user account name
+#   - Looks for "my call CALLSIGN and/or" pattern in upload_to_wsprnet_daemon.log
+#   - This matches how the registration function determines the account name
+#   - Note: REMOTE_ACCESS_CHANNEL in wsprdaemon.conf equals RAC number
+#
+# Changes in v2.10.5:
+#   - FIXED: TCP State column properly aligned (10 chars to match header)
+#   - IMPROVED: Reporter ID now extracted from wsprdaemon.conf REPORTER_ID field
+#   - Already checks localhost first for RAC ports, then falls back to remote gateway
+#
+# Changes in v2.10.4:
+#   - FIXED: TCP State column width now matches header (was 1 char too narrow)
+#   - IMPROVED: Check localhost first for RAC ports, then fallback to remote gateway
+#   - FIXED: Reporter ID now shows actual ID from upload log (not wd_user from .ssr.conf)
+#
+# Changes in v2.10.3:
+#   - IMPROVED: WD Cfg column now shows "✓ OK" or "✗ NO" for better readability
+#   - FIXED: Column header alignment - all headers now properly align with data
+#   - TCP State column renamed and resized for consistent formatting
+#
+# Changes in v2.10.2:
+#   - FIXED: Always use gw2 for RAC connections (RAC ports only exist on gw2)
+#   - Script now works correctly when run from either GW1 or GW2
+#   - WD_RAC_SERVER always set to "gw2" regardless of which server runs script
+#
+# Changes in v2.10.1:
+#   - FIXED: When running on GW1, use gw1 for RAC connections (not gw2)
+#   - RAC ports are only accessible locally on each gateway
+#   - WD_RAC_SERVER now correctly set to local server name
+#
+# Changes in v2.10.0:
+#   - NEW: Track and report count of WD cfg active RACs in --scan-racs
+#   - NEW: List RACs where SSH OK but WD config missing (✗)
+#   - NEW: Save need-registration list to 'wd-register-clients.need-reg'
+#   - NEW: --register-batch option to register all RACs from need-reg file
+#   - NEW: Track WD versions and identify highest version
+#   - NEW: Save RACs with outdated versions to 'wd-register-clients.need-update'
+#   - NEW: --update-clients option to SSH to each RAC for manual updates
+#
+# Changes in v2.9.2:
+#   - NEW: --scan-racs shows WD Cfg column (✓/✗ if WD_SERVER_USER_LIST configured)
+#   - NEW: --scan-racs shows WD Version column (from wd_version.txt-git count)
+#   - FIXED: Suppressed verbose output from ssh-copy-id
+#
+# Changes in v2.9.1:
+#   - IMPROVED: --scan-racs now auto-fixes SSH key issues using sshpass
+#   - FIXED: Password extraction now uses field 5, second space-separated word
+#   - NEW: --update-ssr generates .ssr.conf.updated with REPORTER_IDs
+#   - Uses password from .ssr.conf field 5 with ssh-copy-id
+#   - Shows "✓ Fixed" status when keys are successfully installed
+#   - Lists failed RACs with manual fix commands if auto-fix fails
+#   - Uses StrictHostKeyChecking=no and UserKnownHostsFile=/dev/null
+#   - Requires sshpass package (apt install sshpass)
 #
 # Changes in v2.9.0:
 #   - NEW: --config <reporter_id> <psk> mode for manual client setup
@@ -135,7 +217,7 @@
 # Author: AI6VN (with assistance from Claude)
 # Date: November 2025
 
-VERSION="2.9.0"
+VERSION="2.10.10"
 SCRIPT_NAME="wd-register-client.sh"
 
 # Source bash aliases if available
@@ -604,6 +686,136 @@ function replicate_user_to_server() {
     return 0
 }
 
+# Function to generate updated .ssr.conf with REPORTER_IDs
+# Replaces first word of field 6 (description) with the sanitized REPORTER_ID
+function generate_updated_ssr_conf() {
+    echo ""
+    echo "========================================="
+    echo "Generating updated .ssr.conf with REPORTER_IDs"
+    echo "========================================="
+    echo ""
+    
+    # Check for .ssr.conf file
+    local ssr_conf_file="${HOME}/.ssr.conf"
+    if [[ ! -f "$ssr_conf_file" ]]; then
+        echo "ERROR: .ssr.conf file not found at $ssr_conf_file"
+        return 1
+    fi
+    
+    # Source the .ssr.conf file
+    source "$ssr_conf_file"
+    
+    if [[ ${#FRPS_REMOTE_ACCESS_LIST[@]} -eq 0 ]]; then
+        echo "ERROR: No RAC entries found in .ssr.conf"
+        return 1
+    fi
+    
+    # Always use gw2 for RAC connections (RAC ports only on gw2)
+    local WD_RAC_SERVER="gw2"
+    
+    echo "Reading from: $ssr_conf_file"
+    echo "Total RAC entries: ${#FRPS_REMOTE_ACCESS_LIST[@]}"
+    echo "Using $WD_RAC_SERVER for SSH connections"
+    echo ""
+    
+    # Output file
+    local output_file="${HOME}/.ssr.conf.updated"
+    
+    # Start building the new array
+    echo "# Updated .ssr.conf with REPORTER_IDs" > "$output_file"
+    echo "# Generated by $SCRIPT_NAME v$VERSION on $(date '+%Y-%m-%d %H:%M:%S')" >> "$output_file"
+    echo "#" >> "$output_file"
+    echo "# Format: RAC,wd_user,ssh_user,AUTO,ssh_user password,REPORTER_ID description,forwards" >> "$output_file"
+    echo "" >> "$output_file"
+    echo "declare FRPS_REMOTE_ACCESS_LIST=(" >> "$output_file"
+    
+    local updated_count=0
+    local skipped_count=0
+    local failed_count=0
+    
+    for entry in "${FRPS_REMOTE_ACCESS_LIST[@]}"; do
+        # Parse the entry
+        local rac=$(echo "$entry" | cut -d',' -f1)
+        local wd_user=$(echo "$entry" | cut -d',' -f2)
+        local ssh_user=$(echo "$entry" | cut -d',' -f3)
+        local field4=$(echo "$entry" | cut -d',' -f4)
+        local field5=$(echo "$entry" | cut -d',' -f5)
+        local description=$(echo "$entry" | cut -d',' -f6)
+        local forwards=$(echo "$entry" | cut -d',' -f7-)
+        
+        # Skip comment lines or empty RACs
+        if [[ -z "$rac" ]] || [[ "$rac" =~ ^# ]] || [[ ! "$rac" =~ ^[0-9]+$ ]]; then
+            echo "    \"$entry\"" >> "$output_file"
+            continue
+        fi
+        
+        local port=$((35800 + rac))
+        local reporter_id=""
+        local new_entry=""
+        
+        # Try to get REPORTER_ID from client via SSH
+        if nc -z -w 2 "$WD_RAC_SERVER" "$port" 2>/dev/null; then
+            # Port is open, try SSH
+            if timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${WD_RAC_SERVER}" "exit" 2>/dev/null; then
+                # SSH works, try to get reporter ID
+                reporter_id=$(get_client_reporter_id "$rac" "$ssh_user" "$port" "$WD_RAC_SERVER" 2>/dev/null)
+                
+                if [[ -n "$reporter_id" ]]; then
+                    # Sanitize the reporter ID
+                    local sanitized_id=$(echo "$reporter_id" | tr '/' '_' | tr '.' '_' | tr '-' '_' | tr '@' '_')
+                    
+                    # Extract the rest of the description (after first word)
+                    local desc_rest=$(echo "$description" | cut -d' ' -f2-)
+                    
+                    # Build new description with sanitized reporter ID
+                    local new_description="${sanitized_id} ${desc_rest}"
+                    
+                    # Rebuild the entry
+                    new_entry="${rac},${wd_user},${ssh_user},${field4},${field5},${new_description}"
+                    if [[ -n "$forwards" ]]; then
+                        new_entry="${new_entry},${forwards}"
+                    fi
+                    
+                    printf "  RAC %3s: %s -> %s\n" "$rac" "${description%% *}" "$sanitized_id"
+                    ((updated_count++))
+                else
+                    echo "  RAC $rac: Could not extract REPORTER_ID (keeping original)"
+                    new_entry="$entry"
+                    ((failed_count++))
+                fi
+            else
+                echo "  RAC $rac: SSH failed (keeping original)"
+                new_entry="$entry"
+                ((skipped_count++))
+            fi
+        else
+            echo "  RAC $rac: Port closed (keeping original)"
+            new_entry="$entry"
+            ((skipped_count++))
+        fi
+        
+        echo "    \"$new_entry\"" >> "$output_file"
+    done
+    
+    echo ")" >> "$output_file"
+    
+    echo ""
+    echo "========================================="
+    echo "SUMMARY"
+    echo "========================================="
+    printf "Updated with REPORTER_ID:  %3d\n" "$updated_count"
+    printf "Skipped (offline/no SSH):  %3d\n" "$skipped_count"
+    printf "Failed to get ID:          %3d\n" "$failed_count"
+    echo ""
+    echo "Output written to: $output_file"
+    echo ""
+    echo "To use the updated file:"
+    echo "  cp $output_file $ssr_conf_file"
+    echo ""
+    
+    return 0
+}
+
 # Function to scan all RACs for connectivity
 function scan_all_racs() {
     echo ""
@@ -626,6 +838,16 @@ function scan_all_racs() {
         exit 1
     fi
     
+    # Check if sshpass is available (for auto-fix)
+    local sshpass_available=0
+    if command -v sshpass >/dev/null 2>&1; then
+        sshpass_available=1
+    else
+        echo "NOTE: 'sshpass' not installed - cannot auto-fix SSH key issues"
+        echo "      Install with: sudo apt-get install sshpass"
+        echo ""
+    fi
+    
     # Source the .ssr.conf file
     source "$ssr_conf_file"
     
@@ -638,13 +860,25 @@ function scan_all_racs() {
     echo "Total RAC entries: ${#FRPS_REMOTE_ACCESS_LIST[@]}"
     echo ""
     
-    # Determine which gateway we're using for tests
-    local WD_RAC_SERVER="gw2"  # Default to gw2
+    # Determine which server we're on and set both gateways
     local hostname=$(hostname | tr '[:upper:]' '[:lower:]')
+    local localhost_server=""
+    local remote_server=""
+    
     if [[ "$hostname" == *"gw1"* ]]; then
-        WD_RAC_SERVER="gw1"
+        localhost_server="localhost"
+        remote_server="gw2"
+    elif [[ "$hostname" == *"gw2"* ]]; then
+        localhost_server="localhost"
+        remote_server="gw1"
+    else
+        # Unknown host, use gw2 as primary
+        localhost_server="gw2"
+        remote_server="gw1"
     fi
-    echo "Testing from: $(hostname) (using $WD_RAC_SERVER for connections)"
+    
+    echo "Testing from: $(hostname)"
+    echo "Will check: $localhost_server first, then $remote_server if needed"
     echo "Port formula: 35800 + RAC number"
     echo ""
     
@@ -654,19 +888,31 @@ function scan_all_racs() {
     local inactive_racs=0
     local ssh_ok=0
     local ssh_fail=0
+    local ssh_fixed=0
+    local wd_cfg_active=0
+    local wd_cfg_needed=0
     local active_list=()
     local inactive_list=()
+    local ssh_fail_list=()
+    local need_reg_list=()
+    local wd_versions=()
+    local highest_version=""
+    local version_mismatch_list=()
     
     # Header
-    printf "%-4s | %-6s | %-10s | %-8s | %-15s | %s\n" "RAC" "Port" "TCP Status" "SSH Test" "Reporter ID" "Description"
-    printf "%-4s-+-%-6s-+-%-10s-+-%-8s-+-%-15s-+-%s\n" "----" "------" "----------" "--------" "---------------" "--------------------"
+    printf "%-4s | %-6s | %-10s | %-8s | %-6s | %-12s | %-15s | %s\n" "RAC" "Port" "TCP State" "SSH Test" "WD Cfg" "WD Version" "Reporter ID" "Description"
+    printf "%-4s-+-%-6s-+-%-10s-+-%-8s-+-%-6s-+-%-12s-+-%-15s-+-%s\n" "----" "------" "----------" "--------" "------" "------------" "---------------" "--------------------"
     
     # Test each RAC
     for entry in "${FRPS_REMOTE_ACCESS_LIST[@]}"; do
         # Parse the entry
+        # Format: "RAC,wd_user,ssh_user,AUTO,ssh_user password,description,forwards"
+        # Example: "13,k8nvh3,wsprdaemon,AUTO,wsprdaemon LRS-75-5?,K8NVH3 RX888...,..."
         local rac=$(echo "$entry" | cut -d',' -f1)
         local wd_user=$(echo "$entry" | cut -d',' -f2)
         local ssh_user=$(echo "$entry" | cut -d',' -f3)
+        local field5=$(echo "$entry" | cut -d',' -f5)
+        local ssh_pass=$(echo "$field5" | awk '{print $2}')  # Second space-separated word
         local description=$(echo "$entry" | cut -d',' -f6)
         
         # Skip comment lines or empty RACs
@@ -677,39 +923,161 @@ function scan_all_racs() {
         # Calculate port
         local port=$((35800 + rac))
         
-        # Test TCP connectivity with nc (netcat) - 2 second timeout
-        local tcp_status="CLOSED"
-        local tcp_symbol="✗"
-        if nc -z -w 2 "$WD_RAC_SERVER" "$port" 2>/dev/null; then
-            tcp_status="OPEN"
-            tcp_symbol="✓"
+        # Test TCP connectivity - try localhost first, then remote
+        local tcp_status="✗ CLOSED  "   # 10 display chars (padded)
+        local tcp_symbol=""            # Symbol included in status
+        local ssh_status="   -    "    # 8 display chars, centered dash
+        local wd_cfg="  -   "          # 6 display chars
+        local wd_version="     -      " # 12 display chars
+        local connected_server=""      # Which server we connected to
+        local reporter_id="$wd_user"   # Default to wd_user, will try to get actual ID
+        
+        # Try localhost first
+        if nc -z -w 2 "$localhost_server" "$port" 2>/dev/null; then
+            tcp_status="✓ OPEN    "     # 10 display chars (padded)
+            connected_server="$localhost_server"
             ((active_racs++))
             active_list+=("$rac:$wd_user:$port")
+        # If localhost fails, try remote server
+        elif nc -z -w 2 "$remote_server" "$port" 2>/dev/null; then
+            tcp_status="✓ OPEN    "     # 10 display chars (padded)
+            connected_server="$remote_server"
+            ((active_racs++))
+            active_list+=("$rac:$wd_user:$port")
+        fi
+        
+        # If we have a connection, test SSH and get other info
+        if [[ -n "$connected_server" ]]; then
             
             # Test SSH access for active connections
-            local ssh_status="N/A"
-            if [[ "$tcp_status" == "OPEN" ]]; then
-                if timeout 2 ssh -o ConnectTimeout=2 -o BatchMode=yes -o StrictHostKeyChecking=no -p "$port" "${ssh_user}@${WD_RAC_SERVER}" "exit" 2>/dev/null; then
-                    ssh_status="✓ OK"
-                    ((ssh_ok++))
+            if timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "exit" 2>/dev/null; then
+                ssh_status="✓ OK    "   # 8 display chars
+                ((ssh_ok++))
+                
+                # Try to get actual reporter ID from client's upload log (same source as Linux user)
+                local reporter_id=""
+                reporter_id=$(timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "
+                    # Get reporter ID from the wsprnet upload daemon log (look for 'my call' pattern)
+                    if [[ -f ~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log ]]; then
+                        id=\$(grep 'my call' ~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log 2>/dev/null | tail -1 | sed -n 's/.*my call \\([^ ]*\\) and\\/or.*/\\1/p')
+                        if [[ -n \"\$id\" ]]; then
+                            echo \"\$id\"
+                            exit 0
+                        fi
+                    fi
+                    
+                    # Fallback: Get from RECEIVER_LIST in wsprdaemon.conf (for new RACs without uploads yet)
+                    if [[ -f ~/wsprdaemon/wsprdaemon.conf ]]; then
+                        # Source the config to get RECEIVER_LIST array
+                        source ~/wsprdaemon/wsprdaemon.conf 2>/dev/null
+                        if [[ \${#RECEIVER_LIST[@]} -gt 0 ]]; then
+                            # Get third space-separated field from first element
+                            echo \"\${RECEIVER_LIST[0]}\" | awk '{print \$3}'
+                        fi
+                    fi
+                " 2>/dev/null | tr -d ' \r\n' | head -c 15)
+                if [[ -z "$reporter_id" ]]; then
+                    reporter_id="$wd_user"  # Fall back to wd_user if we can't get it
+                fi
+                
+                # Check for WD_SERVER_USER_LIST in wsprdaemon.conf
+                if timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "grep -q '^WD_SERVER_USER_LIST=' ~/wsprdaemon/wsprdaemon.conf 2>/dev/null" 2>/dev/null; then
+                    wd_cfg="✓ OK  "
+                    ((wd_cfg_active++))
                 else
-                    ssh_status="✗ Fail"
+                    wd_cfg="✗ NO  "
+                    ((wd_cfg_needed++))
+                    need_reg_list+=("$rac:$wd_user:$port:$ssh_user")
+                fi
+                
+                # Get WD version
+                local ver=$(timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "cd ~/wsprdaemon 2>/dev/null && echo \"\$(< wd_version.txt)-\$(git rev-list --count HEAD 2>/dev/null)\" 2>/dev/null" 2>/dev/null)
+                if [[ -n "$ver" && "$ver" != "-" ]]; then
+                    # Pad/truncate to 12 chars
+                    wd_version=$(printf "%-12s" "${ver:0:12}")
+                    wd_versions+=("$ver")
+                    # Store RAC info with version for later comparison
+                    version_mismatch_list+=("$rac:$wd_user:$port:$ssh_user:$ver")
+                fi
+            else
+                # SSH failed - try to fix with ssh-copy-id if we have the password
+                local fixed=0
+                if [[ $sshpass_available -eq 1 && -n "$ssh_pass" && "$ssh_pass" != "AUTO" && "$ssh_pass" != "*" && "$ssh_pass" != "?" ]]; then
+                    # Try to install our public key using the password (suppress output)
+                    if sshpass -p "$ssh_pass" ssh-copy-id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" &>/dev/null; then
+                        # Verify it worked
+                        if timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "exit" 2>/dev/null; then
+                            ssh_status="✓ Fixed "   # 8 display chars
+                            ((ssh_fixed++))
+                            ((ssh_ok++))
+                            fixed=1
+                            
+                            # Try to get actual reporter ID from client's upload log (same source as Linux user)
+                            reporter_id=$(timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "
+                                # Get reporter ID from the wsprnet upload daemon log (look for 'my call' pattern)
+                                if [[ -f ~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log ]]; then
+                                    id=\$(grep 'my call' ~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log 2>/dev/null | tail -1 | sed -n 's/.*my call \\([^ ]*\\) and\\/or.*/\\1/p')
+                                    if [[ -n \"\$id\" ]]; then
+                                        echo \"\$id\"
+                                        exit 0
+                                    fi
+                                fi
+                                
+                                # Fallback: Get from RECEIVER_LIST in wsprdaemon.conf (for new RACs without uploads yet)
+                                if [[ -f ~/wsprdaemon/wsprdaemon.conf ]]; then
+                                    # Source the config to get RECEIVER_LIST array
+                                    source ~/wsprdaemon/wsprdaemon.conf 2>/dev/null
+                                    if [[ \${#RECEIVER_LIST[@]} -gt 0 ]]; then
+                                        # Get third space-separated field from first element
+                                        echo \"\${RECEIVER_LIST[0]}\" | awk '{print \$3}'
+                                    fi
+                                fi
+                            " 2>/dev/null | tr -d ' \r\n' | head -c 15)
+                            if [[ -z "$reporter_id" ]]; then
+                                reporter_id="$wd_user"  # Fall back to wd_user if we can't get it
+                            fi
+                            
+                            # Now check WD config and version since SSH works
+                            if timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "grep -q '^WD_SERVER_USER_LIST=' ~/wsprdaemon/wsprdaemon.conf 2>/dev/null" 2>/dev/null; then
+                                wd_cfg="✓ OK  "
+                                ((wd_cfg_active++))
+                            else
+                                wd_cfg="✗ NO  "
+                                ((wd_cfg_needed++))
+                                need_reg_list+=("$rac:$wd_user:$port:$ssh_user")
+                            fi
+                            
+                            local ver=$(timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "cd ~/wsprdaemon 2>/dev/null && echo \"\$(< wd_version.txt)-\$(git rev-list --count HEAD 2>/dev/null)\" 2>/dev/null" 2>/dev/null)
+                            if [[ -n "$ver" && "$ver" != "-" ]]; then
+                                wd_version=$(printf "%-12s" "${ver:0:12}")
+                                wd_versions+=("$ver")
+                                # Store RAC info with version for later comparison
+                                version_mismatch_list+=("$rac:$wd_user:$port:$ssh_user:$ver")
+                            fi
+                        fi
+                    fi
+                fi
+                
+                if [[ $fixed -eq 0 ]]; then
+                    ssh_status="✗ Fail  "   # 8 display chars
                     ((ssh_fail++))
+                    ssh_fail_list+=("$rac:$wd_user:$port:$ssh_user:$ssh_pass")
                 fi
             fi
         else
             ((inactive_racs++))
             inactive_list+=("$rac:$wd_user:$port")
-            ssh_status="-"
         fi
         
-        # Format output
-        printf "%3s  | %6s | %-10s | %-8s | %-15s | %s\n" \
+        # Format output (use %s for pre-padded columns)
+        printf "%3s  | %6s | %-10s | %s | %s | %s | %-15s | %s\n" \
             "$rac" \
             "$port" \
-            "$tcp_symbol $tcp_status" \
+            "$tcp_status" \
             "$ssh_status" \
-            "${wd_user:0:15}" \
+            "$wd_cfg" \
+            "$wd_version" \
+            "${reporter_id:0:15}" \
             "${description:0:30}"
         
         ((total_racs++))
@@ -726,7 +1094,14 @@ function scan_all_racs() {
     
     if [[ $active_racs -gt 0 ]]; then
         printf "SSH Access OK:         %3d (%.1f%% of active)\n" "$ssh_ok" $(echo "scale=1; $ssh_ok * 100 / $active_racs" | bc 2>/dev/null || echo "0")
+        if [[ $ssh_fixed -gt 0 ]]; then
+            printf "SSH Keys Auto-Fixed:   %3d\n" "$ssh_fixed"
+        fi
         printf "SSH Access Failed:     %3d (%.1f%% of active)\n" "$ssh_fail" $(echo "scale=1; $ssh_fail * 100 / $active_racs" | bc 2>/dev/null || echo "0")
+        
+        echo ""
+        printf "WD Config Active:      %3d (%.1f%% of SSH OK)\n" "$wd_cfg_active" $(echo "scale=1; $wd_cfg_active * 100 / $ssh_ok" | bc 2>/dev/null || echo "0")
+        printf "WD Config Needed:      %3d (SSH OK but no config)\n" "$wd_cfg_needed"
     fi
     
     echo ""
@@ -740,6 +1115,26 @@ function scan_all_racs() {
         done
     else
         echo "  None"
+    fi
+    
+    # Show SSH failures with manual fix instructions
+    if [[ ${#ssh_fail_list[@]} -gt 0 ]]; then
+        echo ""
+        echo "========================================="
+        echo "SSH FAILURES - Manual Fix Required"
+        echo "========================================="
+        for item in "${ssh_fail_list[@]}"; do
+            IFS=':' read -r rac user port ssh_user ssh_pass <<< "$item"
+            echo "  RAC $rac ($user):"
+            if [[ -z "$ssh_pass" || "$ssh_pass" == "AUTO" || "$ssh_pass" == "*" || "$ssh_pass" == "?" ]]; then
+                echo "    No password available in .ssr.conf"
+                echo "    Manual fix: ssh -p $port ${ssh_user}@${WD_RAC_SERVER}"
+                echo "                Then add this server's public key to ~/.ssh/authorized_keys"
+            else
+                echo "    Try: sshpass -p '$ssh_pass' ssh-copy-id -o StrictHostKeyChecking=no -p $port ${ssh_user}@${WD_RAC_SERVER}"
+            fi
+            echo ""
+        done
     fi
     
     echo ""
@@ -769,6 +1164,68 @@ function scan_all_racs() {
     echo "========================================="
     echo "Test completed at $(date '+%Y-%m-%d %H:%M:%S %Z')"
     echo ""
+    
+    # Save RACs needing registration
+    if [[ ${#need_reg_list[@]} -gt 0 ]]; then
+        echo ""
+        echo "========================================="
+        echo "RACS NEEDING REGISTRATION"
+        echo "========================================="
+        echo "RACs with SSH OK but WD Config missing (✗):"
+        
+        # Save to file
+        local reg_file="wd-register-clients.need-reg"
+        > "$reg_file"  # Clear file
+        
+        for item in "${need_reg_list[@]}"; do
+            IFS=':' read -r rac user port ssh_user <<< "$item"
+            printf "  RAC %3s (port %s): %s (user: %s)\n" "$rac" "$port" "$user" "$ssh_user"
+            echo "$rac" >> "$reg_file"
+        done
+        
+        echo ""
+        echo "Saved ${#need_reg_list[@]} RACs to: $reg_file"
+        echo "To register all: ./wd-register-client.sh --register-batch"
+    fi
+    
+    # Find highest version and identify mismatches
+    if [[ ${#wd_versions[@]} -gt 0 ]]; then
+        # Find highest version (sort by git count number after the dash)
+        highest_version=$(printf '%s\n' "${wd_versions[@]}" | sort -t'-' -k2 -n | tail -1)
+        
+        echo ""
+        echo "========================================="
+        echo "WD VERSION ANALYSIS"
+        echo "========================================="
+        echo "Highest version found: $highest_version"
+        echo ""
+        
+        # Find RACs with mismatched versions
+        local mismatch_count=0
+        local update_file="wd-register-clients.need-update"
+        > "$update_file"  # Clear file
+        
+        echo "RACs with older versions:"
+        for item in "${version_mismatch_list[@]}"; do
+            IFS=':' read -r rac user port ssh_user ver <<< "$item"
+            if [[ "$ver" != "$highest_version" ]]; then
+                printf "  RAC %3s (port %s): %s has version %s\n" "$rac" "$port" "$user" "$ver"
+                echo "$rac:$port:$ssh_user" >> "$update_file"
+                ((mismatch_count++))
+            fi
+        done
+        
+        if [[ $mismatch_count -gt 0 ]]; then
+            echo ""
+            echo "Saved $mismatch_count RACs to: $update_file"
+            echo "To update all: ./wd-register-client.sh --update-clients"
+        else
+            echo "All RACs have the same version: $highest_version"
+        fi
+    fi
+    
+    echo ""
+    echo "========================================="
     
     exit 0
 }
@@ -1162,6 +1619,35 @@ function get_client_reporter_id() {
         echo "    Log file not found" >&2
     fi
     
+    # Fallback to RECEIVER_LIST in wsprdaemon.conf (for new RACs without uploads yet)
+    echo "  Trying RECEIVER_LIST in wsprdaemon.conf..." >&2
+    local conf_path="~/wsprdaemon/wsprdaemon.conf"
+    
+    # Check if wsprdaemon.conf exists
+    file_exists=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "[[ -f $conf_path ]] && echo 'yes' || echo 'no'" 2>/dev/null)
+    
+    if [[ "$file_exists" == "yes" ]]; then
+        echo "    Config file found, checking RECEIVER_LIST..." >&2
+        reporter_id=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+            # Source the config to get RECEIVER_LIST array
+            source ~/wsprdaemon/wsprdaemon.conf 2>/dev/null
+            if [[ \${#RECEIVER_LIST[@]} -gt 0 ]]; then
+                # Get third space-separated field from first element
+                echo \"\${RECEIVER_LIST[0]}\" | awk '{print \$3}'
+            fi
+        " 2>/dev/null)
+        
+        if [[ -n "$reporter_id" ]]; then
+            echo "  ✓ Found reporter ID from RECEIVER_LIST: $reporter_id" >&2
+            echo "$reporter_id"
+            return 0
+        else
+            echo "    No RECEIVER_LIST found or empty" >&2
+        fi
+    else
+        echo "    Config file not found" >&2
+    fi
+    
     # Fallback to CSV method if log method fails
     echo "  Log file method failed, trying CSV database..." >&2
     local csv_path="~/wsprdaemon/spots.csv"
@@ -1204,6 +1690,158 @@ function get_client_reporter_id() {
     return 1
 }
 
+# Function to register all RACs from the need-reg file
+function register_batch() {
+    local reg_file="wd-register-clients.need-reg"
+    
+    echo ""
+    echo "========================================="
+    echo "BATCH REGISTRATION"
+    echo "========================================="
+    
+    if [[ ! -f "$reg_file" ]]; then
+        echo "ERROR: File not found: $reg_file"
+        echo "Run './wd-register-client.sh --scan-racs' first to generate the list"
+        exit 1
+    fi
+    
+    local rac_count=$(wc -l < "$reg_file")
+    if [[ $rac_count -eq 0 ]]; then
+        echo "No RACs to register in $reg_file"
+        exit 0
+    fi
+    
+    echo "Found $rac_count RACs to register"
+    echo ""
+    
+    local success=0
+    local failed=0
+    
+    while IFS= read -r rac; do
+        echo "========================================="
+        echo "Registering RAC $rac..."
+        echo "========================================="
+        
+        # Call the script with the RAC number
+        if ./wd-register-client.sh "$rac"; then
+            ((success++))
+            echo "✓ RAC $rac registered successfully"
+        else
+            ((failed++))
+            echo "✗ RAC $rac registration failed"
+        fi
+        echo ""
+        
+        # Small delay between registrations
+        sleep 2
+    done < "$reg_file"
+    
+    echo "========================================="
+    echo "BATCH REGISTRATION COMPLETE"
+    echo "========================================="
+    echo "Successful: $success"
+    echo "Failed:     $failed"
+    echo ""
+    
+    exit 0
+}
+
+# Helper function to SSH to a RAC using its number
+# Usage: ssr <RAC_number>
+# Example: ssr 84  # Connects to RAC 84 on port 35884
+function ssr() {
+    local rac="$1"
+    if [[ -z "$rac" || ! "$rac" =~ ^[0-9]+$ ]]; then
+        echo "Usage: ssr <RAC_number>"
+        echo "Example: ssr 84"
+        return 1
+    fi
+    
+    local port=$((35800 + rac))
+    local server="gw2"  # RAC ports are on gw2
+    local user="wsprdaemon"  # Default user
+    
+    echo "Connecting to RAC $rac on port $port..."
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${user}@${server}"
+}
+
+# Function to SSH to RACs with outdated WD versions for manual updates
+function update_clients() {
+    local update_file="wd-register-clients.need-update"
+    
+    echo ""
+    echo "========================================="
+    echo "CLIENT UPDATE SESSION"
+    echo "========================================="
+    
+    if [[ ! -f "$update_file" ]]; then
+        echo "ERROR: File not found: $update_file"
+        echo "Run './wd-register-client.sh --scan-racs' first to generate the list"
+        exit 1
+    fi
+    
+    local rac_count=$(wc -l < "$update_file")
+    if [[ $rac_count -eq 0 ]]; then
+        echo "No RACs need updating in $update_file"
+        exit 0
+    fi
+    
+    echo "Found $rac_count RACs with outdated versions"
+    echo "You will be connected to each RAC for manual update"
+    echo ""
+    echo "Update commands to run on each client:"
+    echo "  cd ~/wsprdaemon"
+    echo "  git pull"
+    echo "  ./wsprdaemon.sh -V  # Check version"
+    echo "  exit  # When done"
+    echo ""
+    echo "Press Enter to continue or Ctrl-C to abort..."
+    read
+    
+    local count=1
+    # Use file descriptor 3 to avoid SSH consuming stdin
+    exec 3< "$update_file"
+    while IFS=':' read -u 3 -r rac port ssh_user; do
+        echo ""
+        echo "========================================="
+        echo "[$count/$rac_count] Connecting to RAC $rac..."
+        echo "========================================="
+        
+        # Calculate port if not provided
+        if [[ -z "$port" ]]; then
+            port=$((35800 + rac))
+        fi
+        
+        # Use default user if not provided
+        local user="${ssh_user:-wsprdaemon}"
+        
+        echo "Connecting to port $port as user $user..."
+        echo ""
+        
+        # SSH to the RAC with stdin redirected to terminal
+        ssh -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${user}@gw2"
+        
+        echo "✓ Disconnected from RAC $rac"
+        
+        ((count++))
+        if [[ $count -le $rac_count ]]; then
+            echo ""
+            echo "Press Enter for next RAC or Ctrl-C to stop..."
+            read
+        fi
+    done
+    exec 3<&-  # Close file descriptor 3
+    
+    echo ""
+    echo "========================================="
+    echo "CLIENT UPDATE SESSION COMPLETE"
+    echo "========================================="
+    echo "Re-run './wd-register-client.sh --scan-racs' to verify versions"
+    echo ""
+    
+    exit 0
+}
+
 # Main function
 function main() {
     # Handle version argument
@@ -1222,6 +1860,27 @@ function main() {
     if [[ "${1:-}" == "--config" ]]; then
         show_version
         generate_config_output "${2:-}" "${3:-}"
+        exit $?
+    fi
+    
+    # Handle --update-ssr argument (generate updated .ssr.conf with REPORTER_IDs)
+    if [[ "${1:-}" == "--update-ssr" ]]; then
+        show_version
+        generate_updated_ssr_conf
+        exit $?
+    fi
+    
+    # Handle --register-batch argument (register all RACs from need-reg file)
+    if [[ "${1:-}" == "--register-batch" ]]; then
+        show_version
+        register_batch
+        exit $?
+    fi
+    
+    # Handle --update-clients argument (SSH to clients with outdated versions)
+    if [[ "${1:-}" == "--update-clients" ]]; then
+        show_version
+        update_clients
         exit $?
     fi
     
@@ -1252,19 +1911,28 @@ function main() {
     if [[ -z "$client_rac" ]]; then
         echo "Usage: $SCRIPT_NAME <client_rac_number> [<reporter_id>] [--verbose]"
         echo "       $SCRIPT_NAME --config <reporter_id> <psk>"
-        echo "       $SCRIPT_NAME --version"
         echo "       $SCRIPT_NAME --scan-racs"
+        echo "       $SCRIPT_NAME --register-batch"
+        echo "       $SCRIPT_NAME --update-clients"
+        echo "       $SCRIPT_NAME --update-ssr"
+        echo "       $SCRIPT_NAME --version"
         echo ""
         echo "Examples:"
         echo "  $SCRIPT_NAME 84                        # Register RAC 84 (auto-detect ID)"
         echo "  $SCRIPT_NAME 84 KJ6MKI                 # Register with manual reporter ID"
         echo "  $SCRIPT_NAME 84 --verbose              # Register with verbose output"
         echo "  $SCRIPT_NAME --config KJ6MKI 'ssh-rsa AAA...'  # Create accounts + output config"
-        echo "  $SCRIPT_NAME --scan-racs               # Check all RACs for connectivity"
+        echo "  $SCRIPT_NAME --scan-racs               # Check all RACs + auto-fix SSH keys"
+        echo "  $SCRIPT_NAME --register-batch          # Register all RACs from need-reg file"
+        echo "  $SCRIPT_NAME --update-clients          # SSH to RACs with old WD versions"
+        echo "  $SCRIPT_NAME --update-ssr              # Generate .ssr.conf with REPORTER_IDs"
         echo "  $SCRIPT_NAME --version                 # Show version"
         echo ""
         echo "The --config mode creates user accounts on both servers, adds the client's"
         echo "SSH public key (PSK) to authorized_keys, and outputs the wsprdaemon.conf line."
+        echo ""
+        echo "The --update-ssr mode scans active RACs, extracts their REPORTER_IDs, and"
+        echo "generates ~/.ssr.conf.updated with REPORTER_IDs in the description field."
         exit 1
     fi
     
@@ -1272,7 +1940,7 @@ function main() {
     local hostname=$(hostname | tr '[:upper:]' '[:lower:]')
     local WD_SERVER_FQDN=""
     local WD_BACKUP_SERVERS=""
-    local WD_RAC_SERVER="gw2"  # Default RAC server
+    local WD_RAC_SERVER=""  # Will be set based on hostname
     
     echo "Detecting gateway configuration..."
     echo "  Hostname: $(hostname)"
@@ -1281,16 +1949,19 @@ function main() {
         *gw1*)
             WD_SERVER_FQDN="gw1.wsprdaemon.org"
             WD_BACKUP_SERVERS="gw2.wsprdaemon.org"
+            WD_RAC_SERVER="gw2"  # RAC ports are only on gw2
             echo "  ✓ Detected GW1 - Primary: gw1, Backup: gw2"
             ;;
         *gw2*)
             WD_SERVER_FQDN="gw2.wsprdaemon.org"
             WD_BACKUP_SERVERS="gw1.wsprdaemon.org"
+            WD_RAC_SERVER="gw2"  # RAC ports are only on gw2
             echo "  ✓ Detected GW2 - Primary: gw2, Backup: gw1"
             ;;
         *)
             WD_SERVER_FQDN="gw1.wsprdaemon.org"
             WD_BACKUP_SERVERS="gw2.wsprdaemon.org"
+            WD_RAC_SERVER="gw2"  # RAC ports are only on gw2
             echo "  ✓ Unknown hostname - Defaulting to Primary: gw1, Backup: gw2"
             ;;
     esac
