@@ -6,12 +6,12 @@ Usage: wsprdaemon_reflector.py --config /etc/wsprdaemon/reflector_destinations.j
 Simple design:
   1. Scan for .tbz files in /home/*/uploads/
   2. For /home/noisegraphs/uploads/: wait 10s then validate with 'tar tf', delete if invalid
-  3. Copy each file to temp name in each queue dir, then rename (atomic)
+  3. Hard link (or copy if cross-filesystem) to each queue dir
   4. If ALL queues successful -> delete source file
-  5. Rsync workers sync queue dirs to destinations with --remove-source-files
+  5. Rsync workers check 25% free space on destination, then sync with --remove-source-files
 """
 
-VERSION = "2.3.0"
+VERSION = "2.5.0"
 
 import argparse
 import json
@@ -24,7 +24,7 @@ import shutil
 import glob
 import signal
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 import logging
 
 DEFAULT_CONFIG = {
@@ -36,6 +36,7 @@ DEFAULT_CONFIG = {
     'rsync_bandwidth_limit': 20000,
     'rsync_timeout': 300,
     'noisegraphs_min_age_seconds': 10,
+    'min_free_space_percent': 25,
 }
 
 NOISEGRAPHS_UPLOADS = '/home/noisegraphs/uploads'
@@ -141,6 +142,41 @@ def verify_all_destinations(config: Dict) -> List[Dict]:
     return valid
 
 
+def check_remote_free_space(destination: Dict, path: str, min_percent: int = 25) -> Optional[float]:
+    """Check free space on remote server. Returns free percentage or None on error."""
+    name, user, host = destination['name'], destination['user'], destination['host']
+    ssh_key = destination.get('ssh_key', '/home/wsprdaemon/.ssh/id_rsa')
+    ssh_base = f"ssh -i {ssh_key} -o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{host}"
+    
+    try:
+        result = subprocess.run(
+            f"{ssh_base} 'df -P {path} 2>/dev/null | tail -1'",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=15, shell=True
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            parts = result.stdout.strip().split()
+            if len(parts) >= 5:
+                capacity_str = parts[4].rstrip('%')
+                used_percent = int(capacity_str)
+                free_percent = 100 - used_percent
+                return free_percent
+    except subprocess.TimeoutExpired:
+        log(f"{name}: Timeout checking disk space", "WARNING")
+    except Exception as e:
+        log(f"{name}: Error checking disk space: {e}", "WARNING")
+    
+    return None
+
+
+def same_filesystem(path1: str, path2: str) -> bool:
+    """Check if two paths are on the same filesystem (for hard link support)."""
+    try:
+        return os.stat(path1).st_dev == os.stat(path2).st_dev
+    except OSError:
+        return False
+
+
 def is_noisegraphs_file(filepath: str) -> bool:
     return filepath.startswith(NOISEGRAPHS_UPLOADS + '/')
 
@@ -175,6 +211,8 @@ class FileScanner(threading.Thread):
         self.queue_base = Path(config['queue_base_dir'])
         self.dest_names = [d['name'] for d in config['destinations']]
         self.min_age = config.get('noisegraphs_min_age_seconds', 10)
+        # Check if we can use hard links (same filesystem)
+        self.can_hardlink = {}  # Will be populated per source directory
 
     def run(self):
         log("File scanner thread started", "INFO")
@@ -186,6 +224,22 @@ class FileScanner(threading.Thread):
                 log(f"Scanner error: {e}", "ERROR")
             self.stop_event.wait(self.config['scan_interval'])
         log("File scanner thread stopped", "INFO")
+
+    def check_hardlink_support(self, source_dir: str) -> bool:
+        """Check if hard links work between source_dir and queue_base."""
+        if source_dir in self.can_hardlink:
+            return self.can_hardlink[source_dir]
+        
+        # Check if same filesystem
+        can_link = same_filesystem(source_dir, str(self.queue_base))
+        self.can_hardlink[source_dir] = can_link
+        
+        if can_link:
+            log(f"Hard links supported for {source_dir}", "DEBUG")
+        else:
+            log(f"Hard links NOT supported for {source_dir} (cross-filesystem), using copy", "INFO")
+        
+        return can_link
 
     def scan_and_queue(self):
         pattern = self.config.get('incoming_pattern', '/home/*/uploads/*.tbz')
@@ -218,7 +272,10 @@ class FileScanner(threading.Thread):
 
     def process_file(self, filepath: str):
         filename = os.path.basename(filepath)
-        log(f"Processing: {filename}", "DEBUG")
+        source_dir = os.path.dirname(filepath)
+        use_hardlink = self.check_hardlink_support(source_dir)
+        
+        log(f"Processing: {filename} ({'hardlink' if use_hardlink else 'copy'})", "DEBUG")
         success_count = 0
         total_dests = len(self.dest_names)
 
@@ -236,10 +293,19 @@ class FileScanner(threading.Thread):
                 dest_queue.mkdir(parents=True, exist_ok=True)
                 if temp_path.exists():
                     temp_path.unlink()
-                shutil.copy2(filepath, temp_path)
-                temp_path.rename(final_path)
-                log(f"Queued {filename} for {dest_name}", "INFO")
+
+                if use_hardlink:
+                    # Hard link - no extra disk space used
+                    os.link(filepath, final_path)
+                    log(f"Linked {filename} for {dest_name}", "INFO")
+                else:
+                    # Copy with temp file for atomicity
+                    shutil.copy2(filepath, temp_path)
+                    temp_path.rename(final_path)
+                    log(f"Copied {filename} for {dest_name}", "INFO")
+                
                 success_count += 1
+
             except Exception as e:
                 log(f"Failed to queue {filename} for {dest_name}: {e}", "ERROR")
                 if temp_path.exists():
@@ -265,6 +331,8 @@ class RsyncWorker(threading.Thread):
         self.config = config
         self.stop_event = stop_event
         self.queue_dir = Path(config['queue_base_dir']) / destination['name']
+        self.min_free_percent = config.get('min_free_space_percent', 25)
+        self.last_space_warning = 0
 
     def run(self):
         log(f"Rsync worker for {self.destination['name']} started", "INFO")
@@ -284,6 +352,23 @@ class RsyncWorker(threading.Thread):
         if not queued_files:
             log(f"No files queued for {self.destination['name']}", "DEBUG")
             return
+
+        free_percent = check_remote_free_space(
+            self.destination, 
+            self.destination['path'], 
+            self.min_free_percent
+        )
+        
+        if free_percent is not None:
+            if free_percent < self.min_free_percent:
+                now = time.time()
+                if now - self.last_space_warning > 300:
+                    log(f"{self.destination['name']}: Low disk space ({free_percent:.0f}% free, need {self.min_free_percent}%) - skipping sync", "ERROR")
+                    self.last_space_warning = now
+                return
+            else:
+                log(f"{self.destination['name']}: Disk space OK ({free_percent:.0f}% free)", "DEBUG")
+
         log(f"Found {len(queued_files)} files to sync to {self.destination['name']}", "INFO")
 
         ssh_key = self.destination.get('ssh_key', '/home/wsprdaemon/.ssh/id_rsa')
@@ -335,6 +420,7 @@ def main():
         sys.exit(1)
 
     log(f"Configured {len(config['destinations'])} destinations: {[d['name'] for d in config['destinations']]}", "INFO")
+    log(f"Minimum free space required: {config.get('min_free_space_percent', 25)}%", "INFO")
 
     if not args.skip_rsync_check:
         log("Verifying rsync on destination servers...", "INFO")
