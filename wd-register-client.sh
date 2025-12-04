@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# wd-register-client.sh v2.10.7
+# wd-register-client.sh v2.10.10
 # 
 # Script to register WSPRDAEMON client stations for SFTP uploads
 # Creates user accounts on gateway servers and configures client access
@@ -25,6 +25,22 @@
 #   ./wd-register-client.sh --update-clients # Update RACs with old WD versions
 #   ./wd-register-client.sh --update-ssr    # Generate .ssr.conf.updated with REPORTER_IDs
 #   ./wd-register-client.sh --version       # Show version only
+#
+# Changes in v2.10.10:
+#   - FIXED: SSH no longer consumes file content in while loop
+#   - Uses file descriptor 3 to read update file, preventing stdin conflict
+#   - Added -t flag to SSH for proper terminal allocation
+#
+# Changes in v2.10.9:
+#   - FIXED: --update-clients properly calculates SSH port (35800 + RAC)
+#   - Removed confusing ssr command detection, always uses direct SSH
+#   - Shows "Connecting to port 35884 as user wsprdaemon..." for clarity
+#
+# Changes in v2.10.8:
+#   - FIXED: --update-clients now properly iterates through all RACs (was stopping after first)
+#   - NEW: Added ssr() function for simple RAC connections: ssr <RAC_number>
+#   - IMPROVED: Shows progress counter [1/5] when updating multiple RACs
+#   - Uses "ssr RAC" command if available, falls back to direct SSH
 #
 # Changes in v2.10.7:
 #   - NEW: Added RECEIVER_LIST fallback for Reporter ID (for new RACs without uploads)
@@ -201,7 +217,7 @@
 # Author: AI6VN (with assistance from Claude)
 # Date: November 2025
 
-VERSION="2.10.7"
+VERSION="2.10.10"
 SCRIPT_NAME="wd-register-client.sh"
 
 # Source bash aliases if available
@@ -1730,6 +1746,25 @@ function register_batch() {
     exit 0
 }
 
+# Helper function to SSH to a RAC using its number
+# Usage: ssr <RAC_number>
+# Example: ssr 84  # Connects to RAC 84 on port 35884
+function ssr() {
+    local rac="$1"
+    if [[ -z "$rac" || ! "$rac" =~ ^[0-9]+$ ]]; then
+        echo "Usage: ssr <RAC_number>"
+        echo "Example: ssr 84"
+        return 1
+    fi
+    
+    local port=$((35800 + rac))
+    local server="gw2"  # RAC ports are on gw2
+    local user="wsprdaemon"  # Default user
+    
+    echo "Connecting to RAC $rac on port $port..."
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${user}@${server}"
+}
+
 # Function to SSH to RACs with outdated WD versions for manual updates
 function update_clients() {
     local update_file="wd-register-clients.need-update"
@@ -1751,9 +1786,6 @@ function update_clients() {
         exit 0
     fi
     
-    # Always use gw2 for RAC connections (RAC ports only on gw2)
-    local WD_RAC_SERVER="gw2"
-    
     echo "Found $rac_count RACs with outdated versions"
     echo "You will be connected to each RAC for manual update"
     echo ""
@@ -1766,22 +1798,39 @@ function update_clients() {
     echo "Press Enter to continue or Ctrl-C to abort..."
     read
     
-    while IFS=':' read -r rac port ssh_user; do
+    local count=1
+    # Use file descriptor 3 to avoid SSH consuming stdin
+    exec 3< "$update_file"
+    while IFS=':' read -u 3 -r rac port ssh_user; do
         echo ""
         echo "========================================="
-        echo "Connecting to RAC $rac (port $port)..."
+        echo "[$count/$rac_count] Connecting to RAC $rac..."
         echo "========================================="
-        echo "Commands: cd ~/wsprdaemon && git pull"
+        
+        # Calculate port if not provided
+        if [[ -z "$port" ]]; then
+            port=$((35800 + rac))
+        fi
+        
+        # Use default user if not provided
+        local user="${ssh_user:-wsprdaemon}"
+        
+        echo "Connecting to port $port as user $user..."
         echo ""
         
-        # SSH to the client
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${WD_RAC_SERVER}"
+        # SSH to the RAC with stdin redirected to terminal
+        ssh -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${user}@gw2"
         
         echo "✓ Disconnected from RAC $rac"
-        echo ""
-        echo "Press Enter for next RAC or Ctrl-C to stop..."
-        read
-    done < "$update_file"
+        
+        ((count++))
+        if [[ $count -le $rac_count ]]; then
+            echo ""
+            echo "Press Enter for next RAC or Ctrl-C to stop..."
+            read
+        fi
+    done
+    exec 3<&-  # Close file descriptor 3
     
     echo ""
     echo "========================================="
