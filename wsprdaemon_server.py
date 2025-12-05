@@ -19,7 +19,7 @@ import clickhouse_connect
 import logging
 
 # Version
-VERSION = "2.11.0"  # Made incoming_tbz_dirs configurable via --incoming-dirs argument
+VERSION = "2.12.0"  # Added zombie file cleanup (files marked processed but not deleted)
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -1022,6 +1022,18 @@ def main():
 
         # Filter out already processed files
         unprocessed = [f for f in tbz_files if not is_tbz_processed(f, processed_file)]
+        
+        # Clean up zombie files (exist on disk but already marked processed)
+        zombies = [f for f in tbz_files if is_tbz_processed(f, processed_file)]
+        if zombies:
+            log(f"Found {len(zombies)} zombie files (marked processed but not deleted)", "INFO")
+            for zombie in zombies:
+                try:
+                    zombie.unlink()
+                    log(f"Deleted zombie: {zombie.name}", "DEBUG")
+                except Exception as e:
+                    log(f"Failed to delete zombie {zombie.name}: {e}", "WARNING")
+            log(f"Cleaned up {len(zombies)} zombie files", "INFO")
         
         if not unprocessed:
             log("All .tbz files have been processed", "INFO")
