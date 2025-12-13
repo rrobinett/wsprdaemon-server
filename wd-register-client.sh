@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# wd-register-client.sh v2.10.10
+# wd-register-client.sh v2.10.11
 # 
 # Script to register WSPRDAEMON client stations for SFTP uploads
 # Creates user accounts on gateway servers and configures client access
@@ -25,6 +25,12 @@
 #   ./wd-register-client.sh --update-clients # Update RACs with old WD versions
 #   ./wd-register-client.sh --update-ssr    # Generate .ssr.conf.updated with REPORTER_IDs
 #   ./wd-register-client.sh --version       # Show version only
+#
+# Changes in v2.10.11:
+#   - NEW: Loads entries from .ssr.conf.local and .ssr.conf.hamsci if present
+#   - Appends FRPS_REMOTE_ACCESS_LIST_LOCAL and FRPS_REMOTE_ACCESS_LIST_HAMSCI arrays
+#   - Works with all commands: --scan-racs, --update-ssr, normal registration
+#   - Shows count of RACs added from each additional config file
 #
 # Changes in v2.10.10:
 #   - FIXED: SSH no longer consumes file content in while loop
@@ -217,7 +223,7 @@
 # Author: AI6VN (with assistance from Claude)
 # Date: November 2025
 
-VERSION="2.10.10"
+VERSION="2.10.11"
 SCRIPT_NAME="wd-register-client.sh"
 
 # Source bash aliases if available
@@ -705,8 +711,40 @@ function generate_updated_ssr_conf() {
     # Source the .ssr.conf file
     source "$ssr_conf_file"
     
+    # Also source .ssr.conf.local if it exists (for local overrides/additions)
+    local ssr_local_file="${HOME}/.ssr.conf.local"
+    if [[ -f "$ssr_local_file" ]]; then
+        echo "Loading additional RACs from: $ssr_local_file"
+        local orig_length=${#FRPS_REMOTE_ACCESS_LIST[@]}
+        local FRPS_REMOTE_ACCESS_LIST_LOCAL=()
+        source "$ssr_local_file"
+        if [[ ${#FRPS_REMOTE_ACCESS_LIST_LOCAL[@]} -gt 0 ]]; then
+            FRPS_REMOTE_ACCESS_LIST+=("${FRPS_REMOTE_ACCESS_LIST_LOCAL[@]}")
+            echo "  Added ${#FRPS_REMOTE_ACCESS_LIST_LOCAL[@]} RACs from .ssr.conf.local"
+        elif [[ ${#FRPS_REMOTE_ACCESS_LIST[@]} -gt $orig_length ]]; then
+            local added=$((${#FRPS_REMOTE_ACCESS_LIST[@]} - orig_length))
+            echo "  Added $added RACs from .ssr.conf.local"
+        fi
+    fi
+    
+    # Also source .ssr.conf.hamsci if it exists
+    local ssr_hamsci_file="${HOME}/.ssr.conf.hamsci"
+    if [[ -f "$ssr_hamsci_file" ]]; then
+        echo "Loading additional RACs from: $ssr_hamsci_file"
+        local orig_length=${#FRPS_REMOTE_ACCESS_LIST[@]}
+        local FRPS_REMOTE_ACCESS_LIST_HAMSCI=()
+        source "$ssr_hamsci_file"
+        if [[ ${#FRPS_REMOTE_ACCESS_LIST_HAMSCI[@]} -gt 0 ]]; then
+            FRPS_REMOTE_ACCESS_LIST+=("${FRPS_REMOTE_ACCESS_LIST_HAMSCI[@]}")
+            echo "  Added ${#FRPS_REMOTE_ACCESS_LIST_HAMSCI[@]} RACs from .ssr.conf.hamsci"
+        elif [[ ${#FRPS_REMOTE_ACCESS_LIST[@]} -gt $orig_length ]]; then
+            local added=$((${#FRPS_REMOTE_ACCESS_LIST[@]} - orig_length))
+            echo "  Added $added RACs from .ssr.conf.hamsci"
+        fi
+    fi
+    
     if [[ ${#FRPS_REMOTE_ACCESS_LIST[@]} -eq 0 ]]; then
-        echo "ERROR: No RAC entries found in .ssr.conf"
+        echo "ERROR: No RAC entries found in any config file"
         return 1
     fi
     
@@ -851,8 +889,48 @@ function scan_all_racs() {
     # Source the .ssr.conf file
     source "$ssr_conf_file"
     
+    # Also source .ssr.conf.local if it exists (for local overrides/additions)
+    local ssr_local_file="${HOME}/.ssr.conf.local"
+    if [[ -f "$ssr_local_file" ]]; then
+        echo "Loading additional RACs from: $ssr_local_file"
+        # Save current array length
+        local orig_length=${#FRPS_REMOTE_ACCESS_LIST[@]}
+        # Source the local file to get its array
+        local FRPS_REMOTE_ACCESS_LIST_LOCAL=()
+        source "$ssr_local_file"
+        # Append local entries to main array if LOCAL array exists
+        if [[ ${#FRPS_REMOTE_ACCESS_LIST_LOCAL[@]} -gt 0 ]]; then
+            FRPS_REMOTE_ACCESS_LIST+=("${FRPS_REMOTE_ACCESS_LIST_LOCAL[@]}")
+            echo "  Added ${#FRPS_REMOTE_ACCESS_LIST_LOCAL[@]} RACs from .ssr.conf.local"
+        # Otherwise check if entries were added directly to main array
+        elif [[ ${#FRPS_REMOTE_ACCESS_LIST[@]} -gt $orig_length ]]; then
+            local added=$((${#FRPS_REMOTE_ACCESS_LIST[@]} - orig_length))
+            echo "  Added $added RACs from .ssr.conf.local"
+        fi
+    fi
+    
+    # Also source .ssr.conf.hamsci if it exists
+    local ssr_hamsci_file="${HOME}/.ssr.conf.hamsci"
+    if [[ -f "$ssr_hamsci_file" ]]; then
+        echo "Loading additional RACs from: $ssr_hamsci_file"
+        # Save current array length
+        local orig_length=${#FRPS_REMOTE_ACCESS_LIST[@]}
+        # Source the hamsci file to get its array
+        local FRPS_REMOTE_ACCESS_LIST_HAMSCI=()
+        source "$ssr_hamsci_file"
+        # Append hamsci entries to main array if HAMSCI array exists
+        if [[ ${#FRPS_REMOTE_ACCESS_LIST_HAMSCI[@]} -gt 0 ]]; then
+            FRPS_REMOTE_ACCESS_LIST+=("${FRPS_REMOTE_ACCESS_LIST_HAMSCI[@]}")
+            echo "  Added ${#FRPS_REMOTE_ACCESS_LIST_HAMSCI[@]} RACs from .ssr.conf.hamsci"
+        # Otherwise check if entries were added directly to main array
+        elif [[ ${#FRPS_REMOTE_ACCESS_LIST[@]} -gt $orig_length ]]; then
+            local added=$((${#FRPS_REMOTE_ACCESS_LIST[@]} - orig_length))
+            echo "  Added $added RACs from .ssr.conf.hamsci"
+        fi
+    fi
+    
     if [[ ${#FRPS_REMOTE_ACCESS_LIST[@]} -eq 0 ]]; then
-        echo "ERROR: No RAC entries found in .ssr.conf"
+        echo "ERROR: No RAC entries found in any config file"
         exit 1
     fi
     
@@ -1992,6 +2070,26 @@ function main() {
     
     # Source the .ssr.conf to load the FRPS_REMOTE_ACCESS_LIST array
     source "$ssr_conf_file"
+    
+    # Also source .ssr.conf.local if it exists
+    local ssr_local_file="${HOME}/.ssr.conf.local"
+    if [[ -f "$ssr_local_file" ]]; then
+        local FRPS_REMOTE_ACCESS_LIST_LOCAL=()
+        source "$ssr_local_file"
+        if [[ ${#FRPS_REMOTE_ACCESS_LIST_LOCAL[@]} -gt 0 ]]; then
+            FRPS_REMOTE_ACCESS_LIST+=("${FRPS_REMOTE_ACCESS_LIST_LOCAL[@]}")
+        fi
+    fi
+    
+    # Also source .ssr.conf.hamsci if it exists
+    local ssr_hamsci_file="${HOME}/.ssr.conf.hamsci"
+    if [[ -f "$ssr_hamsci_file" ]]; then
+        local FRPS_REMOTE_ACCESS_LIST_HAMSCI=()
+        source "$ssr_hamsci_file"
+        if [[ ${#FRPS_REMOTE_ACCESS_LIST_HAMSCI[@]} -gt 0 ]]; then
+            FRPS_REMOTE_ACCESS_LIST+=("${FRPS_REMOTE_ACCESS_LIST_HAMSCI[@]}")
+        fi
+    fi
     
     # Find the entry for this RAC
     # Format: "RAC,wd_user,wd_pass,ssh_user,ssh_pass,description,port_forwards"
