@@ -10,14 +10,13 @@ Simple design:
   4. If ALL queues successful -> delete source file
   5. Rsync workers check free space on destination, then sync with --remove-source-files
 
-v2.6.2 changes:
-  - Validate ALL .tbz files (not just noisegraphs) before queueing
-  - Scan for and delete files matching delete_patterns (e.g. *.png) in upload dirs
-  - Protect against local queue overflow - purge oldest from largest queue when needed
-  - Continue queueing to healthy destinations even when one destination is full
+v2.6.3 changes:
+  - Use os.scandir() instead of glob.glob() for faster, interruptible scanning
+  - Quick shutdown - no more 2-minute timeout on stop
+  - Scan upload directories incrementally with stop_event checks
 """
 
-VERSION = "2.6.2"
+VERSION = "2.6.3"
 
 import argparse
 import fnmatch
@@ -28,10 +27,9 @@ import os
 import subprocess
 import threading
 import shutil
-import glob
 import signal
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Iterator
 import logging
 
 DEFAULT_CONFIG = {
@@ -218,8 +216,8 @@ def get_file_inode(filepath: str) -> Optional[int]:
         return None
 
 
-def matches_delete_pattern(filename: str, patterns: List[str]) -> bool:
-    """Check if filename matches any of the delete patterns."""
+def matches_pattern(filename: str, patterns: List[str]) -> bool:
+    """Check if filename matches any of the patterns."""
     for pattern in patterns:
         if fnmatch.fnmatch(filename, pattern):
             return True
@@ -274,6 +272,54 @@ def validate_tbz_file(filepath: str) -> Tuple[Optional[bool], str]:
         return None, str(e)
 
 
+def scan_upload_dirs(stop_event: threading.Event) -> Iterator[str]:
+    """Scan /home/*/uploads/ directories for files. Yields filepaths.
+    
+    Uses os.scandir() for fast, interruptible scanning.
+    Checks stop_event between directories to allow quick shutdown.
+    """
+    home_dir = Path('/home')
+    
+    try:
+        for user_entry in os.scandir(home_dir):
+            if stop_event.is_set():
+                return
+            
+            if not user_entry.is_dir():
+                continue
+            
+            uploads_path = Path(user_entry.path) / 'uploads'
+            
+            # Handle symlinks
+            if uploads_path.is_symlink():
+                try:
+                    uploads_path = uploads_path.resolve()
+                except OSError:
+                    continue
+            
+            if not uploads_path.is_dir():
+                continue
+            
+            try:
+                for file_entry in os.scandir(uploads_path):
+                    if stop_event.is_set():
+                        return
+                    
+                    if file_entry.is_file():
+                        yield file_entry.path
+                        
+            except PermissionError:
+                continue
+            except OSError as e:
+                log(f"Error scanning {uploads_path}: {e}", "DEBUG")
+                continue
+                
+    except PermissionError:
+        log("Permission denied scanning /home", "ERROR")
+    except OSError as e:
+        log(f"Error scanning /home: {e}", "ERROR")
+
+
 class QueueManager:
     """Manages local queue directories and prevents overflow."""
     
@@ -314,7 +360,8 @@ class QueueManager:
         try:
             for queue_dir in self.queue_base.iterdir():
                 if queue_dir.is_dir():
-                    count = len(list(queue_dir.glob('*.tbz')))
+                    # Use scandir for speed instead of glob
+                    count = sum(1 for e in os.scandir(queue_dir) if e.name.endswith('.tbz'))
                     sizes[queue_dir.name] = count
         except Exception as e:
             log(f"Error getting queue sizes: {e}", "ERROR")
@@ -336,23 +383,31 @@ class QueueManager:
         queue_dir = self.queue_base / largest_queue
         
         try:
-            files = list(queue_dir.glob('*.tbz'))
-            if not files:
+            # Get files with mtime using scandir (faster than glob + stat)
+            files_with_mtime = []
+            for entry in os.scandir(queue_dir):
+                if entry.name.endswith('.tbz'):
+                    try:
+                        files_with_mtime.append((entry.path, entry.stat().st_mtime))
+                    except OSError:
+                        pass
+            
+            if not files_with_mtime:
                 return
             
             # Sort by mtime, oldest first
-            files.sort(key=lambda f: f.stat().st_mtime)
+            files_with_mtime.sort(key=lambda x: x[1])
             
-            to_delete = min(self.purge_batch, len(files))
+            to_delete = min(self.purge_batch, len(files_with_mtime))
             log(f"Purging {to_delete} oldest files from {largest_queue} (has {largest_count} files)", "WARNING")
             
             deleted = 0
-            for f in files[:to_delete]:
+            for filepath, _ in files_with_mtime[:to_delete]:
                 try:
-                    f.unlink()
+                    os.unlink(filepath)
                     deleted += 1
                 except Exception as e:
-                    log(f"Failed to delete {f.name}: {e}", "DEBUG")
+                    log(f"Failed to delete {os.path.basename(filepath)}: {e}", "DEBUG")
             
             log(f"Purged {deleted} files from {largest_queue}", "WARNING")
             
@@ -400,6 +455,8 @@ class FileScanner(threading.Thread):
                 log(f"Scanner error: {e}", "ERROR")
                 import traceback
                 log(f"Traceback: {traceback.format_exc()}", "DEBUG")
+            
+            # Use wait() instead of sleep() for quick interrupt
             self.stop_event.wait(self.config['scan_interval'])
         
         log("File scanner thread stopped", "INFO")
@@ -420,72 +477,64 @@ class FileScanner(threading.Thread):
         return can_link
 
     def scan_and_queue(self):
-        # First, scan for and delete files matching delete_patterns
-        self.delete_unwanted_files()
-        
         # Check local disk space and purge if needed
         self.queue_manager.check_and_purge_if_needed()
         
-        pattern = self.config.get('incoming_pattern', '/home/*/uploads/*.tbz')
-        files = glob.glob(pattern)
+        # Use interruptible scanner instead of glob
+        processed = 0
+        deleted_unwanted = 0
+        tbz_files = []
         
-        if not files:
+        for filepath in scan_upload_dirs(self.stop_event):
+            if self.stop_event.is_set():
+                return
+            
+            filename = os.path.basename(filepath)
+            
+            # Check for files to delete (any extension)
+            if matches_pattern(filename, self.delete_patterns):
+                try:
+                    os.unlink(filepath)
+                    deleted_unwanted += 1
+                    log(f"Deleted unwanted file: {filename}", "DEBUG")
+                except Exception as e:
+                    log(f"Failed to delete {filename}: {e}", "WARNING")
+                continue
+            
+            # Collect .tbz files for processing
+            if filename.endswith('.tbz'):
+                tbz_files.append(filepath)
+                
+                # Limit batch size
+                if len(tbz_files) >= self.max_files_per_scan:
+                    break
+        
+        if deleted_unwanted > 0:
+            log(f"Deleted {deleted_unwanted} unwanted files", "INFO")
+        
+        if not tbz_files:
             log("No .tbz files found", "DEBUG")
             return
         
-        total_files = len(files)
-        
-        # Process in batches to avoid blocking
-        files_to_process = files[:self.max_files_per_scan]
-        
-        if total_files > self.max_files_per_scan:
-            log(f"Found {total_files} .tbz files, processing {self.max_files_per_scan} this cycle", "INFO")
+        total_found = len(tbz_files)
+        if total_found >= self.max_files_per_scan:
+            log(f"Found {total_found}+ .tbz files, processing {self.max_files_per_scan} this cycle", "INFO")
         else:
-            log(f"Found {total_files} .tbz files", "DEBUG")
+            log(f"Found {total_found} .tbz files", "DEBUG")
         
-        processed = 0
-        
-        for filepath in files_to_process:
+        for filepath in tbz_files:
             if self.stop_event.is_set():
-                break
+                return
             
             # Re-check disk space periodically during large batches
             if processed > 0 and processed % 100 == 0:
                 self.queue_manager.check_and_purge_if_needed()
-            
-            filename = os.path.basename(filepath)
-            
-            # Skip files matching delete patterns (already handled by delete_unwanted_files)
-            if matches_delete_pattern(filename, self.delete_patterns):
-                continue
             
             if self.handle_tbz_file(filepath):
                 processed += 1
         
         if processed > 0:
             log(f"Processed {processed} files this cycle", "DEBUG")
-
-    def delete_unwanted_files(self):
-        """Scan upload directories for files matching delete_patterns and remove them."""
-        if not self.delete_patterns:
-            return
-        
-        deleted_count = 0
-        
-        # Scan all upload directories for files matching delete patterns
-        for pattern in self.delete_patterns:
-            # Handle patterns for any file type
-            upload_pattern = '/home/*/uploads/' + pattern
-            for filepath in glob.glob(upload_pattern):
-                try:
-                    os.unlink(filepath)
-                    deleted_count += 1
-                    log(f"Deleted unwanted file: {os.path.basename(filepath)}", "DEBUG")
-                except Exception as e:
-                    log(f"Failed to delete {filepath}: {e}", "WARNING")
-        
-        if deleted_count > 0:
-            log(f"Deleted {deleted_count} unwanted files matching patterns {self.delete_patterns}", "INFO")
 
     def handle_tbz_file(self, filepath: str) -> bool:
         """Handle a .tbz file. Returns True if processed/handled, False if skipped."""
@@ -648,16 +697,23 @@ class RsyncWorker(threading.Thread):
                 self.sync_files()
             except Exception as e:
                 log(f"Rsync worker {self.destination['name']} error: {e}", "ERROR")
+            
+            # Use wait() instead of sleep() for quick interrupt
             self.stop_event.wait(self.config['rsync_interval'])
+        
         log(f"Rsync worker for {self.destination['name']} stopped", "INFO")
 
     def sync_files(self):
+        if self.stop_event.is_set():
+            return
+            
         if not self.queue_dir.exists():
             self.queue_dir.mkdir(parents=True, exist_ok=True)
             return
         
-        queued_files = list(self.queue_dir.glob('*.tbz'))
-        if not queued_files:
+        # Use scandir for speed
+        queued_count = sum(1 for e in os.scandir(self.queue_dir) if e.name.endswith('.tbz'))
+        if queued_count == 0:
             log(f"No files queued for {self.destination['name']}", "DEBUG")
             return
 
@@ -677,7 +733,7 @@ class RsyncWorker(threading.Thread):
             else:
                 log(f"{self.destination['name']}: Disk space OK ({free_percent:.0f}% free)", "DEBUG")
 
-        log(f"Found {len(queued_files)} files to sync to {self.destination['name']}", "INFO")
+        log(f"Found {queued_count} files to sync to {self.destination['name']}", "INFO")
 
         ssh_key = self.destination.get('ssh_key', '/home/wsprdaemon/.ssh/id_rsa')
         rsync_cmd = [
@@ -768,7 +824,7 @@ def main():
 
     try:
         while not stop_event.is_set():
-            time.sleep(10)
+            stop_event.wait(10)  # Use wait() for quick response to signals
     except KeyboardInterrupt:
         log("Received keyboard interrupt", "INFO")
     finally:
