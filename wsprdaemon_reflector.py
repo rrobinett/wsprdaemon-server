@@ -10,13 +10,12 @@ Simple design:
   4. If ALL queues successful -> delete source file
   5. Rsync workers check free space on destination, then sync with --remove-source-files
 
-v2.6.3 changes:
-  - Use os.scandir() instead of glob.glob() for faster, interruptible scanning
-  - Quick shutdown - no more 2-minute timeout on stop
-  - Scan upload directories incrementally with stop_event checks
+v2.6.5 changes:
+  - FIX: Skip sync when disk space check times out (don't assume OK)
+  - Treat timeout/error as "unknown" and skip sync to be safe
 """
 
-VERSION = "2.6.3"
+VERSION = "2.6.5"
 
 import argparse
 import fnmatch
@@ -48,6 +47,8 @@ DEFAULT_CONFIG = {
     'corrupt_min_age_seconds': 10,  # Only delete corrupt files older than this
     'local_max_used_percent': 80,  # Start purging queues when local disk exceeds this
     'queue_purge_batch': 500,  # Number of files to purge at a time from largest queue
+    'heartbeat_interval': 60,  # Log heartbeat every N seconds
+    'tar_timeout': 30,  # Timeout for tar validation
 }
 
 LOG_FILE = '/var/log/wsprdaemon/reflector.log'
@@ -153,7 +154,7 @@ def verify_all_destinations(config: Dict) -> List[Dict]:
 
 
 def check_remote_free_space(destination: Dict, path: str, min_percent: int = 25) -> Optional[float]:
-    """Check free space on remote server. Returns free percentage or None on error."""
+    """Check free space on remote server. Returns free percentage or None on error/timeout."""
     name, user, host = destination['name'], destination['user'], destination['host']
     ssh_key = destination.get('ssh_key', '/home/wsprdaemon/.ssh/id_rsa')
     ssh_base = f"ssh -i {ssh_key} -o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{host}"
@@ -224,52 +225,85 @@ def matches_pattern(filename: str, patterns: List[str]) -> bool:
     return False
 
 
-def validate_tbz_file(filepath: str) -> Tuple[Optional[bool], str]:
+def validate_tbz_file(filepath: str, timeout: int = 30) -> Tuple[Optional[bool], str]:
     """Validate a .tbz file with tar tf.
+    
+    Uses subprocess with timeout and SIGKILL fallback to prevent hangs.
     
     Returns:
         (True, "") - file is valid
         (False, "reason") - file is DEFINITELY corrupt (tar found actual errors)
         (None, "reason") - validation inconclusive (timeout/error), should retry later
     """
+    process = None
     try:
-        result = subprocess.run(
-            ['tar', 'tf', filepath], 
-            stdout=subprocess.DEVNULL, 
-            stderr=subprocess.PIPE, 
-            timeout=30
+        process = subprocess.Popen(
+            ['tar', 'tf', filepath],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            preexec_fn=os.setsid  # Create new process group for clean kill
         )
-        if result.returncode == 0:
-            return True, ""
         
-        error_msg = result.stderr.decode().strip() if result.stderr else f"exit code {result.returncode}"
-        
-        # Only return False (definitely corrupt) for actual tar corruption errors
-        corruption_indicators = [
-            "unexpected eof",
-            "truncated",
-            "corrupted",
-            "invalid tar",
-            "not in gzip format",
-            "invalid compressed data",
-            "crc error",
-            "length error",
-        ]
-        
-        error_lower = error_msg.lower()
-        for indicator in corruption_indicators:
-            if indicator in error_lower:
-                return False, error_msg
-        
-        # For other errors (permission, busy file, etc), return None to retry later
-        return None, error_msg
-        
-    except subprocess.TimeoutExpired:
-        return None, "timeout (file may be very large or system busy)"
+        try:
+            _, stderr = process.communicate(timeout=timeout)
+            
+            if process.returncode == 0:
+                return True, ""
+            
+            error_msg = stderr.decode().strip() if stderr else f"exit code {process.returncode}"
+            
+            # Only return False (definitely corrupt) for actual tar corruption errors
+            corruption_indicators = [
+                "unexpected eof",
+                "truncated",
+                "corrupted",
+                "invalid tar",
+                "not in gzip format",
+                "invalid compressed data",
+                "crc error",
+                "length error",
+            ]
+            
+            error_lower = error_msg.lower()
+            for indicator in corruption_indicators:
+                if indicator in error_lower:
+                    return False, error_msg
+            
+            # For other errors (permission, busy file, etc), return None to retry later
+            return None, error_msg
+            
+        except subprocess.TimeoutExpired:
+            # Try SIGTERM first
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                time.sleep(0.5)
+            except:
+                pass
+            
+            # If still running, SIGKILL
+            if process.poll() is None:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except:
+                    pass
+                try:
+                    process.kill()
+                except:
+                    pass
+            
+            return None, f"timeout after {timeout}s (killed)"
+            
     except FileNotFoundError:
         return None, "file not found (may have been moved)"
     except Exception as e:
         return None, str(e)
+    finally:
+        # Ensure process is cleaned up
+        if process and process.poll() is None:
+            try:
+                process.kill()
+            except:
+                pass
 
 
 def scan_upload_dirs(stop_event: threading.Event) -> Iterator[str]:
@@ -428,6 +462,8 @@ class FileScanner(threading.Thread):
         self.quarantine_dir = config.get('quarantine_dir')
         self.max_files_per_scan = config.get('max_files_per_scan', 1000)
         self.delete_patterns = config.get('delete_patterns', ['AI6VN_25*'])
+        self.heartbeat_interval = config.get('heartbeat_interval', 60)
+        self.tar_timeout = config.get('tar_timeout', 30)
         
         # Track validated files by inode to avoid re-validating
         self.validated_inodes: Set[int] = set()
@@ -436,12 +472,18 @@ class FileScanner(threading.Thread):
         
         # Check if we can use hard links (same filesystem)
         self.can_hardlink = {}
+        
+        # Watchdog state
+        self.last_heartbeat = time.time()
+        self.current_file = None  # Track which file we're currently processing
+        self.files_processed_since_heartbeat = 0
 
     def run(self):
         log("File scanner thread started", "INFO")
-        log(f"Validation: wait {self.min_age}s then tar tf (once per file, tracked by inode)", "INFO")
+        log(f"Validation: wait {self.min_age}s then tar tf (timeout {self.tar_timeout}s, once per file)", "INFO")
         log(f"Corrupt file min age before deletion: {self.corrupt_min_age}s", "INFO")
         log(f"Max files per scan: {self.max_files_per_scan}", "INFO")
+        log(f"Heartbeat interval: {self.heartbeat_interval}s", "INFO")
         if self.delete_patterns:
             log(f"Auto-delete patterns: {self.delete_patterns}", "INFO")
         if self.quarantine_dir:
@@ -451,6 +493,7 @@ class FileScanner(threading.Thread):
         while not self.stop_event.is_set():
             try:
                 self.scan_and_queue()
+                self.maybe_log_heartbeat()
             except Exception as e:
                 log(f"Scanner error: {e}", "ERROR")
                 import traceback
@@ -460,6 +503,16 @@ class FileScanner(threading.Thread):
             self.stop_event.wait(self.config['scan_interval'])
         
         log("File scanner thread stopped", "INFO")
+
+    def maybe_log_heartbeat(self):
+        """Log periodic heartbeat to show scanner is alive."""
+        now = time.time()
+        if now - self.last_heartbeat >= self.heartbeat_interval:
+            queue_sizes = self.queue_manager.get_queue_sizes()
+            queue_info = ", ".join(f"{k}:{v}" for k, v in sorted(queue_sizes.items()))
+            log(f"HEARTBEAT: Scanner alive, processed {self.files_processed_since_heartbeat} files, queues: {queue_info}", "INFO")
+            self.last_heartbeat = now
+            self.files_processed_since_heartbeat = 0
 
     def check_hardlink_support(self, source_dir: str) -> bool:
         """Check if hard links work between source_dir and queue_base."""
@@ -529,9 +582,11 @@ class FileScanner(threading.Thread):
             # Re-check disk space periodically during large batches
             if processed > 0 and processed % 100 == 0:
                 self.queue_manager.check_and_purge_if_needed()
+                self.maybe_log_heartbeat()
             
             if self.handle_tbz_file(filepath):
                 processed += 1
+                self.files_processed_since_heartbeat += 1
         
         if processed > 0:
             log(f"Processed {processed} files this cycle", "DEBUG")
@@ -575,8 +630,14 @@ class FileScanner(threading.Thread):
                 # Reset and try again
                 del self.inconclusive_inodes[inode]
         
+        # Track which file we're validating (for debugging hangs)
+        self.current_file = filename
+        log(f"Validating: {filename}", "DEBUG")
+        
         # Validate the file
-        is_valid, reason = validate_tbz_file(filepath)
+        is_valid, reason = validate_tbz_file(filepath, timeout=self.tar_timeout)
+        
+        self.current_file = None
         
         if is_valid is True:
             # File is valid - remember this and process it
@@ -689,6 +750,7 @@ class RsyncWorker(threading.Thread):
         self.queue_dir = Path(config['queue_base_dir']) / destination['name']
         self.min_free_percent = config.get('min_free_space_percent', 25)
         self.last_space_warning = 0
+        self.consecutive_space_failures = 0  # Track consecutive failures to check space
 
     def run(self):
         log(f"Rsync worker for {self.destination['name']} started", "INFO")
@@ -717,21 +779,33 @@ class RsyncWorker(threading.Thread):
             log(f"No files queued for {self.destination['name']}", "DEBUG")
             return
 
+        # Check remote disk space
         free_percent = check_remote_free_space(
             self.destination, 
             self.destination['path'], 
             self.min_free_percent
         )
         
-        if free_percent is not None:
-            if free_percent < self.min_free_percent:
-                now = time.time()
-                if now - self.last_space_warning > 300:
-                    log(f"{self.destination['name']}: Low disk space ({free_percent:.0f}% free, need {self.min_free_percent}%) - skipping sync", "ERROR")
-                    self.last_space_warning = now
-                return
-            else:
-                log(f"{self.destination['name']}: Disk space OK ({free_percent:.0f}% free)", "DEBUG")
+        # If we can't determine free space (timeout/error), skip sync to be safe
+        if free_percent is None:
+            self.consecutive_space_failures += 1
+            now = time.time()
+            if now - self.last_space_warning > 300:
+                log(f"{self.destination['name']}: Cannot check disk space (timeout/error) - skipping sync (queued: {queued_count})", "WARNING")
+                self.last_space_warning = now
+            return
+        
+        # Reset failure counter on successful check
+        self.consecutive_space_failures = 0
+        
+        if free_percent < self.min_free_percent:
+            now = time.time()
+            if now - self.last_space_warning > 300:
+                log(f"{self.destination['name']}: Low disk space ({free_percent:.0f}% free, need {self.min_free_percent}%) - skipping sync (queued: {queued_count})", "ERROR")
+                self.last_space_warning = now
+            return
+        else:
+            log(f"{self.destination['name']}: Disk space OK ({free_percent:.0f}% free)", "DEBUG")
 
         log(f"Found {queued_count} files to sync to {self.destination['name']}", "INFO")
 
