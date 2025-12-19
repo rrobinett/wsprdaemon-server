@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# wd-register-client.sh v2.10.11
+# wd-register-client.sh v2.10.12
 # 
 # Script to register WSPRDAEMON client stations for SFTP uploads
 # Creates user accounts on gateway servers and configures client access
@@ -25,6 +25,12 @@
 #   ./wd-register-client.sh --update-clients # Update RACs with old WD versions
 #   ./wd-register-client.sh --update-ssr    # Generate .ssr.conf.updated with REPORTER_IDs
 #   ./wd-register-client.sh --version       # Show version only
+#
+# Changes in v2.10.12:
+#   - NEW: HamSCI RAC support (200-299) - connects via hs0 instead of gw2
+#   - SSH connections: ssh -p $((35800 + RAC)) user@hs0 for HamSCI
+#   - Updated ssr() function to detect HamSCI RACs automatically
+#   - Works with --scan-racs, --update-clients, and normal registration
 #
 # Changes in v2.10.11:
 #   - NEW: Loads entries from .ssr.conf.local and .ssr.conf.hamsci if present
@@ -223,7 +229,7 @@
 # Author: AI6VN (with assistance from Claude)
 # Date: November 2025
 
-VERSION="2.10.11"
+VERSION="2.10.12"
 SCRIPT_NAME="wd-register-client.sh"
 
 # Source bash aliases if available
@@ -958,6 +964,7 @@ function scan_all_racs() {
     echo "Testing from: $(hostname)"
     echo "Will check: $localhost_server first, then $remote_server if needed"
     echo "Port formula: 35800 + RAC number"
+    echo "HamSCI RACs (200-299) connect via hs0, others via gw2"
     echo ""
     
     # Track statistics
@@ -1001,7 +1008,19 @@ function scan_all_racs() {
         # Calculate port
         local port=$((35800 + rac))
         
-        # Test TCP connectivity - try localhost first, then remote
+        # Determine which server to use based on RAC range
+        # HamSCI RACs (200-299) go through hs0, others through gw2
+        local target_server=""
+        local is_hamsci=0
+        if [[ $rac -ge 200 && $rac -le 299 ]]; then
+            target_server="hs0"
+            is_hamsci=1
+        else
+            # Use normal server logic
+            target_server="$remote_server"
+        fi
+        
+        # Test TCP connectivity - try localhost first (unless HamSCI), then remote
         local tcp_status="✗ CLOSED  "   # 10 display chars (padded)
         local tcp_symbol=""            # Symbol included in status
         local ssh_status="   -    "    # 8 display chars, centered dash
@@ -1010,18 +1029,29 @@ function scan_all_racs() {
         local connected_server=""      # Which server we connected to
         local reporter_id="$wd_user"   # Default to wd_user, will try to get actual ID
         
-        # Try localhost first
-        if nc -z -w 2 "$localhost_server" "$port" 2>/dev/null; then
-            tcp_status="✓ OPEN    "     # 10 display chars (padded)
-            connected_server="$localhost_server"
-            ((active_racs++))
-            active_list+=("$rac:$wd_user:$port")
-        # If localhost fails, try remote server
-        elif nc -z -w 2 "$remote_server" "$port" 2>/dev/null; then
-            tcp_status="✓ OPEN    "     # 10 display chars (padded)
-            connected_server="$remote_server"
-            ((active_racs++))
-            active_list+=("$rac:$wd_user:$port")
+        # For HamSCI, only try hs0; for others, try localhost first
+        if [[ $is_hamsci -eq 1 ]]; then
+            # HamSCI RACs only accessible through hs0
+            if nc -z -w 2 "$target_server" "$port" 2>/dev/null; then
+                tcp_status="✓ OPEN    "     # 10 display chars (padded)
+                connected_server="$target_server"
+                ((active_racs++))
+                active_list+=("$rac:$wd_user:$port")
+            fi
+        else
+            # Try localhost first for non-HamSCI
+            if nc -z -w 2 "$localhost_server" "$port" 2>/dev/null; then
+                tcp_status="✓ OPEN    "     # 10 display chars (padded)
+                connected_server="$localhost_server"
+                ((active_racs++))
+                active_list+=("$rac:$wd_user:$port")
+            # If localhost fails, try remote server
+            elif nc -z -w 2 "$target_server" "$port" 2>/dev/null; then
+                tcp_status="✓ OPEN    "     # 10 display chars (padded)
+                connected_server="$target_server"
+                ((active_racs++))
+                active_list+=("$rac:$wd_user:$port")
+            fi
         fi
         
         # If we have a connection, test SSH and get other info
@@ -1836,10 +1866,18 @@ function ssr() {
     fi
     
     local port=$((35800 + rac))
-    local server="gw2"  # RAC ports are on gw2
+    local server=""
     local user="wsprdaemon"  # Default user
     
-    echo "Connecting to RAC $rac on port $port..."
+    # Determine server based on RAC range
+    if [[ $rac -ge 200 && $rac -le 299 ]]; then
+        server="hs0"  # HamSCI RACs go through hs0
+        echo "Connecting to HamSCI RAC $rac on port $port via hs0..."
+    else
+        server="gw2"  # Normal RACs go through gw2
+        echo "Connecting to RAC $rac on port $port via gw2..."
+    fi
+    
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${user}@${server}"
 }
 
@@ -1893,11 +1931,19 @@ function update_clients() {
         # Use default user if not provided
         local user="${ssh_user:-wsprdaemon}"
         
-        echo "Connecting to port $port as user $user..."
+        # Determine server based on RAC range
+        local server=""
+        if [[ $rac -ge 200 && $rac -le 299 ]]; then
+            server="hs0"  # HamSCI RACs go through hs0
+            echo "Connecting to HamSCI RAC $rac on port $port via hs0..."
+        else
+            server="gw2"  # Normal RACs go through gw2
+            echo "Connecting to port $port as user $user via gw2..."
+        fi
         echo ""
         
         # SSH to the RAC with stdin redirected to terminal
-        ssh -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${user}@gw2"
+        ssh -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${user}@${server}"
         
         echo "✓ Disconnected from RAC $rac"
         
@@ -2048,6 +2094,12 @@ function main() {
     if [[ -f "client-register.conf" ]]; then
         echo "  Loading configuration from client-register.conf..."
         source client-register.conf
+    fi
+    
+    # Override WD_RAC_SERVER for HamSCI RACs (200-299)
+    if [[ $client_rac -ge 200 && $client_rac -le 299 ]]; then
+        WD_RAC_SERVER="hs0"
+        echo "  ✓ HamSCI RAC detected - Using server: hs0"
     fi
     
     echo ""
