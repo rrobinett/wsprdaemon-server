@@ -19,7 +19,7 @@ import clickhouse_connect
 import logging
 
 # Version
-VERSION = "2.12.0"  # Added zombie file cleanup (files marked processed but not deleted)
+VERSION = "2.13.0"  # Fixed: corrupt tbz files now deleted instead of retried forever
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -1056,7 +1056,12 @@ def main():
 
             # Extract
             if not extract_tbz(tbz_file, extraction_dir):
-                log(f"Failed to extract {tbz_file.name}, skipping", "ERROR")
+                log(f"Failed to extract {tbz_file.name} (corrupt?), deleting", "ERROR")
+                try:
+                    tbz_file.unlink()
+                    log(f"Deleted corrupt file: {tbz_file.name}", "WARNING")
+                except Exception as e:
+                    log(f"Failed to delete corrupt file {tbz_file.name}: {e}", "ERROR")
                 continue
 
             # Get CLIENT_VERSION, RUNNING_JOBS, and RECEIVER_DESCRIPTIONS from uploads_config.txt
