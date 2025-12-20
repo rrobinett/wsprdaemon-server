@@ -1,8 +1,10 @@
 #!/bin/bash
 # install-servers.sh - Install WSPRNET Scraper and WSPRDAEMON Server Services
-# Version: 1.6.1 - Skip default user config if already exists
+# Version: 1.7.0 - Added --check and --sync options for file synchronization
 #
 # Usage: sudo ./install-servers.sh --ch-admin USERNAME --ch-admin-password PASSWORD
+#        ./install-servers.sh --check    # Compare repo vs installed file timestamps
+#        ./install-servers.sh --sync     # Sync files (newer overwrites older)
 #
 # This script:
 #   - Creates ClickHouse root admin user (credentials from command line, not stored in git)
@@ -13,14 +15,180 @@
 
 set -e
 
-# Parse command line arguments
+VERSION="1.7.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_USER="wsprdaemon"
+INSTALL_DIR="/opt/wsprdaemon-server"
+VENV_DIR="$INSTALL_DIR/venv"
+
+# Files that get installed to /usr/local/bin
+MANAGED_FILES=(
+    "wsprnet_scraper.py"
+    "wsprnet_scraper.sh"
+    "wsprdaemon_server.py"
+    "wsprdaemon_server.sh"
+    "wsprnet_cache_manager.sh"
+)
+
+# Function to compare and sync files
+check_and_sync_files() {
+    local mode="$1"  # "check" or "sync"
+    local needs_restart=0
+    local files_updated=0
+    local files_differ=0
+    local repo_updated=0
+    
+    echo ""
+    echo "=== Checking file synchronization ==="
+    echo "Repository: $SCRIPT_DIR"
+    echo "Installed:  /usr/local/bin"
+    echo ""
+    
+    for file in "${MANAGED_FILES[@]}"; do
+        local repo_file="$SCRIPT_DIR/$file"
+        local installed_file="/usr/local/bin/$file"
+        
+        # Check if repo file exists
+        if [[ ! -f "$repo_file" ]]; then
+            # Some files are optional (like wsprnet_cache_manager.sh)
+            if [[ -f "$installed_file" ]]; then
+                echo "⚠ $file: In /usr/local/bin but missing from repository"
+                if [[ "$mode" == "sync" ]]; then
+                    echo "  → Copying to repository..."
+                    cp "$installed_file" "$repo_file"
+                    echo "  ✓ Repository updated"
+                    files_updated=$((files_updated + 1))
+                    repo_updated=$((repo_updated + 1))
+                fi
+            fi
+            continue
+        fi
+        
+        if [[ ! -f "$installed_file" ]]; then
+            echo "✗ $file: Not installed"
+            files_differ=$((files_differ + 1))
+            if [[ "$mode" == "sync" ]]; then
+                echo "  → Installing from repository..."
+                cp "$repo_file" "$installed_file"
+                chmod +x "$installed_file"
+                echo "  ✓ Installed"
+                files_updated=$((files_updated + 1))
+                needs_restart=1
+            fi
+            continue
+        fi
+        
+        # Compare content using diff
+        if diff -q "$repo_file" "$installed_file" >/dev/null 2>&1; then
+            echo "✓ $file: In sync"
+        else
+            # Files differ - determine which is newer by timestamp
+            local repo_time=$(stat -c %Y "$repo_file" 2>/dev/null)
+            local installed_time=$(stat -c %Y "$installed_file" 2>/dev/null)
+            local repo_date=$(stat -c %y "$repo_file" 2>/dev/null | cut -d. -f1)
+            local installed_date=$(stat -c %y "$installed_file" 2>/dev/null | cut -d. -f1)
+            
+            files_differ=$((files_differ + 1))
+            
+            if [[ "$installed_time" -gt "$repo_time" ]]; then
+                echo "✗ $file: DIFFERS (installed is newer)"
+                echo "    Repo:      $repo_date"
+                echo "    Installed: $installed_date"
+                
+                if [[ "$mode" == "sync" ]]; then
+                    echo "  → Updating repository version..."
+                    cp "$installed_file" "$repo_file"
+                    echo "  ✓ Repository updated (remember to git commit)"
+                    files_updated=$((files_updated + 1))
+                    repo_updated=$((repo_updated + 1))
+                fi
+            else
+                echo "✗ $file: DIFFERS (repo is newer)"
+                echo "    Repo:      $repo_date"
+                echo "    Installed: $installed_date"
+                
+                if [[ "$mode" == "sync" ]]; then
+                    echo "  → Updating installed version..."
+                    cp "$repo_file" "$installed_file"
+                    chmod +x "$installed_file"
+                    echo "  ✓ Updated"
+                    files_updated=$((files_updated + 1))
+                    needs_restart=1
+                fi
+            fi
+        fi
+    done
+    
+    echo ""
+    echo "=== Summary ==="
+    
+    if [[ "$mode" == "check" ]]; then
+        if [[ $files_differ -gt 0 ]]; then
+            echo "Files out of sync: $files_differ"
+            echo ""
+            echo "Run 'sudo $0 --sync' to synchronize files"
+            return 1
+        else
+            echo "All files are in sync ✓"
+            return 0
+        fi
+    else
+        # sync mode
+        if [[ $files_updated -gt 0 ]]; then
+            echo "Files synchronized: $files_updated"
+            if [[ $needs_restart -eq 1 ]]; then
+                echo ""
+                echo "⚠ RESTART REQUIRED: Installed files were updated."
+                echo "  Run: sudo systemctl restart wsprnet_scraper@wsprnet"
+                echo "  Run: sudo systemctl restart wsprdaemon_server@wsprdaemon"
+            fi
+            if [[ $repo_updated -gt 0 ]]; then
+                echo ""
+                echo "⚠ COMMIT REQUIRED: Repository files were updated from installed versions."
+                echo "  Run: cd $SCRIPT_DIR && git add -A && git commit -m 'Sync scripts from /usr/local/bin'"
+            fi
+        else
+            echo "All files already in sync ✓"
+        fi
+        return 0
+    fi
+}
+
+# Handle --check argument
+if [[ "${1:-}" == "--check" ]]; then
+    check_and_sync_files "check"
+    exit $?
+fi
+
+# Handle --sync argument
+if [[ "${1:-}" == "--sync" ]]; then
+    if [[ $EUID -ne 0 ]]; then
+        echo "This command requires root (use sudo)"
+        exit 1
+    fi
+    check_and_sync_files "sync"
+    exit $?
+fi
+
+# Handle --version argument
+if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
+    echo "install-servers.sh version $VERSION"
+    exit 0
+fi
+
+# Parse command line arguments for full install
 CH_ADMIN_USER=""
 CH_ADMIN_PASSWORD=""
 
 usage() {
-    echo "Usage: $0 --ch-admin USERNAME --ch-admin-password PASSWORD"
+    echo "install-servers.sh v$VERSION - Install WSPRNET Scraper and WSPRDAEMON Server"
     echo ""
-    echo "Required arguments:"
+    echo "Usage: $0 --ch-admin USERNAME --ch-admin-password PASSWORD"
+    echo "       $0 --check     # Compare repo vs installed file timestamps"
+    echo "       $0 --sync      # Sync files (newer overwrites older)"
+    echo "       $0 --version   # Show version"
+    echo ""
+    echo "Required arguments for full install:"
     echo "  --ch-admin USERNAME           ClickHouse root admin username"
     echo "  --ch-admin-password PASSWORD  ClickHouse root admin password"
     echo ""
@@ -28,6 +196,11 @@ usage() {
     echo "  sudo $0 --ch-admin chadmin --ch-admin-password 'MySecretPass123'"
     exit 1
 }
+
+# Handle --help argument
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+fi
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -61,12 +234,7 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_USER="wsprdaemon"
-INSTALL_DIR="/opt/wsprdaemon-server"
-VENV_DIR="$INSTALL_DIR/venv"
-
-echo "Installing WSPRDAEMON Server Services..."
+echo "Installing WSPRDAEMON Server Services v$VERSION..."
 echo "Script directory: $SCRIPT_DIR"
 echo "Installation directory: $INSTALL_DIR"
 echo "Virtual environment: $VENV_DIR"
@@ -222,17 +390,18 @@ DEFAULTEOF
         if systemctl is-active --quiet clickhouse-server; then
             echo "    ClickHouse restarted successfully"
         else
-            echo "    WARNING: ClickHouse failed to restart - check configuration"
+            echo "    WARNING: ClickHouse may have failed to restart"
+            echo "    Check: sudo systemctl status clickhouse-server"
         fi
     else
-        echo "  NOTE: ClickHouse is not running - user changes will apply on next start"
+        echo "  Note: ClickHouse is not running - user config will apply on next start"
     fi
 fi
 
 # ============================================================================
-# Install wrapper scripts from repo directory
+# Install wrapper scripts
 # ============================================================================
-echo "Installing wrapper scripts from repo..."
+echo "Installing wrapper scripts..."
 
 if [[ -f "$SCRIPT_DIR/wsprnet_scraper.sh" ]]; then
     cp "$SCRIPT_DIR/wsprnet_scraper.sh" /usr/local/bin/
@@ -465,3 +634,7 @@ echo "     sudo systemctl start wsprdaemon_server@wsprdaemon"
 echo "4. Check status:"
 echo "     sudo systemctl status wsprnet_scraper@wsprnet"
 echo "     sudo systemctl status wsprdaemon_server@wsprdaemon"
+echo ""
+echo "To check file sync status later: $0 --check"
+echo "To sync files: sudo $0 --sync"
+echo ""
