@@ -1,6 +1,6 @@
 #!/bin/bash
 # fail2ban-installer.sh - Complete fail2ban setup with local network protection
-# Version 2.0 - Never bans 10.0.0.0/8 or 172.30.31.0/24
+# Version 2.1 - Configurable maxretry, shows banned IPs with usernames
 
 set -e  # Exit on error
 
@@ -13,7 +13,10 @@ NC='\033[0m' # No Color
 # Protected networks that should never be banned
 LOCAL_NETWORKS="10.0.0.0/8 172.30.31.0/24"
 
-echo -e "${GREEN}=== Fail2ban Installer for WSPRDAEMON v2.0 ===${NC}"
+# Default maxretry for invalid users/root (configurable)
+DEFAULT_MAXRETRY=3
+
+echo -e "${GREEN}=== Fail2ban Installer for WSPRDAEMON v2.1 ===${NC}"
 echo "This will set up fail2ban with permanent banning for invalid users and root attempts"
 echo -e "${YELLOW}Protected networks (never banned): $LOCAL_NETWORKS${NC}"
 echo ""
@@ -23,6 +26,16 @@ if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}Please run with sudo: sudo bash $0${NC}"
     exit 1
 fi
+
+# Get maxretry setting
+echo -e "${YELLOW}Enter max failed attempts before ban for invalid users/root (default: $DEFAULT_MAXRETRY):${NC}"
+read -p "Max retries: " MAXRETRY_INPUT
+if [ -z "$MAXRETRY_INPUT" ]; then
+    MAXRETRY_INVALID=$DEFAULT_MAXRETRY
+else
+    MAXRETRY_INVALID=$MAXRETRY_INPUT
+fi
+echo -e "${GREEN}Will ban after $MAXRETRY_INVALID failed attempts for invalid users/root${NC}"
 
 # Get additional IP to whitelist
 echo -e "${YELLOW}Enter additional management IP to whitelist (or press Enter to skip):${NC}"
@@ -126,7 +139,7 @@ port = 0:65535
 filter = sshd-invalidusers
 backend = systemd
 journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd
-maxretry = 1
+maxretry = $MAXRETRY_INVALID
 # 10 years = essentially permanent
 bantime = 315360000
 findtime = 86400
@@ -139,24 +152,28 @@ port = 0:65535
 filter = sshd-root
 backend = systemd
 journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd
-maxretry = 1
+maxretry = $MAXRETRY_INVALID
 bantime = 315360000
 findtime = 86400
 action = %(action_)s
 $WHITELIST_SETTING
 EOF
 
+# Save maxretry setting for management script
+echo "$MAXRETRY_INVALID" > /etc/fail2ban/maxretry-invalidusers
+
 echo -e "\n${GREEN}[7/8] Creating management script...${NC}"
 mkdir -p ~/bin
 
 cat > ~/bin/f2b-manage.sh << 'SCRIPT_EOF'
 #!/bin/bash
-# Fail2ban management script v2.0
+# Fail2ban management script v2.1
 # Protected networks: 10.0.0.0/8, 172.30.31.0/24
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 # Function to check if IP is in protected range
@@ -169,6 +186,16 @@ is_protected_ip() {
     return 1  # Not protected
 }
 
+# Function to get failed username(s) for an IP from journal
+get_failed_users_for_ip() {
+    local ip=$1
+    # Search journal for failed attempts from this IP, extract usernames
+    sudo journalctl -u ssh.service --no-pager -g "$ip" 2>/dev/null | \
+        grep -oE "(Invalid user [^ ]+ from|Failed password for [^ ]+ from)" | \
+        sed -E 's/Invalid user ([^ ]+) from/\1/; s/Failed password for ([^ ]+) from/\1/' | \
+        sort -u | tr '\n' ',' | sed 's/,$//'
+}
+
 case "$1" in
     status)
         echo -e "${GREEN}=== Fail2ban Status ===${NC}"
@@ -177,6 +204,9 @@ case "$1" in
         sudo fail2ban-client status
         echo ""
         echo -e "${YELLOW}Protected Networks:${NC} 10.0.0.0/8, 172.30.31.0/24"
+        if [ -f /etc/fail2ban/maxretry-invalidusers ]; then
+            echo -e "${YELLOW}Invalid user/root ban threshold:${NC} $(cat /etc/fail2ban/maxretry-invalidusers) attempts"
+        fi
         echo ""
         for jail in $(sudo fail2ban-client status | grep "Jail list" | sed 's/.*://;s/,//g'); do
             echo -e "${YELLOW}[$jail]${NC}"
@@ -191,18 +221,28 @@ case "$1" in
     
     banned)
         echo -e "${GREEN}=== All Banned IPs ===${NC}"
+        echo -e "${CYAN}Format: IP (attempted usernames)${NC}"
+        echo ""
         for jail in $(sudo fail2ban-client status | grep "Jail list" | sed -E 's/^[^:]+:[ \t]+//' | sed 's/,//g'); do
             echo -e "${YELLOW}Jail: $jail${NC}"
             banned_list=$(sudo fail2ban-client status "$jail" | grep "Banned IP list:" | sed 's/.*://')
             if [ ! -z "$banned_list" ]; then
                 for ip in $banned_list; do
+                    users=$(get_failed_users_for_ip "$ip")
                     if is_protected_ip "$ip"; then
-                        echo -e "  ${RED}$ip (WARNING: LOCAL IP SHOULD NOT BE BANNED!)${NC}"
+                        echo -e "  ${RED}$ip${NC} (${users:-unknown}) ${RED}WARNING: LOCAL IP SHOULD NOT BE BANNED!${NC}"
                     else
-                        echo "  $ip"
+                        if [ -z "$users" ]; then
+                            echo "  $ip"
+                        else
+                            echo "  $ip ($users)"
+                        fi
                     fi
                 done
+            else
+                echo "  (none)"
             fi
+            echo ""
         done
         ;;
     
@@ -273,6 +313,28 @@ case "$1" in
         grep -h "^ignoreip" /etc/fail2ban/jail.local /etc/fail2ban/jail.d/*.conf 2>/dev/null | sort -u
         ;;
     
+    set-maxretry)
+        if [ -z "$2" ]; then
+            echo "Usage: $0 set-maxretry <number>"
+            echo "Sets the max failed attempts before ban for invalid users/root"
+            if [ -f /etc/fail2ban/maxretry-invalidusers ]; then
+                echo "Current setting: $(cat /etc/fail2ban/maxretry-invalidusers)"
+            fi
+            exit 1
+        fi
+        if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}Error: maxretry must be a number${NC}"
+            exit 1
+        fi
+        echo "$2" | sudo tee /etc/fail2ban/maxretry-invalidusers > /dev/null
+        # Update the jail config
+        sudo sed -i "s/^maxretry = .*/maxretry = $2/" /etc/fail2ban/jail.d/permanent-ban-invalidusers.conf
+        echo -e "${GREEN}Set maxretry to $2 for invalid users/root jails${NC}"
+        echo "Restarting fail2ban..."
+        sudo systemctl restart fail2ban
+        echo -e "${GREEN}Done${NC}"
+        ;;
+    
     test)
         echo -e "${GREEN}=== Testing Configuration ===${NC}"
         sudo fail2ban-client -d 2>&1 | head -20
@@ -288,7 +350,7 @@ case "$1" in
         echo -e "${YELLOW}Protected networks: 10.0.0.0/8, 172.30.31.0/24${NC}"
         echo "Press Ctrl+C to stop"
         echo ""
-        sudo journalctl -fu sshd.service | while read line; do
+        sudo journalctl -fu ssh.service | while read line; do
             if echo "$line" | grep -qE "Invalid user"; then
                 echo -e "${RED}[INVALID USER]${NC} $line"
             elif echo "$line" | grep -qE "Failed password for root"; then
@@ -303,6 +365,9 @@ case "$1" in
         echo -e "${GREEN}=== Fail2ban Statistics ===${NC}"
         echo "Uptime: $(sudo fail2ban-client status | grep "Number of jail" | head -1)"
         echo -e "${YELLOW}Protected Networks:${NC} 10.0.0.0/8, 172.30.31.0/24"
+        if [ -f /etc/fail2ban/maxretry-invalidusers ]; then
+            echo -e "${YELLOW}Invalid user/root ban threshold:${NC} $(cat /etc/fail2ban/maxretry-invalidusers) attempts"
+        fi
         echo ""
         total_banned=0
         total_failed=0
@@ -317,14 +382,15 @@ case "$1" in
         ;;
     
     *)
-        echo "Usage: $0 {status|banned|unban|ban|check-local|whitelist|test|logs|watch|stats}"
+        echo "Usage: $0 {status|banned|unban|ban|check-local|whitelist|set-maxretry|test|logs|watch|stats}"
         echo ""
         echo "  status       - Show all jails and their status"
-        echo "  banned       - List all banned IPs"
+        echo "  banned       - List all banned IPs with attempted usernames"
         echo "  unban        - Unban IP from all jails"
         echo "  ban          - Manually ban an IP (blocked for local IPs)"
         echo "  check-local  - Check if any local IPs are banned"
         echo "  whitelist    - Show whitelist configuration"
+        echo "  set-maxretry - Set max failed attempts before ban (invalid users/root)"
         echo "  test         - Test configuration"
         echo "  logs         - Follow fail2ban logs"
         echo "  watch        - Watch for invalid login attempts"
@@ -359,15 +425,16 @@ echo "Management script: ~/bin/f2b-manage.sh"
 echo ""
 echo "Common commands:"
 echo "  ~/bin/f2b-manage.sh status      - Check status"
-echo "  ~/bin/f2b-manage.sh banned      - List banned IPs"
+echo "  ~/bin/f2b-manage.sh banned      - List banned IPs with usernames"
 echo "  ~/bin/f2b-manage.sh check-local - Check for banned local IPs"
 echo "  ~/bin/f2b-manage.sh watch       - Watch for attacks"
 echo "  ~/bin/f2b-manage.sh unban IP    - Unban an IP"
+echo "  ~/bin/f2b-manage.sh set-maxretry N - Change ban threshold"
 echo ""
 echo -e "${YELLOW}Configuration:${NC}"
 echo "  - Protected Networks: 10.0.0.0/8, 172.30.31.0/24"
-echo "  - Root attempts: 1 try = 10 year ban"
-echo "  - Invalid users: 1 try = 10 year ban"
+echo "  - Root attempts: $MAXRETRY_INVALID tries = 10 year ban"
+echo "  - Invalid users: $MAXRETRY_INVALID tries = 10 year ban"
 echo "  - Normal SSH: 3 tries = 1 hour ban"
 echo "  - Recidive: 3 rebans = 1 day ban"
 

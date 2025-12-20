@@ -1,12 +1,13 @@
 #!/bin/bash
 # fail2ban-manage.sh - Comprehensive fail2ban management tool
-# Version: 1.1
-# Includes permanent unban with database cleanup
+# Version: 1.2
+# Includes permanent unban with database cleanup, username display, maxretry config
 
-VERSION="1.1"
+VERSION="1.2"
 
 # Database location
 DB_FILE="/var/lib/fail2ban/fail2ban.sqlite3"
+MAXRETRY_FILE="/etc/fail2ban/maxretry-invalidusers"
 
 # Function to check if running with sudo
 check_sudo() {
@@ -21,6 +22,26 @@ get_jails() {
     fail2ban-client status 2>/dev/null | grep "Jail list" | sed 's/.*://;s/,/ /g'
 }
 
+# Function to get failed username(s) for an IP from journal
+get_failed_users_for_ip() {
+    local ip=$1
+    # Search journal for failed attempts from this IP, extract usernames
+    journalctl -u ssh.service --no-pager -g "$ip" 2>/dev/null | \
+        grep -oE "(Invalid user [^ ]+ from|Failed password for [^ ]+ from)" | \
+        sed -E 's/Invalid user ([^ ]+) from/\1/; s/Failed password for ([^ ]+) from/\1/' | \
+        sort -u | tr '\n' ',' | sed 's/,$//'
+}
+
+# Function to get current maxretry setting
+get_maxretry() {
+    if [ -f "$MAXRETRY_FILE" ]; then
+        cat "$MAXRETRY_FILE"
+    else
+        # Try to read from config
+        grep -h "^maxretry" /etc/fail2ban/jail.d/permanent-ban-invalidusers.conf 2>/dev/null | head -1 | awk '{print $3}'
+    fi
+}
+
 case "$1" in
     version)
         echo "fail2ban-manage version $VERSION"
@@ -31,6 +52,12 @@ case "$1" in
         echo "=== Fail2ban Status ==="
         echo "Service: $(systemctl is-active fail2ban)"
         echo "Uptime: $(systemctl show fail2ban -p ActiveEnterTimestamp --value)"
+        
+        # Show maxretry setting
+        maxretry=$(get_maxretry)
+        if [ ! -z "$maxretry" ]; then
+            echo "Invalid user/root ban threshold: $maxretry failed attempts"
+        fi
         echo ""
         fail2ban-client status
         echo ""
@@ -50,16 +77,25 @@ case "$1" in
     banned)
         check_sudo
         echo "=== All Banned IPs ==="
+        echo "(Format: IP - attempted usernames)"
+        echo ""
         total=0
         for jail in $(get_jails); do
             bans=$(fail2ban-client status "$jail" 2>/dev/null | grep "Banned IP list:" | sed 's/.*Banned IP list://')
             if [ ! -z "$bans" ] && [ "$bans" != "" ]; then
-                echo "$jail:$bans"
-                count=$(echo "$bans" | wc -w)
-                total=$((total + count))
+                echo "[$jail]"
+                for ip in $bans; do
+                    users=$(get_failed_users_for_ip "$ip")
+                    if [ -z "$users" ]; then
+                        echo "  $ip"
+                    else
+                        echo "  $ip ($users)"
+                    fi
+                    total=$((total + 1))
+                done
+                echo ""
             fi
         done
-        echo ""
         echo "Total banned IPs: $total"
         ;;
     
@@ -205,6 +241,55 @@ case "$1" in
         esac
         ;;
     
+    maxretry)
+        check_sudo
+        if [ -z "$2" ]; then
+            echo "=== Max Retry Settings ==="
+            current=$(get_maxretry)
+            if [ ! -z "$current" ]; then
+                echo "Current setting for invalid users/root: $current failed attempts before ban"
+            else
+                echo "No custom maxretry setting found"
+            fi
+            echo ""
+            echo "Usage: $0 maxretry <number>"
+            echo "       Sets max failed attempts before ban for invalid users and root"
+            echo ""
+            echo "Example: $0 maxretry 3"
+            exit 0
+        fi
+        
+        if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+            echo "Error: maxretry must be a positive number"
+            exit 1
+        fi
+        
+        NEW_MAXRETRY="$2"
+        
+        echo "Setting maxretry to $NEW_MAXRETRY for invalid users/root..."
+        
+        # Save to tracking file
+        echo "$NEW_MAXRETRY" > "$MAXRETRY_FILE"
+        
+        # Update jail config
+        JAIL_CONF="/etc/fail2ban/jail.d/permanent-ban-invalidusers.conf"
+        if [ -f "$JAIL_CONF" ]; then
+            sed -i "s/^maxretry = .*/maxretry = $NEW_MAXRETRY/" "$JAIL_CONF"
+            echo "  ✓ Updated $JAIL_CONF"
+        else
+            echo "  ⚠ Config file not found: $JAIL_CONF"
+        fi
+        
+        # Restart fail2ban to apply
+        echo "Restarting fail2ban..."
+        systemctl restart fail2ban
+        sleep 2
+        
+        echo "✓ Max retry set to $NEW_MAXRETRY"
+        echo ""
+        echo "Invalid users and root login attempts will be banned after $NEW_MAXRETRY failed attempts"
+        ;;
+    
     investigate)
         check_sudo
         if [ -z "$2" ]; then
@@ -247,17 +332,17 @@ case "$1" in
         # Check SSH attempts
         echo ""
         echo "SSH Authentication Attempts:"
-        attempts=$(journalctl -u sshd.service 2>/dev/null | grep -c "$IP")
+        attempts=$(journalctl -u ssh.service 2>/dev/null | grep -c "$IP")
         echo "  Total attempts: $attempts"
         
         if [ $attempts -gt 0 ]; then
             echo ""
             echo "Recent SSH Logs:"
-            journalctl -u sshd.service 2>/dev/null | grep "$IP" | tail -5 | sed 's/^/  /'
+            journalctl -u ssh.service 2>/dev/null | grep "$IP" | tail -5 | sed 's/^/  /'
             
             echo ""
             echo "Usernames Attempted:"
-            journalctl -u sshd.service 2>/dev/null | grep "$IP" | \
+            journalctl -u ssh.service 2>/dev/null | grep "$IP" | \
                 grep -oE "(Invalid user |Failed password for )[^ ]+" | \
                 sed 's/Invalid user //;s/Failed password for //' | \
                 sort | uniq -c | sort -rn | sed 's/^/  /'
@@ -282,7 +367,7 @@ case "$1" in
         echo "Monitoring for: root, admin, test, ubuntu, and invalid users"
         echo ""
         
-        journalctl -fu sshd.service | while read line; do
+        journalctl -fu ssh.service | while read line; do
             if echo "$line" | grep -qE "Invalid user"; then
                 echo "[INVALID USER] $line"
             elif echo "$line" | grep -qE "Failed password for root"; then
@@ -306,6 +391,12 @@ case "$1" in
         echo "Service Status:"
         echo "  Status: $(systemctl is-active fail2ban)"
         echo "  Started: $(systemctl show fail2ban -p ActiveEnterTimestamp --value)"
+        
+        # Show maxretry setting
+        maxretry=$(get_maxretry)
+        if [ ! -z "$maxretry" ]; then
+            echo "  Invalid user/root threshold: $maxretry attempts"
+        fi
         
         # Calculate totals
         total_banned=0
@@ -364,10 +455,11 @@ case "$1" in
         echo ""
         echo "Commands:"
         echo "  status              - Show all jails and their status"
-        echo "  banned              - List all banned IPs"
+        echo "  banned              - List all banned IPs with attempted usernames"
         echo "  unban <ip>          - Permanently unban IP (removes from DB)"
         echo "  unban all           - Unban all IPs"
         echo "  ban <jail> <ip>     - Manually ban an IP"
+        echo "  maxretry [N]        - Show or set max failed attempts before ban"
         echo "  whitelist <ip> add  - Add IP to whitelist"
         echo "  whitelist list      - Show all whitelisted IPs"
         echo "  investigate <ip>    - Show why IP was banned"
@@ -381,6 +473,7 @@ case "$1" in
         echo ""
         echo "Examples:"
         echo "  $0 unban 192.168.1.100"
+        echo "  $0 maxretry 3           # Set ban after 3 failed attempts"
         echo "  $0 whitelist 10.0.0.5 add"
         echo "  $0 investigate 45.78.219.24"
         ;;
