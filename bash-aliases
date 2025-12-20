@@ -1,6 +1,8 @@
 #!/bin/bash 
-### This file ~/wsprdaemon/bash-aliases  includes functions and aliases which are helpful in running and debugging WD systems
+### This file ~/wsprdaemon-server/bash-aliases  includes functions and aliases which are helpful in running and debugging WD systems
 #
+
+alias f2b='sudo ~/wsprdaemon-server/fail2ban-manage.sh'
 
 function wd-systemclt-server()
 {
@@ -35,7 +37,7 @@ function wd-sftp-wd-test()
     local end_epoch
     local runtime_seconds
 
-    source ~/wsprdaemon/wsprdaemon.conf
+    source ~/wsprdaemon-server/wsprdaemon.conf
     
     if [[ -z "${WD_SERVER_USER-}" ]]; then
         wd_logger 1 "This WD client is not configured to sftp upload extended spots to its user account on the WD0 server"
@@ -275,7 +277,7 @@ function ka9qctl()
 #############################################
 function wd-rac-status()
 {
-    (cd ${HOME}/wsprdaemon/bin; ./frpc status)
+    (cd ${HOME}/wsprdaemon-server/bin; ./frpc status)
 }
 
 function wd-rac-purge() 
@@ -293,7 +295,7 @@ function wd-rac-purge()
     sudo rm -f /etc/systemd/system/wd_remote_access.service
     sudo systemctl daemon-reload
     ### Setup RAC again if it is defined in wsprdaemon.org
-    ${HOME}/wsprdaemon/wsprdaemon.sh -V
+    ${HOME}/wsprdaemon-server/wsprdaemon.sh -V
 }
 
 function wd-ws8 ()
@@ -332,7 +334,7 @@ function wd-usbreset() {
 
 function wd-web-restart()
 { 
-    local web_daemon_pid="$(< ~/wsprdaemon/ka9q_web_daemon.pid)"
+    local web_daemon_pid="$(< ~/wsprdaemon-server/ka9q_web_daemon.pid)"
     if [[ -z "$web_daemon_pid" ]]; then
         echo "Ka9q-web is not running"
         return 0
@@ -439,9 +441,9 @@ function wd-pcmrecord-status()
 function cdt()
 {
     local wd_tmp_file_system_path
-    if [[ -d /run/wsprdaemon/recording.d ]]; then
+    if [[ -d /run/wsprdaemon-server/recording.d ]]; then
         wd_tmp_file_system_path="/run/wsprdaemon"
-    elif [[ -d /dev/shm/wsprdaemon/recording.d ]]; then
+    elif [[ -d /dev/shm/wsprdaemon-server/recording.d ]]; then
         wd_tmp_file_system_path="/dev/shm/wsprdaemon"
     else
         echo "ERROR: dan't find WD's tmp file system"
@@ -479,7 +481,7 @@ function wdsr()
     local wd_is_running
     local wd_last_start_epoch
 
-    local wd_watchdog_pid_file_path=~/wsprdaemon/watchdog_daemon.pid
+    local wd_watchdog_pid_file_path=~/wsprdaemon-server/watchdog_daemon.pid
     if ! [[ -f ${wd_watchdog_pid_file_path} ]]; then
         echo "Can't find '${wd_watchdog_pid_file_path}', so WD can't be running"
         return 0
@@ -492,7 +494,7 @@ function wdsr()
     else
         echo "WD's watchdog_daemon() pid ${wd_pid} has been running for D-HH:MM:SS: ${wd_run_time}"
     fi
-    local pid_file_path_list=( $(find /dev/shm/wsprdaemon/ -path /dev/shm/wsprdaemon/wav-archive -prune -o -type f -name '*.pid') )
+    local pid_file_path_list=( $(find /dev/shm/wsprdaemon-server/ -path /dev/shm/wsprdaemon-server/wav-archive -prune -o -type f -name '*.pid') )
     echo "Checking ${#pid_file_path_list[@]} pid files.."
 
     local running_pid_count=0
@@ -511,7 +513,7 @@ function wdsr()
         fi
     done
     echo "Found ${running_pid_count} running PID files and ${dead_pid_count} dead pids"
-    (  source ~/wsprdaemon/running.jobs
+    (  source ~/wsprdaemon-server/running.jobs
     echo "There are ${#RUNNING_JOBS[@]} running receiver jobs"
     )
 }
@@ -531,7 +533,7 @@ function get-github-projects-list()
         exit
     }
 }
-' ~/wsprdaemon/ka9q-utils.sh > "$tmpfile"
+' ~/wsprdaemon-server/ka9q-utils.sh > "$tmpfile"
 }
 
 function wd-commit-info() 
@@ -545,7 +547,7 @@ function wd-commit-info()
     ONION_LIBS_NEEDED="NONE"
     source "$tmpfile"
     ka9q_list=( "${GITHUB_PROJECTS_LIST[@]}")
-    source ~/wsprdaemon/wsprdaemon.conf
+    source ~/wsprdaemon-server/wsprdaemon.conf
     source "$tmpfile"
     as_configured_list=( "${GITHUB_PROJECTS_LIST[@]}")
     #cat "$tmpfile"
@@ -566,7 +568,7 @@ function wd-commit-info()
         local as_configured_commit_check=${as_configured_info_list[1]}
         local as_configured_commit_val=${as_configured_info_list[6]}
 
-        local running_commit=$(cd ~/wsprdaemon/${commit_dir}; git rev-parse HEAD)
+        local running_commit=$(cd ~/wsprdaemon-server/${commit_dir}; git rev-parse HEAD)
         set +x
         printf "${format}" ${commit_dir} ${ka9q_commit_check} ${ka9q_commit_val} ${as_configured_commit_check} ${as_configured_commit_val} ${running_commit}
     done
@@ -782,7 +784,7 @@ function wd-killweb() {
 }
 
 function wd-pcmrecord-version() {
-    ~/wsprdaemon/ka9q-radio/pcmrecord --version
+    ~/wsprdaemon-server/ka9q-radio/pcmrecord --version
 }
 
 declare -A KA9Q_wspr_band_freq_list=(
@@ -827,7 +829,7 @@ function wd-pcmrecord-summaries()
         return 1
     fi
 
-    python3 ~/wsprdaemon/wd-validate-wav-logs.py ${create_time_file_list[@]}
+    python3 ~/wsprdaemon-server/wd-validate-wav-logs.py ${create_time_file_list[@]}
 }
 
 ### USAGE: wd-pcmrecord-filetime [band]
@@ -906,7 +908,7 @@ function wd-get-ka9q-receiver-dir()
 {
     local __return_var_name=$1
 
-    local wd_recording_root_dir="/dev/shm/wsprdaemon/recording.d"
+    local wd_recording_root_dir="/dev/shm/wsprdaemon-server/recording.d"
     local receiver_dir_list=( $( find ${wd_recording_root_dir} -maxdepth 1 -type d -name 'KA9Q*' | sort -t _ -k 3,3 -k 2,2n) )     ### sort so list is 'KA9Q_0 KA9Q_1 KA9Q_0_WWV KA9Q_1_WWV
 
     local ka9q_receiver_dir
@@ -978,7 +980,7 @@ function wd-wsprlog-check() {
     local wspr_cycles_to_search=${1-400}
 
     local verbosity=${verbosity-0}
-    local wd_watchdog_pid_file=~/wsprdaemon/watchdog_daemon.pid
+    local wd_watchdog_pid_file=~/wsprdaemon-server/watchdog_daemon.pid
     local wd_watchdog_start_epoch=0
 
     if [[ ! -f $wd_watchdog_pid_file ]]; then
@@ -1109,7 +1111,7 @@ function ka9q-web-control() {
 }
 
 ### So we don't run through all the 'wd -Z' startupi, installation and validation code which might crash
-declare WD_CONF_PATH=~/wsprdaemon/wsprdaemon.conf
+declare WD_CONF_PATH=~/wsprdaemon-server/wsprdaemon.conf
 function wd-killall() {
     local rc
     local rc1
@@ -1244,9 +1246,9 @@ function wd-killall() {
 }
 
 function wd-flush-hashtables() {
-    wc $(find /dev/shm/wsprdaemon/ -type f -name hashtable.txt) | sort -n
+    wc $(find /dev/shm/wsprdaemon-server/ -type f -name hashtable.txt) | sort -n
     read -p "Flush these hashtable.txt files? => "
-    find /dev/shm/wsprdaemon/ -type f -name hashtable.txt -delete
+    find /dev/shm/wsprdaemon-server/ -type f -name hashtable.txt -delete
 }
 
 alias wdtw="test_get_wav_file_list"
@@ -1259,7 +1261,7 @@ function test_get_wav_file_list() {
     local testing_frequency="14095600"
     local testing_modes="W2:F2:W5"
     #local testing_wav_recording_dir=$(get_recording_dir_path ${testing_receiver_name} ${testing_receiver_band})
-    local testing_wav_recording_dir=" /dev/shm/wsprdaemon/recording.d/KA9Q_0"
+    local testing_wav_recording_dir=" /dev/shm/wsprdaemon-server/recording.d/KA9Q_0"
     local template_wav_file="${testing_wav_recording_dir%/*}/one-minute.wav"
 
     if [[ ! -f ${template_wav_file} ]]; then
@@ -1309,7 +1311,7 @@ function test_get_wav_file_list() {
 
 
 function wd-restart-web() {
-    local ka9q_web_pid_file=~/wsprdaemon/ka9q_web_daemon.pid
+    local ka9q_web_pid_file=~/wsprdaemon-server/ka9q_web_daemon.pid
 
     if [[ ! -f  ${ka9q_web_pid_file} ]]; then
         echo "There is no file ${ka9q_web_pid_file}, so KA9Q-web server is not running"
@@ -1324,7 +1326,7 @@ function wd-restart-web() {
     fi
     rm ${ka9q_web_pid_file}
     echo "Starting the  KA9Q-web server (and any other WD services which aren't running)"
-    ~/wsprdaemon/wsprdaemon.sh -A
+    ~/wsprdaemon-server/wsprdaemon.sh -A
 }
 
 
@@ -1460,7 +1462,7 @@ function wd-find-functions() {
 ### To speed debugging of the WD upload daemons, kill just the watchdog and upload daemons.  You can then 'wda' and watch the upload log as the WD uploader starts to work immediately
 function wd-kill-uploader()
 {
-    kill $( cat ~/wsprdaemon/watchdog_daemon.pid  ~/wsprdaemon/uploads.d/wsprnet.d/spots.d/upload_to_wsprnet_daemon.pid )
+    kill $( cat ~/wsprdaemon-server/watchdog_daemon.pid  ~/wsprdaemon-server/uploads.d/wsprnet.d/spots.d/upload_to_wsprnet_daemon.pid )
 }
 alias wd-k=wd-kill-uploader
 alias wdk=wd-kill-uploader
@@ -1468,7 +1470,7 @@ alias wdk=wd-kill-uploader
 ### Watch the upload log file
 function wd-watch-wsprnet-upload-log()
 {
-    local wsprnet_uploads_log_file_path=~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log
+    local wsprnet_uploads_log_file_path=~/wsprdaemon-server/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log
     if ! [[ -f ${wsprnet_uploads_log_file_path} ]]; then
          wsprnet_uploads_log_file_path=~/wspsrdaemon/uploads.d/wsprnet.d/spots.d/upload_to_wsprnet_daemon.log
     fi
@@ -1497,7 +1499,7 @@ function wd-find-kiwis()
 
 function wd-kiwi-status()
 {
-    local wsprconf_file=~/wsprdaemon/wsprdaemon.conf;
+    local wsprconf_file=~/wsprdaemon-server/wsprdaemon.conf;
     if [[ ! -f ${wsprconf_file} ]]; then
         echo "ERROR: can't find config file ${wsprconf_file}";
         return;
@@ -1604,11 +1606,11 @@ function wd-rci()
 {
     if [[ ! -f ~/.bash_aliases ]] || ! grep '/bash-aliases' ~/.bash_aliases > /dev/null ; then
         echo "
-if [[ -f ~/wsprdaemon/bash-aliases ]]; then
-    source ~/wsprdaemon/bash-aliases
+if [[ -f ~/wsprdaemon-server/bash-aliases ]]; then
+    source ~/wsprdaemon-server/bash-aliases
 fi
 " >> ~/.bash_aliases
-         echo "A reference to '~/wsprdaemon/bash-aliases' has been added to ' ~/.bash_aliases'"
+         echo "A reference to '~/wsprdaemon-server/bash-aliases' has been added to ' ~/.bash_aliases'"
     else
          [[ ${verbosity-0} -gt 1 ]] && echo "bash-aliases has already been installed in ~/.bash_aliases"
     fi
@@ -1636,17 +1638,17 @@ alias hg='history | grep'
 alias j=jobs
 
 alias cdw='cd ~/wsprdaemon-server/'
-alias cdk='cd ~/wsprdaemon/ka9q-radio'
+alias cdk='cd ~/wsprdaemon-server/ka9q-radio'
 alias cdr='cd /etc/radio'
 alias cdrf='cd /run/ft8'
 alias cds='cd /etc/systemd/system'
 alias pdw='pushd ~/wsprdaemon'
-alias cdu='cd /dev/shm/wsprdaemon/uploads.d/'
-alias cdww='cd ~/wsprdaemon/wav-archive/'
+alias cdu='cd /dev/shm/wsprdaemon-server/uploads.d/'
+alias cdww='cd ~/wsprdaemon-server/wav-archive/'
 
 ### Start 'vi' using WD's .vimrc
 function vi_fixup() {
-    local REPO_VIMRC="$HOME/wsprdaemon/.vimrc"
+    local REPO_VIMRC="$HOME/wsprdaemon-server/.vimrc"
     local USER_VIMRC="$HOME/.vimrc"
 
     # If ~/.vimrc exists and is not the correct symlink
@@ -1666,11 +1668,11 @@ function vi_fixup() {
 }
 
 alias vi=vi_fixup
-alias vib='vi ~/wsprdaemon/bash-aliases'
+alias vib='vi ~/wsprdaemon-server/bash-aliases'
 alias vibb='vi ~/.bash_aliases'
-alias viw='vi ~/wsprdaemon/wsprdaemon.sh'
-alias vic='vi ~/wsprdaemon/wsprdaemon.conf'
-alias vir='vi ~/wsprdaemon/radiod@rx888-wsprdaemon.conf'
+alias viw='vi ~/wsprdaemon-server/wsprdaemon.sh'
+alias vic='vi ~/wsprdaemon-server/wsprdaemon.conf'
+alias vir='vi ~/wsprdaemon-server/radiod@rx888-wsprdaemon.conf'
 alias virr='vi /etc/radio/radiod@rx888-wsprdaemon.conf'
 
 ### sprdaemon-server aliases
@@ -1678,9 +1680,9 @@ alias virr='vi /etc/radio/radiod@rx888-wsprdaemon.conf'
 alias cdq='cd /var/spool/wsprdaemon'
 
 alias tf='tail -F -n 80'
-alias tfd='tf /var/log/wsprdaemon/wsprdaemon_server.log'    ### There are two WD services running on WD10/20/30/...: the server which records extended spots to Clickhouse
-alias tfn='tf /var/log/wsprdaemon/wsprnet_scraper.log'      ### And the scraper which gets spots from wsprnet.org and saves the in Clickhouse
-alias tfr='tf /var/log/wsprdaemon/reflector.log'            ## The scraper runs only on GW1 and GW2, so this is only useful there
+alias tfd='tf /var/log/wsprdaemon-server/wsprdaemon_server.log'    ### There are two WD services running on WD10/20/30/...: the server which records extended spots to Clickhouse
+alias tfn='tf /var/log/wsprdaemon-server/wsprnet_scraper.log'      ### And the scraper which gets spots from wsprnet.org and saves the in Clickhouse
+alias tfr='tf /var/log/wsprdaemon-server/reflector.log'            ## The scraper runs only on GW1 and GW2, so this is only useful there
 
 alias g='git'
 alias gc='git commit'
@@ -1748,7 +1750,7 @@ function setup-ubuntu() {
 
 # Get status of all active kiwis
 function kiwi-stats(){
-    local wsprconf_file=~/wsprdaemon/wsprdaemon.conf
+    local wsprconf_file=~/wsprdaemon-server/wsprdaemon.conf
 
     if [[ ! -f ${wsprconf_file} ]] ; then
         echo "ERROR: can't find config file ${wsprconf_file}"
@@ -1821,13 +1823,13 @@ function kiwi-stats(){
 }
 
 ### Aliases which call WD
-alias wd='~/wsprdaemon/wsprdaemon.sh'
+alias wd='~/wsprdaemon-server/wsprdaemon.sh'
 alias wdl='wd -l'
 alias wdle='wd -l e'
 alias wdld='wd -l d'
 alias wda='wd -A'       ### If WD isn't running, start it in this terminal session.
 alias wdz='wd-killall'  ### Quickly stops all WD-associated services and kills all WD daemons and zombies
-alias wdzz='(cd; rm -r /dev/shm/wsprdaemon/*)'
+alias wdzz='(cd; rm -r /dev/shm/wsprdaemon-server/*)'
 alias wds='wd -s'
 alias wdv='wd -V'
 alias wdvv='(cd ~/wsprdaemon; echo "$(< wd_version.txt)-$(git rev-list --count HEAD)" )'
@@ -1883,7 +1885,7 @@ function wd-merged-kfs() {
 }
 
 
-declare WD_WAV_ARCHIVE_ROOT_DIR=~/wsprdaemon/wav-archive    ### No "" so ~ is expanded
+declare WD_WAV_ARCHIVE_ROOT_DIR=~/wsprdaemon-server/wav-archive    ### No "" so ~ is expanded
 ### 11/2/22 - This doesn't work anymore, but it could be modifed 
 function wd-grape-info(){
     local grape_date_dirs_list=( $( find ${WD_WAV_ARCHIVE_ROOT_DIR} -mindepth 1 -maxdepth 1 -type d | sort) )
@@ -1939,12 +1941,12 @@ function wd-wav-clean() {
 }
 
 ### At sites which are archiving wav files, this gets some info
-alias wd-wav-archive='df -h ~ ; du -sh ~/wsprdaemon/wav-archive/ ; ls -lt ~/wsprdaemon/wav-archive/ | head  -n 3; ls -lt ~/wsprdaemon/wav-archive/ | tail -n 2'
+alias wd-wav-archive='df -h ~ ; du -sh ~/wsprdaemon-server/wav-archive/ ; ls -lt ~/wsprdaemon-server/wav-archive/ | head  -n 3; ls -lt ~/wsprdaemon-server/wav-archive/ | tail -n 2'
 
 ### HELP:  On systems where there ar WWV/CHU channels defined, but GRAPE_PSWS_ID is not defined in WD.conf, the .wv files will be stored in a date...directory nameed ...@NOT_DEFINED
 ### HELP:  Once GRAPE_PSWS_ID is defined, this command searches for files in the @NOT_DEFINED/... tree and moves them to @${GRAPE_PSWS_ID}/...
 function wd-wav-archive-fix(){
-    source ~/wsprdaemon/wsprdaemon.conf
+    source ~/wsprdaemon-server/wsprdaemon.conf
     if [[ -z "${GRAPE_PSWS_ID-}" ]]; then
         echo "This server is not configured with a GRAPE_PSWS_ID in the wsprdaemon.conf file, so can't fix the directories"
         return 0
@@ -1991,7 +1993,7 @@ function wd-sftp-psws(){
     local end_epoch
     local runtime_seconds
 
-    source ~/wsprdaemon/wsprdaemon.conf
+    source ~/wsprdaemon-server/wsprdaemon.conf
     
     if [[ -z "${GRAPE_PSWS_ID-}" ]]; then
         if [[ -z "${PSWS_STATION_ID-}" || -z "${PSWS_DEVICE_ID-}" ]]; then
@@ -2060,7 +2062,7 @@ alias wdssp=wd-sftp-psws
 function wd-overloads()
 {
 : <<"comment_out"
-    local log_file_list=( $(find /dev/shm/wsprdaemon/ -name wav_status.log | sort ) )
+    local log_file_list=( $(find /dev/shm/wsprdaemon-server/ -name wav_status.log | sort ) )
     #printf "Searching ${#log_file_list[@]} 'wav_status.log' files for WAV overload events\n%-40s YYMMDD_HHMM      MIN_SAMPLE MAX_SAMPLE Count_of MIN/MAX\n" "RECIEVER/BAND/log_file"
 
     if [[ ${#log_file_list[@]} -eq 0 ]]; then
@@ -2070,7 +2072,7 @@ function wd-overloads()
     fi
 comment_out
 
-    log_file_list=( $(find /dev/shm/wsprdaemon/ \( -name kiwi_ovs.log -o -name adc_overloads.log \) -printf "%p\n" | sort ) )
+    log_file_list=( $(find /dev/shm/wsprdaemon-server/ \( -name kiwi_ovs.log -o -name adc_overloads.log \) -printf "%p\n" | sort ) )
     if [[ ${#log_file_list[@]} -eq 0 ]]; then
         echo "Can't find any 'kiwi_ovs.log or ad_overloads.log' files"
         return
@@ -2174,7 +2176,7 @@ function wd-wd-rec-flush()
 }
 
 function wd-freqs(){
-    local rec_root_dir="/dev/shm/wsprdaemon/recording.d"
+    local rec_root_dir="/dev/shm/wsprdaemon-server/recording.d"
     local rec_rx_root_dir_list=( $( find ${rec_root_dir}/* -type d -prune ) )
     local rec_bands_list=( $( find ${rec_root_dir} -mindepth 2 -maxdepth 2 -type d ! -name kiwi_status.d -printf "%f\n" | sort -u ) )
 
@@ -2209,7 +2211,7 @@ function wd-wavs() {
     done
     return 0
 
-    local rec_root_dir="/dev/shm/wsprdaemon/recording.d"
+    local rec_root_dir="/dev/shm/wsprdaemon-server/recording.d"
     local rec_rx_root_dir_list=( $( find ${rec_root_dir}/* -type d -prune ) )
     local rec_bands_list=( $( find ${rec_root_dir} -mindepth 2 -maxdepth 2 -type d ! -name kiwi_status.d -printf "%f\n" | sort -u ) )
 
@@ -2222,11 +2224,11 @@ function wd-wavs() {
 ### Monitor and control the KA9Q-radio service
 ###
 function wd-get_ka9q-conf_file-base_name() {
-    source ~/wsprdaemon/wsprdaemon.conf
+    source ~/wsprdaemon-server/wsprdaemon.conf
     local conf_base_name
 
     if [[ -n "${KA9Q_CONF_NAME-}" ]]; then
-        [[ ${verbosity-0} -gt 0 ]] && echo "Using conf base name KA9Q_CONF_NAME='${KA9Q_CONF_NAME}' found in  ~/wsprdaemon/wsprdaemon.conf" 1>&2
+        [[ ${verbosity-0} -gt 0 ]] && echo "Using conf base name KA9Q_CONF_NAME='${KA9Q_CONF_NAME}' found in  ~/wsprdaemon-server/wsprdaemon.conf" 1>&2
         conf_base_name="${KA9Q_CONF_NAME}"
     else
         [[ ${verbosity-0} -gt 0 ]] && echo "Using default conf base name 'rx888-wsprdaemon'" 1>&2
@@ -2347,7 +2349,7 @@ function wd-radiod-bw-check() {
 }
 
 function wd-9qstats() {
-    local root_dir="/dev/shm/wsprdaemon/posting.d/MERG_6_Q"
+    local root_dir="/dev/shm/wsprdaemon-server/posting.d/MERG_6_Q"
     local band_dir_list=( $(find ${root_dir} -maxdepth 1 -type d -not -wholename ${root_dir}) )
     local band_list=( ${band_dir_list[@]##*/} )
 
@@ -2411,7 +2413,7 @@ alias wd9c=wd-radiod-control
 alias wdrc=wd-radiod-control
 
 function wd-rc-gain() {
-    local root_dir="/dev/shm/wsprdaemon/recording.d/KA9Q_0"
+    local root_dir="/dev/shm/wsprdaemon-server/recording.d/KA9Q_0"
 
     if [[ ! -d "${root_dir}" ]]; then
         echo "${root_dir} doesn't exist"
@@ -2619,7 +2621,7 @@ fi
 
 alias wdg='wd -g'
 
-###  Runs du and sorts output by name rather than ???   Useful in the ~/wsprdaemon/wav-archive directory
+###  Runs du and sorts output by name rather than ???   Useful in the ~/wsprdaemon-server/wav-archive directory
 function wddu() {
     local files="$@"
 
@@ -2668,7 +2670,7 @@ function wd-no-capslock() {
    hidutil property --set '{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":0x700000039,"HIDKeyboardModifierMappingDst":0}]}'
 }
 
-alias cdb='cd ~/wsprdaemon/ka9q-web'
+alias cdb='cd ~/wsprdaemon-server/ka9q-web'
 alias cdu='cd /srv/wd_data/uploads/wsprdaemon'
 alias wdua='wd -u a'
 alias wduz='wd -u z'
