@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# wd-register-client.sh v2.10.12
+# wd-register-client.sh v2.11.0
 # 
 # Script to register WSPRDAEMON client stations for SFTP uploads
 # Creates user accounts on gateway servers and configures client access
@@ -13,6 +13,7 @@
 #   ./wd-register-client.sh --register-batch                   # Register all RACs from need-reg file
 #   ./wd-register-client.sh --update-clients                   # SSH to RACs with old versions
 #   ./wd-register-client.sh --update-ssr                       # Update .ssr.conf with REPORTER_IDs
+#   ./wd-register-client.sh --sync-users [source_server]       # Sync upload users from source server
 #   ./wd-register-client.sh --version
 #
 # Examples:
@@ -24,7 +25,16 @@
 #   ./wd-register-client.sh --register-batch # Register all RACs needing config
 #   ./wd-register-client.sh --update-clients # Update RACs with old WD versions
 #   ./wd-register-client.sh --update-ssr    # Generate .ssr.conf.updated with REPORTER_IDs
+#   ./wd-register-client.sh --sync-users     # Sync upload users from gw1 (default)
+#   ./wd-register-client.sh --sync-users gw1.wsprdaemon.org  # Sync from specific server
 #   ./wd-register-client.sh --version       # Show version only
+#
+# Changes in v2.11.0:
+#   - NEW: --sync-users command to replicate upload user accounts from source server
+#   - Syncs users that have ~/uploads directories
+#   - Copies authorized_keys for each user
+#   - Creates noisegraphs legacy account if --with-noisegraphs flag used
+#   - Useful for setting up new gateway servers (e.g., gw3)
 #
 # Changes in v2.10.12:
 #   - NEW: HamSCI RAC support (200-299) - connects via hs0 instead of gw2
@@ -229,7 +239,7 @@
 # Author: AI6VN (with assistance from Claude)
 # Date: November 2025
 
-VERSION="2.10.12"
+VERSION="2.11.0"
 SCRIPT_NAME="wd-register-client.sh"
 
 # Source bash aliases if available
@@ -1966,6 +1976,177 @@ function update_clients() {
     exit 0
 }
 
+# Function to sync upload users from source server
+# Usage: sync_users [source_server] [--with-noisegraphs]
+function sync_users() {
+    local source_server="${1:-gw1.wsprdaemon.org}"
+    local with_noisegraphs=0
+    
+    # Check for --with-noisegraphs flag
+    if [[ "${2:-}" == "--with-noisegraphs" ]] || [[ "${1:-}" == "--with-noisegraphs" ]]; then
+        with_noisegraphs=1
+        if [[ "${1:-}" == "--with-noisegraphs" ]]; then
+            source_server="gw1.wsprdaemon.org"
+        fi
+    fi
+    
+    echo ""
+    echo "========================================="
+    echo "SYNC UPLOAD USERS FROM $source_server"
+    echo "========================================="
+    echo ""
+    
+    # Check SSH connectivity to source server
+    echo "Checking SSH connectivity to $source_server..."
+    if ! ssh -o ConnectTimeout=5 "$source_server" "echo ok" >/dev/null 2>&1; then
+        echo "ERROR: Cannot connect to $source_server via SSH"
+        echo "Make sure you have SSH key access configured."
+        return 1
+    fi
+    echo "✓ SSH connection OK"
+    echo ""
+    
+    # Ensure SSHD is configured for SFTP-only access
+    echo "Ensuring local SSHD is configured for SFTP-only access..."
+    if ! wd-sshd-conf-add-sftponly; then
+        echo "ERROR: Failed to configure SSHD"
+        return 1
+    fi
+    
+    # Ensure sftponly group exists
+    if ! ensure_sftponly_group; then
+        echo "ERROR: Failed to ensure sftponly group"
+        return 1
+    fi
+    
+    # Get list of users with uploads directories from source server
+    echo ""
+    echo "Fetching list of upload users from $source_server..."
+    local remote_users=$(ssh "$source_server" "ls -d /home/*/uploads 2>/dev/null | cut -d/ -f3 | sort")
+    
+    if [[ -z "$remote_users" ]]; then
+        echo "No users with uploads directories found on $source_server"
+        return 0
+    fi
+    
+    local user_count=$(echo "$remote_users" | wc -l)
+    echo "Found $user_count users with uploads directories"
+    echo ""
+    
+    local created=0
+    local existed=0
+    local failed=0
+    
+    # Process each user
+    for username in $remote_users; do
+        echo "--- Processing user: $username ---"
+        
+        # Check if user already exists locally
+        if id "$username" >/dev/null 2>&1; then
+            echo "  ✓ User already exists locally"
+            existed=$((existed + 1))
+            
+            # Still sync authorized_keys in case there are updates
+            echo "  Syncing authorized_keys..."
+        else
+            echo "  Creating user $username..."
+            
+            # Create user with nologin shell
+            if ! sudo useradd -m -d "/home/$username" -s /usr/sbin/nologin "$username" 2>/dev/null; then
+                echo "  ✗ Failed to create user $username"
+                failed=$((failed + 1))
+                continue
+            fi
+            
+            # Set disabled password (allows SSH key auth)
+            sudo usermod -p '*' "$username"
+            
+            # Add to sftponly group
+            sudo usermod -a -G sftponly "$username"
+            
+            echo "  ✓ User created"
+            created=$((created + 1))
+        fi
+        
+        # Setup directories
+        sudo mkdir -p "/home/$username/.ssh" "/home/$username/uploads"
+        sudo touch "/home/$username/.ssh/authorized_keys"
+        
+        # Get authorized_keys from source server
+        local remote_keys=$(ssh "$source_server" "sudo cat /home/$username/.ssh/authorized_keys 2>/dev/null")
+        
+        if [[ -n "$remote_keys" ]]; then
+            # Append any keys not already present
+            echo "$remote_keys" | while read -r key; do
+                if [[ -n "$key" ]] && ! sudo grep -qF "$key" "/home/$username/.ssh/authorized_keys" 2>/dev/null; then
+                    echo "$key" | sudo tee -a "/home/$username/.ssh/authorized_keys" >/dev/null
+                fi
+            done
+            echo "  ✓ authorized_keys synced"
+        else
+            echo "  ⚠ No authorized_keys found on source"
+        fi
+        
+        # Set ownership (must be done before permissions)
+        sudo chown "$username:$username" "/home/$username/.ssh"
+        sudo chown "$username:$username" "/home/$username/.ssh/authorized_keys"
+        sudo chown "$username:$username" "/home/$username/uploads"
+        sudo chown root:root "/home/$username"
+        
+        # Set permissions
+        sudo chmod 755 "/home/$username"
+        sudo chmod 700 "/home/$username/.ssh"
+        sudo chmod 600 "/home/$username/.ssh/authorized_keys"
+        sudo chmod 755 "/home/$username/uploads"
+        
+        echo ""
+    done
+    
+    # Create noisegraphs legacy account if requested
+    if [[ $with_noisegraphs -eq 1 ]]; then
+        echo ""
+        echo "--- Creating noisegraphs legacy account ---"
+        
+        if id "noisegraphs" >/dev/null 2>&1; then
+            echo "  ✓ User noisegraphs already exists"
+        else
+            echo "  Creating user noisegraphs..."
+            if sudo useradd -m -d "/home/noisegraphs" -s /bin/bash "noisegraphs" 2>/dev/null; then
+                # Set the legacy password
+                echo "noisegraphs:xahFie6g" | sudo chpasswd
+                
+                # Setup directories
+                sudo mkdir -p "/home/noisegraphs/.ssh" "/home/noisegraphs/uploads"
+                sudo chown -R noisegraphs:noisegraphs "/home/noisegraphs"
+                sudo chmod 755 "/home/noisegraphs"
+                sudo chmod 700 "/home/noisegraphs/.ssh"
+                sudo chmod 755 "/home/noisegraphs/uploads"
+                
+                echo "  ✓ noisegraphs account created with legacy password"
+                echo "  ⚠ Remember to disable this account after migrating legacy clients!"
+                created=$((created + 1))
+            else
+                echo "  ✗ Failed to create noisegraphs user"
+                failed=$((failed + 1))
+            fi
+        fi
+    fi
+    
+    echo ""
+    echo "========================================="
+    echo "SYNC COMPLETE"
+    echo "========================================="
+    echo "  Created: $created"
+    echo "  Already existed: $existed"
+    echo "  Failed: $failed"
+    echo ""
+    
+    if [[ $failed -gt 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
 # Main function
 function main() {
     # Handle version argument
@@ -2008,6 +2189,13 @@ function main() {
         exit $?
     fi
     
+    # Handle --sync-users argument (sync upload users from source server)
+    if [[ "${1:-}" == "--sync-users" ]]; then
+        show_version
+        sync_users "${2:-}" "${3:-}"
+        exit $?
+    fi
+    
     # Always show version when running
     show_version
     
@@ -2039,6 +2227,7 @@ function main() {
         echo "       $SCRIPT_NAME --register-batch"
         echo "       $SCRIPT_NAME --update-clients"
         echo "       $SCRIPT_NAME --update-ssr"
+        echo "       $SCRIPT_NAME --sync-users [source_server] [--with-noisegraphs]"
         echo "       $SCRIPT_NAME --version"
         echo ""
         echo "Examples:"
@@ -2050,6 +2239,8 @@ function main() {
         echo "  $SCRIPT_NAME --register-batch          # Register all RACs from need-reg file"
         echo "  $SCRIPT_NAME --update-clients          # SSH to RACs with old WD versions"
         echo "  $SCRIPT_NAME --update-ssr              # Generate .ssr.conf with REPORTER_IDs"
+        echo "  $SCRIPT_NAME --sync-users              # Sync upload users from gw1 (default)"
+        echo "  $SCRIPT_NAME --sync-users gw1 --with-noisegraphs  # Include legacy account"
         echo "  $SCRIPT_NAME --version                 # Show version"
         echo ""
         echo "The --config mode creates user accounts on both servers, adds the client's"
