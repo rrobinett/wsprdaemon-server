@@ -1680,9 +1680,9 @@ alias virr='vi /etc/radio/radiod@rx888-wsprdaemon.conf'
 alias cdq='cd /var/spool/wsprdaemon'
 
 alias tf='tail -F -n 80'
-alias tfd='tf /var/log/wsprdaemon-server/wsprdaemon_server.log'    ### There are two WD services running on WD10/20/30/...: the server which records extended spots to Clickhouse
-alias tfn='tf /var/log/wsprdaemon-server/wsprnet_scraper.log'      ### And the scraper which gets spots from wsprnet.org and saves the in Clickhouse
-alias tfr='tf /var/log/wsprdaemon-server/reflector.log'            ## The scraper runs only on GW1 and GW2, so this is only useful there
+alias tfd='tf /var/log/wsprdaemon/wsprdaemon_server.log'    ### There are two WD services running on WD10/20/30/...: the server which records extended spots to Clickhouse
+alias tfn='tf /var/log/wsprdaemon/wsprnet_scraper.log'      ### And the scraper which gets spots from wsprnet.org and saves the in Clickhouse
+alias tfr='tf /var/log/wsprdaemon/reflector.log'            ## The scraper runs only on GW1 and GW2, so this is only useful there
 
 alias g='git'
 alias gc='git commit'
