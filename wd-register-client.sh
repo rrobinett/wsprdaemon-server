@@ -804,7 +804,7 @@ function generate_updated_ssr_conf() {
         local ssh_user=$(echo "$entry" | cut -d',' -f3)
         local field4=$(echo "$entry" | cut -d',' -f4)
         local field5=$(echo "$entry" | cut -d',' -f5)
-        local description=$(echo "$entry" | cut -d',' -f6)
+        local description=$(echo "$entry" | cut -d',' -f6-)
         local forwards=$(echo "$entry" | cut -d',' -f7-)
         
         # Skip comment lines or empty RACs
@@ -820,7 +820,7 @@ function generate_updated_ssr_conf() {
         # Try to get REPORTER_ID from client via SSH
         if nc -z -w 2 "$WD_RAC_SERVER" "$port" 2>/dev/null; then
             # Port is open, try SSH
-            if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${WD_RAC_SERVER}" "exit" 2>/dev/null; then
+            if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -p "$port" "${ssh_user}@${WD_RAC_SERVER}" "exit" 2>/dev/null; then
                 # SSH works, try to get reporter ID
                 reporter_id=$(get_client_reporter_id "$rac" "$ssh_user" "$port" "$WD_RAC_SERVER" 2>/dev/null)
                 
@@ -1018,7 +1018,7 @@ function scan_all_racs() {
         local ssh_user=$(echo "$entry" | cut -d',' -f3)
         local field5=$(echo "$entry" | cut -d',' -f5)
         local ssh_pass=$(echo "$field5" | awk '{print $2}')  # Second space-separated word
-        local description=$(echo "$entry" | cut -d',' -f6)
+        local description=$(echo "$entry" | cut -d',' -f6-)
         
         # Skip comment lines or empty RACs
         if [[ -z "$rac" ]] || [[ "$rac" =~ ^# ]] || [[ ! "$rac" =~ ^[0-9]+$ ]]; then
@@ -1078,13 +1078,13 @@ function scan_all_racs() {
         if [[ -n "$connected_server" ]]; then
             
             # Test SSH access for active connections
-            if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "exit" 2>/dev/null; then
+            if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -p "$port" "${ssh_user}@${connected_server}" "exit" 2>/dev/null; then
                 ssh_status="✓ OK    "   # 8 display chars
                 ((ssh_ok++))
                 
                 # Try to get actual reporter ID from client's upload log (same source as Linux user)
                 local reporter_id=""
-                reporter_id=$(timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "
+                reporter_id=$(timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -p "$port" "${ssh_user}@${connected_server}" "
                     # Get reporter ID from the wsprnet upload daemon log (look for 'my call' pattern)
                     if [[ -f ~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log ]]; then
                         id=\$(grep 'my call' ~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log 2>/dev/null | tail -1 | sed -n 's/.*my call \\([^ ]*\\) and\\/or.*/\\1/p')
@@ -1109,7 +1109,7 @@ function scan_all_racs() {
                 fi
                 
                 # Check for WD_SERVER_USER_LIST in wsprdaemon.conf
-                if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "grep -q '^WD_SERVER_USER_LIST=' ~/wsprdaemon/wsprdaemon.conf 2>/dev/null" 2>/dev/null; then
+                if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -p "$port" "${ssh_user}@${connected_server}" "grep -q '^WD_SERVER_USER_LIST=' ~/wsprdaemon/wsprdaemon.conf 2>/dev/null" 2>/dev/null; then
                     wd_cfg="✓ OK  "
                     ((wd_cfg_active++))
                 else
@@ -1119,7 +1119,7 @@ function scan_all_racs() {
                 fi
                 
                 # Get WD version
-                local ver=$(timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "cd ~/wsprdaemon 2>/dev/null && echo \"\$(< wd_version.txt)-\$(git rev-list --count HEAD 2>/dev/null)\" 2>/dev/null" 2>/dev/null)
+                local ver=$(timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -p "$port" "${ssh_user}@${connected_server}" "cd ~/wsprdaemon 2>/dev/null && echo \"\$(< wd_version.txt)-\$(git rev-list --count HEAD 2>/dev/null)\" 2>/dev/null" 2>/dev/null)
                 if [[ -n "$ver" && "$ver" != "-" ]]; then
                     # Pad/truncate to 12 chars
                     wd_version=$(printf "%-12s" "${ver:0:12}")
@@ -1132,16 +1132,16 @@ function scan_all_racs() {
                 local fixed=0
                 if [[ $sshpass_available -eq 1 && -n "$ssh_pass" && "$ssh_pass" != "AUTO" && "$ssh_pass" != "*" && "$ssh_pass" != "?" ]]; then
                     # Try to install our public key using the password (suppress output)
-                    if sshpass -p "$ssh_pass" ssh-copy-id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" &>/dev/null; then
+                    if timeout 10 sshpass -p "$ssh_pass" ssh-copy-id -o StrictHostKeyChecking=accept-new -p "$port" "${ssh_user}@${connected_server}" &>/dev/null; then
                         # Verify it worked
-                        if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "exit" 2>/dev/null; then
+                        if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -p "$port" "${ssh_user}@${connected_server}" "exit" 2>/dev/null; then
                             ssh_status="✓ Fixed "   # 8 display chars
                             ((ssh_fixed++))
                             ((ssh_ok++))
                             fixed=1
                             
                             # Try to get actual reporter ID from client's upload log (same source as Linux user)
-                            reporter_id=$(timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "
+                            reporter_id=$(timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -p "$port" "${ssh_user}@${connected_server}" "
                                 # Get reporter ID from the wsprnet upload daemon log (look for 'my call' pattern)
                                 if [[ -f ~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log ]]; then
                                     id=\$(grep 'my call' ~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log 2>/dev/null | tail -1 | sed -n 's/.*my call \\([^ ]*\\) and\\/or.*/\\1/p')
@@ -1166,7 +1166,7 @@ function scan_all_racs() {
                             fi
                             
                             # Now check WD config and version since SSH works
-                            if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "grep -q '^WD_SERVER_USER_LIST=' ~/wsprdaemon/wsprdaemon.conf 2>/dev/null" 2>/dev/null; then
+                            if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -p "$port" "${ssh_user}@${connected_server}" "grep -q '^WD_SERVER_USER_LIST=' ~/wsprdaemon/wsprdaemon.conf 2>/dev/null" 2>/dev/null; then
                                 wd_cfg="✓ OK  "
                                 ((wd_cfg_active++))
                             else
@@ -1175,7 +1175,7 @@ function scan_all_racs() {
                                 need_reg_list+=("$rac:$wd_user:$port:$ssh_user")
                             fi
                             
-                            local ver=$(timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "cd ~/wsprdaemon 2>/dev/null && echo \"\$(< wd_version.txt)-\$(git rev-list --count HEAD 2>/dev/null)\" 2>/dev/null" 2>/dev/null)
+                            local ver=$(timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -p "$port" "${ssh_user}@${connected_server}" "cd ~/wsprdaemon 2>/dev/null && echo \"\$(< wd_version.txt)-\$(git rev-list --count HEAD 2>/dev/null)\" 2>/dev/null" 2>/dev/null)
                             if [[ -n "$ver" && "$ver" != "-" ]]; then
                                 wd_version=$(printf "%-12s" "${ver:0:12}")
                                 wd_versions+=("$ver")
@@ -1206,7 +1206,7 @@ function scan_all_racs() {
             "$wd_cfg" \
             "$wd_version" \
             "${reporter_id:0:15}" \
-            "${description:0:30}"
+            "$description"
         
         ((total_racs++))
     done
