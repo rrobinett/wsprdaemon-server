@@ -1,9 +1,10 @@
 #!/bin/bash
 # fail2ban-manage.sh - Comprehensive fail2ban management tool
-# Version: 1.2
-# Includes permanent unban with database cleanup, username display, maxretry config
+# Version: 1.3
+# Includes permanent unban with database cleanup, username display, maxretry config,
+# and CIDR consolidation for optimizing iptables rules
 
-VERSION="1.2"
+VERSION="1.3"
 
 # Database location
 DB_FILE="/var/lib/fail2ban/fail2ban.sqlite3"
@@ -432,6 +433,265 @@ case "$1" in
         echo "  Bans today: $today_bans"
         ;;
     
+    consolidate)
+        check_sudo
+        ACTION="${2:-analyze}"
+        THRESHOLD="${3:-3}"
+        
+        case "$ACTION" in
+            analyze)
+                echo "=== Consolidation Analysis ==="
+                echo "Finding /24 and /16 blocks with multiple banned IPs..."
+                echo "(Threshold: $THRESHOLD+ IPs to recommend consolidation)"
+                echo ""
+                
+                # Collect all banned IPs from iptables f2b chains
+                ALL_IPS=$(iptables-save 2>/dev/null | grep -E "^-A f2b-" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+                
+                if [ -z "$ALL_IPS" ]; then
+                    echo "No banned IPs found in iptables."
+                    exit 0
+                fi
+                
+                TOTAL_IPS=$(echo "$ALL_IPS" | wc -l)
+                echo "Total individual IP bans: $TOTAL_IPS"
+                echo ""
+                
+                # Analyze /16 blocks
+                echo "=== /16 Blocks (major consolidation opportunities) ==="
+                echo "$ALL_IPS" | sed 's/\.[0-9]*\.[0-9]*$/.0.0\/16/' | sort | uniq -c | sort -rn | \
+                    awk -v t="$THRESHOLD" '$1 >= t {printf "  %s - %d IPs (saves %d rules)\n", $2, $1, $1-1}' | head -10
+                
+                echo ""
+                echo "=== /24 Blocks ==="
+                echo "$ALL_IPS" | sed 's/\.[0-9]*$/.0\/24/' | sort | uniq -c | sort -rn | \
+                    awk -v t="$THRESHOLD" '$1 >= t {printf "  %s - %d IPs (saves %d rules)\n", $2, $1, $1-1}' | head -20
+                
+                echo ""
+                echo "To consolidate a block, run:"
+                echo "  $0 consolidate apply <CIDR>  (e.g., $0 consolidate apply 45.78.0.0/16)"
+                echo ""
+                echo "To change threshold: $0 consolidate analyze <threshold>"
+                ;;
+            
+            apply)
+                CIDR="$3"
+                if [ -z "$CIDR" ]; then
+                    echo "Usage: $0 consolidate apply <CIDR>"
+                    echo "Example: $0 consolidate apply 45.78.0.0/16"
+                    echo "         $0 consolidate apply 101.47.160.0/24"
+                    exit 1
+                fi
+                
+                # Validate CIDR format
+                if ! echo "$CIDR" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/(8|16|24|32)$'; then
+                    echo "Error: Invalid CIDR format. Use format like 45.78.0.0/16 or 192.168.1.0/24"
+                    exit 1
+                fi
+                
+                # Extract prefix for matching
+                MASK=$(echo "$CIDR" | grep -oE '/[0-9]+$' | tr -d '/')
+                case "$MASK" in
+                    8)  PREFIX=$(echo "$CIDR" | cut -d. -f1)"." ;;
+                    16) PREFIX=$(echo "$CIDR" | cut -d. -f1-2)"." ;;
+                    24) PREFIX=$(echo "$CIDR" | cut -d. -f1-3)"." ;;
+                    32) PREFIX=$(echo "$CIDR" | sed 's/\/32//') ;;
+                esac
+                
+                echo "=== Consolidating $CIDR ==="
+                echo "Prefix match: ${PREFIX}*"
+                echo ""
+                
+                # Find all f2b chains
+                CHAINS=$(iptables-save 2>/dev/null | grep -oE "f2b-[a-zA-Z0-9-]+" | sort -u)
+                
+                total_removed=0
+                for chain in $CHAINS; do
+                    chain_removed=0
+                    # Find matching IPs in this chain
+                    MATCHING_IPS=$(iptables -L "$chain" -n 2>/dev/null | awk '/REJECT|DROP/ {print $4}' | grep "^${PREFIX}")
+                    
+                    for ip in $MATCHING_IPS; do
+                        # Determine action type (REJECT or DROP)
+                        ACTION_TYPE=$(iptables -L "$chain" -n 2>/dev/null | grep "$ip" | awk '{print $1}' | head -1)
+                        
+                        if [ "$ACTION_TYPE" = "REJECT" ]; then
+                            iptables -D "$chain" -s "$ip" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null && \
+                                echo "  Removed $ip from $chain" && chain_removed=$((chain_removed + 1))
+                        elif [ "$ACTION_TYPE" = "DROP" ]; then
+                            iptables -D "$chain" -s "$ip" -j DROP 2>/dev/null && \
+                                echo "  Removed $ip from $chain" && chain_removed=$((chain_removed + 1))
+                        fi
+                    done
+                    
+                    # Add the CIDR block if we removed any IPs from this chain
+                    if [ $chain_removed -gt 0 ]; then
+                        total_removed=$((total_removed + chain_removed))
+                        # Check if CIDR already exists
+                        if ! iptables -L "$chain" -n 2>/dev/null | grep -q "$CIDR"; then
+                            # Use same action as the chain typically uses
+                            if iptables -L "$chain" -n 2>/dev/null | grep -q "REJECT"; then
+                                iptables -I "$chain" 1 -s "$CIDR" -j REJECT --reject-with icmp-port-unreachable
+                            else
+                                iptables -I "$chain" 1 -s "$CIDR" -j DROP
+                            fi
+                            echo "  ✓ Added $CIDR to $chain"
+                        fi
+                    fi
+                done
+                
+                if [ $total_removed -eq 0 ]; then
+                    echo "No matching IPs found for $CIDR"
+                else
+                    echo ""
+                    echo "✓ Consolidated $total_removed individual IPs into $CIDR"
+                    echo ""
+                    echo "⚠ Note: This change is temporary (lost on reboot/restart)."
+                    echo "  To make permanent, add to /etc/fail2ban/action.d/ or use ipset."
+                fi
+                ;;
+            
+            apply-all)
+                THRESHOLD="${3:-5}"
+                CIDR_SIZE="${4:-16}"  # Default to /16, can specify 24
+                
+                echo "=== Applying All Consolidations ==="
+                echo "Threshold: $THRESHOLD+ IPs per block"
+                echo "Block size: /$CIDR_SIZE"
+                echo ""
+                
+                ALL_IPS=$(iptables-save 2>/dev/null | grep -E "^-A f2b-" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+                
+                if [ -z "$ALL_IPS" ]; then
+                    echo "No banned IPs found."
+                    exit 0
+                fi
+                
+                # Get list of CIDRs to consolidate
+                if [ "$CIDR_SIZE" = "16" ]; then
+                    CIDRS=$(echo "$ALL_IPS" | sed 's/\.[0-9]*\.[0-9]*$/.0.0\/16/' | sort | uniq -c | sort -rn | \
+                        awk -v t="$THRESHOLD" '$1 >= t {print $2}')
+                else
+                    CIDRS=$(echo "$ALL_IPS" | sed 's/\.[0-9]*$/.0\/24/' | sort | uniq -c | sort -rn | \
+                        awk -v t="$THRESHOLD" '$1 >= t {print $2}')
+                fi
+                
+                if [ -z "$CIDRS" ]; then
+                    echo "No blocks found with $THRESHOLD+ IPs."
+                    exit 0
+                fi
+                
+                # Count what we're about to do
+                CIDR_COUNT=$(echo "$CIDRS" | wc -l)
+                echo "Found $CIDR_COUNT blocks to consolidate:"
+                echo "$CIDRS" | sed 's/^/  /'
+                echo ""
+                
+                read -p "Proceed? [y/N] " confirm
+                if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                    echo "Aborted."
+                    exit 0
+                fi
+                
+                echo ""
+                grand_total=0
+                for cidr in $CIDRS; do
+                    echo "--- Processing $cidr ---"
+                    
+                    # Extract prefix for matching
+                    MASK=$(echo "$cidr" | grep -oE '/[0-9]+$' | tr -d '/')
+                    case "$MASK" in
+                        8)  PREFIX=$(echo "$cidr" | cut -d. -f1)"." ;;
+                        16) PREFIX=$(echo "$cidr" | cut -d. -f1-2)"." ;;
+                        24) PREFIX=$(echo "$cidr" | cut -d. -f1-3)"." ;;
+                    esac
+                    
+                    CHAINS=$(iptables-save 2>/dev/null | grep -oE "f2b-[a-zA-Z0-9-]+" | sort -u)
+                    
+                    cidr_total=0
+                    for chain in $CHAINS; do
+                        chain_removed=0
+                        MATCHING_IPS=$(iptables -L "$chain" -n 2>/dev/null | awk '/REJECT|DROP/ {print $4}' | grep "^${PREFIX}")
+                        
+                        for ip in $MATCHING_IPS; do
+                            ACTION_TYPE=$(iptables -L "$chain" -n 2>/dev/null | grep "$ip" | awk '{print $1}' | head -1)
+                            
+                            if [ "$ACTION_TYPE" = "REJECT" ]; then
+                                iptables -D "$chain" -s "$ip" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null && \
+                                    chain_removed=$((chain_removed + 1))
+                            elif [ "$ACTION_TYPE" = "DROP" ]; then
+                                iptables -D "$chain" -s "$ip" -j DROP 2>/dev/null && \
+                                    chain_removed=$((chain_removed + 1))
+                            fi
+                        done
+                        
+                        if [ $chain_removed -gt 0 ]; then
+                            cidr_total=$((cidr_total + chain_removed))
+                            if ! iptables -L "$chain" -n 2>/dev/null | grep -q "$cidr"; then
+                                if iptables -L "$chain" -n 2>/dev/null | grep -q "REJECT"; then
+                                    iptables -I "$chain" 1 -s "$cidr" -j REJECT --reject-with icmp-port-unreachable
+                                else
+                                    iptables -I "$chain" 1 -s "$cidr" -j DROP
+                                fi
+                            fi
+                        fi
+                    done
+                    
+                    [ $cidr_total -gt 0 ] && echo "  ✓ Consolidated $cidr_total IPs into $cidr"
+                    grand_total=$((grand_total + cidr_total))
+                done
+                
+                echo ""
+                echo "=== Summary ==="
+                echo "✓ Consolidated $grand_total individual IPs into $CIDR_COUNT CIDR blocks"
+                
+                # Show new rule count
+                NEW_COUNT=$(iptables-save 2>/dev/null | grep -E "^-A f2b-" | wc -l)
+                echo "  New total iptables rules in f2b chains: $NEW_COUNT"
+                echo ""
+                echo "⚠ Changes are temporary. Will be lost on fail2ban restart."
+                ;;
+            
+            recommend)
+                echo "=== Recommended Consolidations ==="
+                THRESHOLD="${3:-5}"
+                
+                ALL_IPS=$(iptables-save 2>/dev/null | grep -E "^-A f2b-" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+                
+                echo "Generating consolidation commands (threshold: $THRESHOLD+ IPs)..."
+                echo ""
+                
+                # /16 recommendations
+                echo "# Large blocks (/16):"
+                echo "$ALL_IPS" | sed 's/\.[0-9]*\.[0-9]*$/.0.0\/16/' | sort | uniq -c | sort -rn | \
+                    awk -v t="$THRESHOLD" -v cmd="$0" '$1 >= t {printf "%s consolidate apply %s  # %d IPs\n", cmd, $2, $1}'
+                
+                echo ""
+                echo "# Smaller blocks (/24) not covered by /16 above:"
+                echo "$ALL_IPS" | sed 's/\.[0-9]*$/.0\/24/' | sort | uniq -c | sort -rn | \
+                    awk -v t="$THRESHOLD" -v cmd="$0" '$1 >= t {printf "%s consolidate apply %s  # %d IPs\n", cmd, $2, $1}' | head -15
+                ;;
+            
+            *)
+                echo "Usage: $0 consolidate <subcommand> [options]"
+                echo ""
+                echo "Subcommands:"
+                echo "  analyze [threshold]           - Show consolidation opportunities (default: 3)"
+                echo "  apply <CIDR>                  - Consolidate IPs into a CIDR block"
+                echo "  apply-all [threshold] [size]  - Consolidate all blocks (default: 5+ IPs, /16)"
+                echo "  recommend [threshold]         - Generate consolidation commands"
+                echo ""
+                echo "Examples:"
+                echo "  $0 consolidate analyze"
+                echo "  $0 consolidate analyze 5          # Only show blocks with 5+ IPs"
+                echo "  $0 consolidate apply 45.78.0.0/16"
+                echo "  $0 consolidate apply-all          # All /16 blocks with 5+ IPs"
+                echo "  $0 consolidate apply-all 10       # All /16 blocks with 10+ IPs"
+                echo "  $0 consolidate apply-all 3 24     # All /24 blocks with 3+ IPs"
+                ;;
+        esac
+        ;;
+    
     reload)
         check_sudo
         echo "Reloading fail2ban..."
@@ -467,6 +727,7 @@ case "$1" in
         echo "  logs                - Follow fail2ban logs"
         echo "  watch               - Watch for SSH attacks"
         echo "  stats               - Show statistics"
+        echo "  consolidate         - Analyze/apply CIDR consolidation"
         echo "  reload              - Reload fail2ban"
         echo "  restart             - Restart fail2ban"
         echo "  version             - Show version"
@@ -476,5 +737,7 @@ case "$1" in
         echo "  $0 maxretry 3           # Set ban after 3 failed attempts"
         echo "  $0 whitelist 10.0.0.5 add"
         echo "  $0 investigate 45.78.219.24"
+        echo "  $0 consolidate analyze       # Find CIDR consolidation opportunities"
+        echo "  $0 consolidate apply 45.78.0.0/16"
         ;;
 esac
