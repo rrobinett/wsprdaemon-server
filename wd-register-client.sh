@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# wd-register-client.sh v2.11.0
+# wd-register-client.sh v2.12.0
 # 
 # Script to register WSPRDAEMON client stations for SFTP uploads
 # Creates user accounts on gateway servers and configures client access
@@ -28,6 +28,12 @@
 #   ./wd-register-client.sh --sync-users     # Sync upload users from gw1 (default)
 #   ./wd-register-client.sh --sync-users gw1.wsprdaemon.org  # Sync from specific server
 #   ./wd-register-client.sh --version       # Show version only
+#
+# Changes in v2.12.0:
+#   - FIXED: SSH now auto-accepts new host keys (StrictHostKeyChecking=accept-new)
+#   - New hosts are automatically trusted and keys saved
+#   - Changed host keys still trigger warnings (security protection)
+#   - Allows --scan-racs to work on fresh server installs
 #
 # Changes in v2.11.0:
 #   - NEW: --sync-users command to replicate upload user accounts from source server
@@ -239,8 +245,12 @@
 # Author: AI6VN (with assistance from Claude)
 # Date: November 2025
 
-VERSION="2.11.0"
+VERSION="2.12.0"
 SCRIPT_NAME="wd-register-client.sh"
+
+# SSH options: accept-new means auto-accept unknown hosts, but reject changed keys
+SSH_OPTS="-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+SSH_OPTS_INTERACTIVE="-o StrictHostKeyChecking=accept-new"
 
 # Source bash aliases if available
 if [[ -f ~/wsprdaemon/bash-aliases ]]; then
@@ -354,10 +364,10 @@ function generate_config_output() {
         local remote_auth_keys="/home/${sanitized_reporter_id}/.ssh/authorized_keys"
         
         # Check if PSK already exists on remote
-        if ssh "$backup_server" "sudo grep -qF '$psk' '$remote_auth_keys'" 2>/dev/null; then
+        if ssh $SSH_OPTS "$backup_server" "sudo grep -qF '$psk' '$remote_auth_keys'" 2>/dev/null; then
             echo "✓ PSK already exists on $backup_server"
         else
-            if ssh "$backup_server" "echo '$psk' | sudo tee -a '$remote_auth_keys' > /dev/null && sudo chown '${sanitized_reporter_id}:${sanitized_reporter_id}' '$remote_auth_keys' && sudo chmod 600 '$remote_auth_keys'" 2>/dev/null; then
+            if ssh $SSH_OPTS "$backup_server" "echo '$psk' | sudo tee -a '$remote_auth_keys' > /dev/null && sudo chown '${sanitized_reporter_id}:${sanitized_reporter_id}' '$remote_auth_keys' && sudo chmod 600 '$remote_auth_keys'" 2>/dev/null; then
                 echo "✓ PSK added to authorized_keys on $backup_server"
             else
                 echo "WARNING: Could not add PSK on $backup_server"
@@ -585,18 +595,18 @@ function replicate_user_to_server() {
     
     # Check if user exists on remote server (more thorough check)
     echo "Checking if user exists on $server..."
-    if ssh "$server" "getent passwd '$sanitized_username' >/dev/null 2>&1"; then
+    if ssh $SSH_OPTS "$server" "getent passwd '$sanitized_username' >/dev/null 2>&1"; then
         echo "✓ User '$sanitized_username' already exists on $server"
         
         # Check if account is TRULY locked on remote (! or !! in shadow, not *)
         echo "  Checking account status on $server..."
-        local remote_shadow=$(ssh "$server" "sudo getent shadow '$sanitized_username' 2>/dev/null | cut -d: -f2")
+        local remote_shadow=$(ssh $SSH_OPTS "$server" "sudo getent shadow '$sanitized_username' 2>/dev/null | cut -d: -f2")
         if [[ "$remote_shadow" =~ ^!+[^*] ]] || [[ "$remote_shadow" == "!" ]] || [[ "$remote_shadow" == "!!" ]]; then
             echo "  Account is LOCKED on $server (password starts with !) - unlocking..."
-            ssh "$server" "sudo usermod -p '*' '$sanitized_username'"
+            ssh $SSH_OPTS "$server" "sudo usermod -p '*' '$sanitized_username'"
             echo "  ✓ Account unlocked on $server"
         else
-            local remote_passwd_status=$(ssh "$server" "sudo passwd -S '$sanitized_username' 2>/dev/null | awk '{print \$2}'")
+            local remote_passwd_status=$(ssh $SSH_OPTS "$server" "sudo passwd -S '$sanitized_username' 2>/dev/null | awk '{print \$2}'")
             if [[ "$remote_passwd_status" == "L" ]] || [[ "$remote_passwd_status" == "LK" ]]; then
                 echo "  ✓ Account on $server shows 'L' but has '*' password - SSH keys work, no action needed"
             else
@@ -608,15 +618,15 @@ function replicate_user_to_server() {
         echo "User does not exist on $server, creating..."
         
         # Check if a group with the same name already exists
-        local group_exists=$(ssh "$server" "getent group '$sanitized_username' >/dev/null 2>&1 && echo 'yes' || echo 'no'")
+        local group_exists=$(ssh $SSH_OPTS "$server" "getent group '$sanitized_username' >/dev/null 2>&1 && echo 'yes' || echo 'no'")
         
         if [[ "$group_exists" == "yes" ]]; then
             echo "  Group '$sanitized_username' already exists on $server"
             echo "  Creating user '$sanitized_username' using existing group..."
-            if ! ssh "$server" "sudo useradd -m -g '$sanitized_username' -d '/home/$sanitized_username' -s /usr/sbin/nologin '$sanitized_username'"; then
+            if ! ssh $SSH_OPTS "$server" "sudo useradd -m -g '$sanitized_username' -d '/home/$sanitized_username' -s /usr/sbin/nologin '$sanitized_username'"; then
                 echo "ERROR: Failed to create user on $server even with existing group"
                 echo "Debugging: Checking what exists on $server..."
-                ssh "$server" "
+                ssh $SSH_OPTS "$server" "
                     echo '  User check:' && getent passwd '$sanitized_username' || echo '    User does not exist'
                     echo '  Group check:' && getent group '$sanitized_username' || echo '    Group does not exist'
                     echo '  Home dir:' && ls -ld '/home/$sanitized_username' 2>/dev/null || echo '    No home directory'
@@ -625,10 +635,10 @@ function replicate_user_to_server() {
             fi
         else
             echo "  Creating new user '$sanitized_username' (server will assign UID/GID)..."
-            if ! ssh "$server" "sudo useradd -m -d '/home/$sanitized_username' -s /usr/sbin/nologin '$sanitized_username'"; then
+            if ! ssh $SSH_OPTS "$server" "sudo useradd -m -d '/home/$sanitized_username' -s /usr/sbin/nologin '$sanitized_username'"; then
                 echo "ERROR: Failed to create user on $server"
                 echo "Debugging: Checking what exists on $server..."
-                ssh "$server" "
+                ssh $SSH_OPTS "$server" "
                     echo '  User check:' && getent passwd '$sanitized_username' || echo '    User does not exist'
                     echo '  Group check:' && getent group '$sanitized_username' || echo '    Group does not exist'
                 "
@@ -642,24 +652,24 @@ function replicate_user_to_server() {
     # Only set disabled password for NEW users on remote
     if [[ $remote_user_exists -eq 0 ]]; then
         echo "Setting disabled password for new remote user..."
-        ssh "$server" "sudo usermod -p '*' '$sanitized_username'"
+        ssh $SSH_OPTS "$server" "sudo usermod -p '*' '$sanitized_username'"
         echo "✓ Remote password disabled"
     fi
     
     # Check if already in sftponly group
     echo "Checking group membership on $server..."
-    if ssh "$server" "groups '$sanitized_username' 2>/dev/null | grep -q sftponly"; then
+    if ssh $SSH_OPTS "$server" "groups '$sanitized_username' 2>/dev/null | grep -q sftponly"; then
         echo "  ✓ User already in 'sftponly' group on $server"
     else
         echo "  Adding user to 'sftponly' group on $server..."
-        ssh "$server" "sudo groupadd -f sftponly 2>/dev/null || true"
-        ssh "$server" "sudo usermod -a -G sftponly '$sanitized_username'"
+        ssh $SSH_OPTS "$server" "sudo groupadd -f sftponly 2>/dev/null || true"
+        ssh $SSH_OPTS "$server" "sudo usermod -a -G sftponly '$sanitized_username'"
         echo "  ✓ Added to sftponly group on $server"
     fi
     
     # Check if directories exist and have correct permissions
     echo "Checking directories on $server..."
-    local dirs_ok=$(ssh "$server" "
+    local dirs_ok=$(ssh $SSH_OPTS "$server" "
         if [[ -d /home/$sanitized_username/.ssh && -d /home/$sanitized_username/uploads ]]; then
             # Check ownership and permissions
             ssh_owner=\$(stat -c '%U:%G' /home/$sanitized_username/.ssh 2>/dev/null)
@@ -686,7 +696,7 @@ function replicate_user_to_server() {
         else
             echo "  Creating directories on $server..."
         fi
-        ssh "$server" "
+        ssh $SSH_OPTS "$server" "
             sudo mkdir -p /home/$sanitized_username/{.ssh,uploads}
             sudo touch /home/$sanitized_username/.ssh/authorized_keys
             
@@ -810,7 +820,7 @@ function generate_updated_ssr_conf() {
         # Try to get REPORTER_ID from client via SSH
         if nc -z -w 2 "$WD_RAC_SERVER" "$port" 2>/dev/null; then
             # Port is open, try SSH
-            if timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${WD_RAC_SERVER}" "exit" 2>/dev/null; then
+            if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${WD_RAC_SERVER}" "exit" 2>/dev/null; then
                 # SSH works, try to get reporter ID
                 reporter_id=$(get_client_reporter_id "$rac" "$ssh_user" "$port" "$WD_RAC_SERVER" 2>/dev/null)
                 
@@ -1068,13 +1078,13 @@ function scan_all_racs() {
         if [[ -n "$connected_server" ]]; then
             
             # Test SSH access for active connections
-            if timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "exit" 2>/dev/null; then
+            if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "exit" 2>/dev/null; then
                 ssh_status="✓ OK    "   # 8 display chars
                 ((ssh_ok++))
                 
                 # Try to get actual reporter ID from client's upload log (same source as Linux user)
                 local reporter_id=""
-                reporter_id=$(timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "
+                reporter_id=$(timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "
                     # Get reporter ID from the wsprnet upload daemon log (look for 'my call' pattern)
                     if [[ -f ~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log ]]; then
                         id=\$(grep 'my call' ~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log 2>/dev/null | tail -1 | sed -n 's/.*my call \\([^ ]*\\) and\\/or.*/\\1/p')
@@ -1099,7 +1109,7 @@ function scan_all_racs() {
                 fi
                 
                 # Check for WD_SERVER_USER_LIST in wsprdaemon.conf
-                if timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "grep -q '^WD_SERVER_USER_LIST=' ~/wsprdaemon/wsprdaemon.conf 2>/dev/null" 2>/dev/null; then
+                if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "grep -q '^WD_SERVER_USER_LIST=' ~/wsprdaemon/wsprdaemon.conf 2>/dev/null" 2>/dev/null; then
                     wd_cfg="✓ OK  "
                     ((wd_cfg_active++))
                 else
@@ -1109,7 +1119,7 @@ function scan_all_racs() {
                 fi
                 
                 # Get WD version
-                local ver=$(timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "cd ~/wsprdaemon 2>/dev/null && echo \"\$(< wd_version.txt)-\$(git rev-list --count HEAD 2>/dev/null)\" 2>/dev/null" 2>/dev/null)
+                local ver=$(timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "cd ~/wsprdaemon 2>/dev/null && echo \"\$(< wd_version.txt)-\$(git rev-list --count HEAD 2>/dev/null)\" 2>/dev/null" 2>/dev/null)
                 if [[ -n "$ver" && "$ver" != "-" ]]; then
                     # Pad/truncate to 12 chars
                     wd_version=$(printf "%-12s" "${ver:0:12}")
@@ -1124,14 +1134,14 @@ function scan_all_racs() {
                     # Try to install our public key using the password (suppress output)
                     if sshpass -p "$ssh_pass" ssh-copy-id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" &>/dev/null; then
                         # Verify it worked
-                        if timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "exit" 2>/dev/null; then
+                        if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "exit" 2>/dev/null; then
                             ssh_status="✓ Fixed "   # 8 display chars
                             ((ssh_fixed++))
                             ((ssh_ok++))
                             fixed=1
                             
                             # Try to get actual reporter ID from client's upload log (same source as Linux user)
-                            reporter_id=$(timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "
+                            reporter_id=$(timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "
                                 # Get reporter ID from the wsprnet upload daemon log (look for 'my call' pattern)
                                 if [[ -f ~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log ]]; then
                                     id=\$(grep 'my call' ~/wsprdaemon/uploads/wsprnet/spots/upload_to_wsprnet_daemon.log 2>/dev/null | tail -1 | sed -n 's/.*my call \\([^ ]*\\) and\\/or.*/\\1/p')
@@ -1156,7 +1166,7 @@ function scan_all_racs() {
                             fi
                             
                             # Now check WD config and version since SSH works
-                            if timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "grep -q '^WD_SERVER_USER_LIST=' ~/wsprdaemon/wsprdaemon.conf 2>/dev/null" 2>/dev/null; then
+                            if timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "grep -q '^WD_SERVER_USER_LIST=' ~/wsprdaemon/wsprdaemon.conf 2>/dev/null" 2>/dev/null; then
                                 wd_cfg="✓ OK  "
                                 ((wd_cfg_active++))
                             else
@@ -1165,7 +1175,7 @@ function scan_all_racs() {
                                 need_reg_list+=("$rac:$wd_user:$port:$ssh_user")
                             fi
                             
-                            local ver=$(timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "cd ~/wsprdaemon 2>/dev/null && echo \"\$(< wd_version.txt)-\$(git rev-list --count HEAD 2>/dev/null)\" 2>/dev/null" 2>/dev/null)
+                            local ver=$(timeout 5 ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$port" "${ssh_user}@${connected_server}" "cd ~/wsprdaemon 2>/dev/null && echo \"\$(< wd_version.txt)-\$(git rev-list --count HEAD 2>/dev/null)\" 2>/dev/null" 2>/dev/null)
                             if [[ -n "$ver" && "$ver" != "-" ]]; then
                                 wd_version=$(printf "%-12s" "${ver:0:12}")
                                 wd_versions+=("$ver")
@@ -1360,7 +1370,7 @@ function ensure_client_ssh_keys() {
     
     # Check if client has SSH keys
     echo "  Checking for existing SSH keys on client..."
-    local has_keys=$(ssh -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+    local has_keys=$(ssh $SSH_OPTS -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
         if [[ -f ~/.ssh/id_rsa.pub ]] || [[ -f ~/.ssh/id_ed25519.pub ]]; then
             echo 'yes'
         else
@@ -1376,7 +1386,7 @@ function ensure_client_ssh_keys() {
     echo "  ✗ Client has no SSH keys - creating them..."
     
     # Create SSH keys on the client
-    if ! ssh -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+    if ! ssh $SSH_OPTS -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
         # Create .ssh directory if it doesn't exist
         mkdir -p ~/.ssh
         chmod 700 ~/.ssh
@@ -1415,7 +1425,7 @@ function diagnose_and_fix_authorized_keys() {
     
     # Get client's public key from RAC
     echo "  1. Getting client's public key from RAC server..."
-    local client_key=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "cat ~/.ssh/id_rsa.pub 2>/dev/null || cat ~/.ssh/id_ecdsa.pub 2>/dev/null || cat ~/.ssh/id_ed25519.pub 2>/dev/null" 2>/dev/null | head -1)
+    local client_key=$(ssh $SSH_OPTS -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "cat ~/.ssh/id_rsa.pub 2>/dev/null || cat ~/.ssh/id_ecdsa.pub 2>/dev/null || cat ~/.ssh/id_ed25519.pub 2>/dev/null" 2>/dev/null | head -1)
     
     if [[ -z "$client_key" ]]; then
         echo "    ✗ ERROR: Client has no SSH keys!"
@@ -1456,7 +1466,7 @@ function diagnose_and_fix_authorized_keys() {
         if [[ $is_local -eq 1 ]]; then
             local current_key=$(sudo cat "/home/$sanitized_username/.ssh/authorized_keys" 2>/dev/null | head -1)
         else
-            local current_key=$(ssh "$server_fqdn" "sudo cat '/home/$sanitized_username/.ssh/authorized_keys' 2>/dev/null | head -1" 2>/dev/null)
+            local current_key=$(ssh $SSH_OPTS "$server_fqdn" "sudo cat '/home/$sanitized_username/.ssh/authorized_keys' 2>/dev/null | head -1" 2>/dev/null)
         fi
         
         if [[ -z "$current_key" ]]; then
@@ -1468,7 +1478,7 @@ function diagnose_and_fix_authorized_keys() {
                 sudo chown "$sanitized_username:$sanitized_username" "/home/$sanitized_username/.ssh/authorized_keys"
                 sudo chmod 600 "/home/$sanitized_username/.ssh/authorized_keys"
             else
-                echo "$client_key" | ssh "$server_fqdn" "sudo tee '/home/$sanitized_username/.ssh/authorized_keys' >/dev/null && sudo chown '$sanitized_username:$sanitized_username' '/home/$sanitized_username/.ssh/authorized_keys' && sudo chmod 600 '/home/$sanitized_username/.ssh/authorized_keys'"
+                echo "$client_key" | ssh $SSH_OPTS "$server_fqdn" "sudo tee '/home/$sanitized_username/.ssh/authorized_keys' >/dev/null && sudo chown '$sanitized_username:$sanitized_username' '/home/$sanitized_username/.ssh/authorized_keys' && sudo chmod 600 '/home/$sanitized_username/.ssh/authorized_keys'"
             fi
             
             echo "    ✓ Installed client's key on $server_fqdn"
@@ -1488,7 +1498,7 @@ function diagnose_and_fix_authorized_keys() {
                     sudo chown "$sanitized_username:$sanitized_username" "/home/$sanitized_username/.ssh/authorized_keys"
                     sudo chmod 600 "/home/$sanitized_username/.ssh/authorized_keys"
                 else
-                    echo "$client_key" | ssh "$server_fqdn" "sudo tee '/home/$sanitized_username/.ssh/authorized_keys' >/dev/null && sudo chown '$sanitized_username:$sanitized_username' '/home/$sanitized_username/.ssh/authorized_keys' && sudo chmod 600 '/home/$sanitized_username/.ssh/authorized_keys'"
+                    echo "$client_key" | ssh $SSH_OPTS "$server_fqdn" "sudo tee '/home/$sanitized_username/.ssh/authorized_keys' >/dev/null && sudo chown '$sanitized_username:$sanitized_username' '/home/$sanitized_username/.ssh/authorized_keys' && sudo chmod 600 '/home/$sanitized_username/.ssh/authorized_keys'"
                 fi
                 
                 echo "    ✓ Replaced with client's key on $server_fqdn"
@@ -1538,7 +1548,7 @@ function test_sftp_uploads() {
         
         # Test FROM THE CLIENT by SSHing to the client and running SFTP from there
         echo "    Running test from client (RAC $client_rac)..."
-        if ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+        if ssh $SSH_OPTS -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
             # Create test file on client
             echo 'Test from client at \$(date)' > /tmp/$test_filename
             
@@ -1562,7 +1572,7 @@ EOF
             if [[ "$server_fqdn" == *"$current_hostname"* ]]; then
                 sudo rm -f "/home/$sanitized_username/uploads/$test_filename" 2>/dev/null
             else
-                ssh "$server_fqdn" "sudo rm -f '/home/$sanitized_username/uploads/$test_filename'" 2>/dev/null
+                ssh $SSH_OPTS "$server_fqdn" "sudo rm -f '/home/$sanitized_username/uploads/$test_filename'" 2>/dev/null
             fi
         else
             echo "    ✗ FAILED: Client cannot upload to $server_fqdn"
@@ -1634,7 +1644,7 @@ function configure_client_access() {
     done
     
     echo "  Writing configuration to client..."
-    if ! ssh -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+    if ! ssh $SSH_OPTS -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
         # Remove ALL old WD_SERVER_USER lines (both single and list)
         sed -i '/^[[:space:]]*WD_SERVER_USER=/d' ${config_file}
         sed -i '/^[[:space:]]*WD_SERVER_USER_LIST=/d' ${config_file}
@@ -1663,12 +1673,12 @@ function configure_client_access() {
     
     # Verify configuration
     echo "  Verifying configuration..."
-    if ! ssh -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "grep -E '^WD_SERVER_USER_LIST=|^###.*WD SERVER' ${config_file} 2>/dev/null" 2>/dev/null; then
+    if ! ssh $SSH_OPTS -o ConnectTimeout=10 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "grep -E '^WD_SERVER_USER_LIST=|^###.*WD SERVER' ${config_file} 2>/dev/null" 2>/dev/null; then
         echo "  ⚠ WARNING: Could not verify configuration on client"
         echo "    Client may need manual configuration"
         local configured_list=""
     else
-        local configured_list=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "grep '^WD_SERVER_USER_LIST=' ${config_file} 2>/dev/null")
+        local configured_list=$(ssh $SSH_OPTS -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "grep '^WD_SERVER_USER_LIST=' ${config_file} 2>/dev/null")
     fi
     
     if [[ -n "$configured_list" ]]; then
@@ -1706,7 +1716,7 @@ function get_client_reporter_id() {
     echo "=== Extracting client reporter ID ===" >&2
     
     # First test the SSH connection
-    if ! ssh -o ConnectTimeout=5 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "true" 2>/dev/null; then
+    if ! ssh $SSH_OPTS -o ConnectTimeout=5 -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "true" 2>/dev/null; then
         echo "  ✗ ERROR: Cannot connect to client via SSH on port ${client_ip_port}" >&2
         echo "  Check that port forwarding is working for RAC ${client_rac}" >&2
         return 1
@@ -1718,11 +1728,11 @@ function get_client_reporter_id() {
     echo "  Checking log file: $log_path" >&2
     
     # First check if file exists
-    local file_exists=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "[[ -f $log_path ]] && echo 'yes' || echo 'no'" 2>/dev/null)
+    local file_exists=$(ssh $SSH_OPTS -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "[[ -f $log_path ]] && echo 'yes' || echo 'no'" 2>/dev/null)
     
     if [[ "$file_exists" == "yes" ]]; then
         echo "    Log file found, extracting reporter ID..." >&2
-        local reporter_id=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+        local reporter_id=$(ssh $SSH_OPTS -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
             grep 'my call' $log_path 2>/dev/null | tail -1 | sed -n 's/.*my call \([^ ]*\) and\/or.*/\1/p'
         " 2>/dev/null)
         
@@ -1742,11 +1752,11 @@ function get_client_reporter_id() {
     local conf_path="~/wsprdaemon/wsprdaemon.conf"
     
     # Check if wsprdaemon.conf exists
-    file_exists=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "[[ -f $conf_path ]] && echo 'yes' || echo 'no'" 2>/dev/null)
+    file_exists=$(ssh $SSH_OPTS -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "[[ -f $conf_path ]] && echo 'yes' || echo 'no'" 2>/dev/null)
     
     if [[ "$file_exists" == "yes" ]]; then
         echo "    Config file found, checking RECEIVER_LIST..." >&2
-        reporter_id=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+        reporter_id=$(ssh $SSH_OPTS -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
             # Source the config to get RECEIVER_LIST array
             source ~/wsprdaemon/wsprdaemon.conf 2>/dev/null
             if [[ \${#RECEIVER_LIST[@]} -gt 0 ]]; then
@@ -1771,11 +1781,11 @@ function get_client_reporter_id() {
     local csv_path="~/wsprdaemon/spots.csv"
     
     # Check if CSV exists
-    file_exists=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "[[ -f $csv_path ]] && echo 'yes' || echo 'no'" 2>/dev/null)
+    file_exists=$(ssh $SSH_OPTS -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "[[ -f $csv_path ]] && echo 'yes' || echo 'no'" 2>/dev/null)
     
     if [[ "$file_exists" == "yes" ]]; then
         echo "    CSV file found, extracting field 7..." >&2
-        reporter_id=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+        reporter_id=$(ssh $SSH_OPTS -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
             tail -1 $csv_path 2>/dev/null | cut -d',' -f7
         " 2>/dev/null)
         
@@ -1792,7 +1802,7 @@ function get_client_reporter_id() {
     
     # Last resort - try to find any spots files
     echo "  Looking for alternative file locations..." >&2
-    local alt_files=$(ssh -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
+    local alt_files=$(ssh $SSH_OPTS -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "
         find ~ -name 'upload_to_wsprnet_daemon.log' -o -name 'spots.csv' 2>/dev/null | head -5
     " 2>/dev/null)
     
@@ -1998,7 +2008,7 @@ function sync_users() {
     
     # Check SSH connectivity to source server
     echo "Checking SSH connectivity to $source_server..."
-    if ! ssh -o ConnectTimeout=5 "$source_server" "echo ok" >/dev/null 2>&1; then
+    if ! ssh $SSH_OPTS -o ConnectTimeout=5 "$source_server" "echo ok" >/dev/null 2>&1; then
         echo "ERROR: Cannot connect to $source_server via SSH"
         echo "Make sure you have SSH key access configured."
         return 1
@@ -2022,7 +2032,7 @@ function sync_users() {
     # Get list of users with uploads directories from source server
     echo ""
     echo "Fetching list of upload users from $source_server..."
-    local remote_users=$(ssh "$source_server" "ls -d /home/*/uploads 2>/dev/null | cut -d/ -f3 | sort")
+    local remote_users=$(ssh $SSH_OPTS "$source_server" "ls -d /home/*/uploads 2>/dev/null | cut -d/ -f3 | sort")
     
     if [[ -z "$remote_users" ]]; then
         echo "No users with uploads directories found on $source_server"
@@ -2073,7 +2083,7 @@ function sync_users() {
         sudo touch "/home/$username/.ssh/authorized_keys"
         
         # Get authorized_keys from source server
-        local remote_keys=$(ssh "$source_server" "sudo cat /home/$username/.ssh/authorized_keys 2>/dev/null")
+        local remote_keys=$(ssh $SSH_OPTS "$source_server" "sudo cat /home/$username/.ssh/authorized_keys 2>/dev/null")
         
         if [[ -n "$remote_keys" ]]; then
             # Append any keys not already present
