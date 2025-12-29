@@ -1,9 +1,13 @@
 #!/bin/bash
 ###############################################################################
-### wd-register-client.sh v3.4.1
+### wd-register-client.sh v3.4.2
 ###
 ### Script to register WSPRDAEMON client stations for SFTP uploads
 ### Creates user accounts on gateway servers and configures client access
+###
+### v3.4.2 Changes:
+###   - FIX: Add sudo to rm when verifying peer gateway upload (wsprdaemon can't
+###          delete files owned by SFTP user without sudo)
 ###
 ### v3.4.1 Changes:
 ###   - Test SFTP upload to peer gateway after creating user there
@@ -45,7 +49,7 @@
 ###
 ###############################################################################
 
-declare VERSION="3.4.1"
+declare VERSION="3.4.2"
 
 if [[ -f ~/wsprdaemon/bash-aliases ]]; then
     source ~/wsprdaemon/bash-aliases
@@ -959,8 +963,9 @@ function wd-client-to-server-setup()
                  rm -f /tmp/${peer_test_file}"; then
                 
                 # Verify file arrived on peer (check via SSH to peer)
+                # Note: need sudo for rm since file is owned by the SFTP user, not wsprdaemon
                 if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "${peer_gateway}" \
-                    "test -f '/home/${sanitized_reporter_id}/uploads/${peer_test_file}' && rm -f '/home/${sanitized_reporter_id}/uploads/${peer_test_file}'" 2>/dev/null; then
+                    "test -f '/home/${sanitized_reporter_id}/uploads/${peer_test_file}' && sudo rm -f '/home/${sanitized_reporter_id}/uploads/${peer_test_file}'" 2>/dev/null; then
                     echo "SUCCESS: SFTP upload test to ${peer_fqdn} passed"
                 else
                     echo "WARNING: Could not verify upload on ${peer_fqdn}"
