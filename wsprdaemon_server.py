@@ -433,11 +433,14 @@ def maidenhead_to_latlon(grid: str) -> Tuple[float, float]:
     Returns (lat, lon) with 3 decimal places precision
     Handles 4-character (e.g., CM87) and 6-character (e.g., CM87wj) grids
     Returns (-999, -999) if grid is invalid
+    
+    Convention: 4-character grids are centered at subsquare 'll' (index 11)
     """
     if not grid or len(grid) < 4:
         return (-999.0, -999.0)
     
-    grid = grid.upper()
+    # Only uppercase the field letters (first 2 chars), leave subsquares lowercase
+    grid = grid[:2].upper() + grid[2:]
     
     try:
         # Field (first 2 characters): 20° lon, 10° lat
@@ -448,17 +451,20 @@ def maidenhead_to_latlon(grid: str) -> Tuple[float, float]:
         lon += int(grid[2]) * 2
         lat += int(grid[3]) * 1
         
-        # Center of the square
-        lon += 1.0  # Add half of 2°
-        lat += 0.5  # Add half of 1°
-        
         # Subsquare (optional next 2 characters): 5' lon, 2.5' lat
+        # Subsquares use lowercase letters 'a'-'x' (0-23)
         if len(grid) >= 6:
-            lon += (ord(grid[4]) - ord('A')) * (2.0/24.0)
-            lat += (ord(grid[5]) - ord('A')) * (1.0/24.0)
-            # Center of subsquare
-            lon += (1.0/24.0)  # Add half of 2/24°
-            lat += (0.5/24.0)  # Add half of 1/24°
+            # For 6-character grids, add subsquare offset and center in subsquare
+            lon += (ord(grid[4].lower()) - ord('a')) * (2.0/24.0)
+            lat += (ord(grid[5].lower()) - ord('a')) * (1.0/24.0)
+            # Center of subsquare (half of 2/24° lon and 1/24° lat)
+            lon += (1.0/24.0)
+            lat += (0.5/24.0)
+        else:
+            # For 4-character grids, use center of 'll' subsquare (subsquare index 11)
+            # This gives: 11*(2/24) + 1/24 = 23/24 for lon, 11*(1/24) + 0.5/24 = 11.5/24 for lat
+            lon += 11 * (2.0/24.0) + (1.0/24.0)  # = 23/24 = 0.958
+            lat += 11 * (1.0/24.0) + (0.5/24.0)  # = 11.5/24 = 0.479
         
         # Round to 3 decimal places
         return (round(lat, 3), round(lon, 3))
