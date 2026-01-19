@@ -1,0 +1,251 @@
+Started at Sat Dec 7 15:30:45 UTC 2024
+======================================
+RAC #1   [  1/213] SKIP - No connection
+RAC #2   [  2/213] SKIP - No connection
+RAC #3   [  3/213] CLEANED
+RAC #4   [  4/213] SKIP - Can't autologin
+RAC #5   [  5/213] SKIP - No connection
+RAC #6   [  6/213] SKIP - No connection
+RAC #7   [  7/213] SKIP - No connection
+RAC #8   [  8/213] SKIP - No connection
+RAC #9   [  9/213] SKIP - No connection
+RAC #10  [ 10/213] SKIP - No connection
+RAC #11  [ 11/213] SKIP - No connection
+RAC #12  [ 12/213] SKIP - No connection
+RAC #13  [ 13/213] SKIP - No connection
+RAC #14  [ 14/213] SKIP - No connection
+RAC #15  [ 15/213] CLEANED
+RAC #16  [ 16/213] SKIP - No connection
+RAC #17  [ 17/213] SKIP - No connection
+RAC #18  [ 18/213] SKIP - No connection
+RAC #19  [ 19/213] SKIP - No connection
+RAC #20  [ 20/213] SKIP - No connection
+RAC #21  [ 21/213] CLEANED
+RAC #22  [ 22/213] SKIP - Can't autologin
+RAC #23  [ 23/213] SKIP - No connection
+RAC #24  [ 24/213] SKIP - No connection
+RAC #25  [ 25/213] SKIP - No connection
+RAC #26  [ 26/213] SKIP - No connection
+RAC #27  [ 27/213] SKIP - No connection
+RAC #28  [ 28/213] CLEANED
+RAC #29  [ 29/213] SKIP - No connection
+RAC #30  [ 30/213] SKIP - No connection
+RAC #31  [ 31/213] SKIP - No connection
+RAC #32  [ 32/213] SKIP - No connection
+RAC #33  [ 33/213] SKIP - No connection
+RAC #34  [ 34/213] SKIP - No connection
+RAC #35  [ 35/213] SKIP - No connection
+RAC #36  [ 36/213] SKIP - No connection
+RAC #37  [ 37/213] CLEANED
+RAC #38  [ 38/213] SKIP - No connection
+RAC #39  [ 39/213] SKIP - No connection
+RAC #40  [ 40/213] SKIP - No connection
+RAC #41  [ 41/213] SKIP - No connection
+RAC #42  [ 42/213] SKIP - No connection
+RAC #43  [ 43/213] SKIP - Can't autologin
+RAC #44  [ 44/213] CLEANED
+RAC #45  [ 45/213] SKIP - No connection
+RAC #46  [ 46/213] SKIP - No connection
+RAC #47  [ 47/213] SKIP - No connection
+RAC #48  [ 48/213] SKIP - No connection
+RAC #49  [ 49/213] SKIP - No connection
+RAC #50  [ 50/213] SKIP - No connection
+RAC #51  [ 51/213] SKIP - No connection
+RAC #52  [ 52/213] SKIP - No connection
+RAC #53  [ 53/213] SKIP - No connection
+RAC #54  [ 54/213] SKIP - No connection
+RAC #55  [ 55/213] CLEANED
+RAC #56  [ 56/213] SKIP - No connection
+RAC #57  [ 57/213] SKIP - No connection
+RAC #58  [ 58/213] SKIP - No connection
+RAC #59  [ 59/213] SKIP - No connection
+RAC #60  [ 60/213] SKIP - No connection
+RAC #61  [ 61/213] SKIP - No connection
+RAC #62  [ 62/213] SKIP - No connection
+RAC #63  [ 63/213] SKIP - No connection
+RAC #64  [ 64/213] SKIP - No connection
+RAC #65  [ 65/213] CLEANED
+RAC #66  [ 66/213] SKIP - No connection
+RAC #67  [ 67/213] SKIP - No connection
+RAC #68  [ 68/213] SKIP - No connection
+RAC #69  [ 69/213] SKIP - No connection
+RAC #70  [ 70/213] SKIP - No connection
+RAC #71  [ 71/213] SKIP - No connection
+RAC #72  [ 72/213] SKIP - No connection
+RAC #73  [ 73/213] SKIP - No connection
+RAC #74  [ 74/213] CLEANED
+RAC #75  [ 75/213] SKIP - No connection
+RAC #76  [ 76/213] SKIP - No connection
+RAC #77  [ 77/213] SKIP - No connection
+RAC #78  [ 78/213] SKIP - No connection
+RAC #79  [ 79/213] SKIP - No connection
+RAC #80  [ 80/213] SKIP - No connection
+RAC #81  [ 81/213] SKIP - No connection
+RAC #82  [ 82/213] SKIP - No connection
+RAC #83  [ 83/213] SKIP - No connection
+RAC #84  [ 84/213] SKIP - No connection
+RAC #85  [ 85/213] SKIP - No connection
+RAC #86  [ 86/213] CLEANED
+RAC #87  [ 87/213] SKIP - No connection
+RAC #88  [ 88/213] SKIP - No connection
+RAC #89  [ 89/213] SKIP - No connection
+RAC #90  [ 90/213] SKIP - No connection
+RAC #91  [ 91/213] SKIP - No connection
+RAC #92  [ 92/213] SKIP - No connection
+RAC #93  [ 93/213] SKIP - No connection
+RAC #94  [ 94/213] SKIP - No connection
+RAC #95  [ 95/213] SKIP - No connection
+RAC #96  [ 96/213] SKIP - No connection
+RAC #97  [ 97/213] SKIP - No connection
+RAC #98  [ 98/213] CLEANED
+RAC #99  [ 99/213] SKIP - No connection
+RAC #100 [100/213] SKIP - No connection
+RAC #101 [101/213] SKIP - No connection
+RAC #102 [102/213] SKIP - No connection
+RAC #103 [103/213] SKIP - No connection
+RAC #104 [104/213] SKIP - No connection
+RAC #105 [105/213] CLEANED
+RAC #106 [106/213] SKIP - No connection
+RAC #107 [107/213] SKIP - No connection
+RAC #108 [108/213] SKIP - No connection
+RAC #109 [109/213] SKIP - No connection
+RAC #110 [110/213] SKIP - No connection
+RAC #111 [111/213] SKIP - No connection
+RAC #112 [112/213] CLEANED
+RAC #113 [113/213] SKIP - No connection
+RAC #114 [114/213] SKIP - No connection
+RAC #115 [115/213] SKIP - No connection
+RAC #116 [116/213] SKIP - No connection
+RAC #117 [117/213] SKIP - No connection
+RAC #118 [118/213] SKIP - No connection
+RAC #119 [119/213] SKIP - No connection
+RAC #120 [120/213] SKIP - No connection
+RAC #121 [121/213] FAILED - Error cleaning keys
+RAC #122 [122/213] SKIP - No connection
+RAC #123 [123/213] SKIP - No connection
+RAC #124 [124/213] SKIP - No connection
+RAC #125 [125/213] SKIP - No connection
+RAC #126 [126/213] SKIP - No connection
+RAC #127 [127/213] SKIP - No connection
+RAC #128 [128/213] SKIP - No connection
+RAC #129 [129/213] CLEANED
+RAC #130 [130/213] SKIP - No connection
+RAC #131 [131/213] SKIP - No connection
+RAC #132 [132/213] SKIP - No connection
+RAC #133 [133/213] SKIP - No connection
+RAC #134 [134/213] SKIP - No connection
+RAC #135 [135/213] SKIP - No connection
+RAC #136 [136/213] SKIP - No connection
+RAC #137 [137/213] SKIP - No connection
+RAC #138 [138/213] SKIP - No connection
+RAC #139 [139/213] SKIP - No connection
+RAC #140 [140/213] SKIP - No connection
+RAC #141 [141/213] CLEANED
+RAC #142 [142/213] SKIP - No connection
+RAC #143 [143/213] SKIP - No connection
+RAC #144 [144/213] SKIP - No connection
+RAC #145 [145/213] SKIP - No connection
+RAC #146 [146/213] SKIP - No connection
+RAC #147 [147/213] SKIP - No connection
+RAC #148 [148/213] SKIP - No connection
+RAC #149 [149/213] SKIP - No connection
+RAC #150 [150/213] SKIP - No connection
+RAC #151 [151/213] SKIP - No connection
+RAC #152 [152/213] CLEANED
+RAC #153 [153/213] SKIP - No connection
+RAC #154 [154/213] SKIP - No connection
+RAC #155 [155/213] SKIP - No connection
+RAC #156 [156/213] SKIP - No connection
+RAC #157 [157/213] SKIP - No connection
+RAC #158 [158/213] SKIP - No connection
+RAC #159 [159/213] SKIP - No connection
+RAC #160 [160/213] SKIP - No connection
+RAC #161 [161/213] SKIP - No connection
+RAC #162 [162/213] CLEANED
+RAC #163 [163/213] SKIP - No connection
+RAC #164 [164/213] SKIP - No connection
+RAC #165 [165/213] SKIP - No connection
+RAC #166 [166/213] SKIP - No connection
+RAC #167 [167/213] SKIP - No connection
+RAC #168 [168/213] SKIP - No connection
+RAC #169 [169/213] SKIP - No connection
+RAC #170 [170/213] SKIP - No connection
+RAC #171 [171/213] SKIP - No connection
+RAC #172 [172/213] SKIP - No connection
+RAC #173 [173/213] SKIP - No connection
+RAC #174 [174/213] SKIP - No connection
+RAC #175 [175/213] CLEANED
+RAC #176 [176/213] SKIP - No connection
+RAC #177 [177/213] SKIP - No connection
+RAC #178 [178/213] SKIP - No connection
+RAC #179 [179/213] SKIP - No connection
+RAC #180 [180/213] SKIP - No connection
+RAC #181 [181/213] SKIP - No connection
+RAC #182 [182/213] SKIP - No connection
+RAC #183 [183/213] SKIP - No connection
+RAC #184 [184/213] SKIP - No connection
+RAC #185 [185/213] SKIP - No connection
+RAC #186 [186/213] SKIP - No connection
+RAC #187 [187/213] CLEANED
+RAC #188 [188/213] SKIP - No connection
+RAC #189 [189/213] SKIP - No connection
+RAC #190 [190/213] SKIP - No connection
+RAC #191 [191/213] SKIP - No connection
+RAC #192 [192/213] SKIP - No connection
+RAC #193 [193/213] SKIP - No connection
+RAC #194 [194/213] SKIP - No connection
+RAC #195 [195/213] SKIP - No connection
+RAC #196 [196/213] SKIP - No connection
+RAC #197 [197/213] SKIP - No connection
+RAC #198 [198/213] CLEANED
+RAC #199 [199/213] SKIP - No connection
+RAC #200 [200/213] SKIP - No connection
+RAC #201 [201/213] SKIP - No connection
+RAC #202 [202/213] SKIP - No connection
+RAC #203 [203/213] SKIP - No connection
+RAC #204 [204/213] SKIP - No connection
+RAC #205 [205/213] SKIP - No connection
+RAC #206 [206/213] SKIP - No connection
+RAC #207 [207/213] SKIP - No connection
+RAC #208 [208/213] SKIP - No connection
+RAC #209 [209/213] SKIP - No connection
+RAC #210 [210/213] SKIP - No connection
+RAC #211 [211/213] SKIP - No connection
+RAC #212 [212/213] SKIP - No connection
+RAC #213 [213/213] SKIP - No connection
+
+======================================
+Scan completed at Sat Dec 7 15:45:22 UTC 2024
+
+Summary:
+  Cleaned: 20
+  Failed:  1
+  Skipped: 192
+  Total:   213
+
+RACs cleaned (20):
+  RAC #3
+  RAC #15
+  RAC #21
+  RAC #28
+  RAC #37
+  RAC #44
+  RAC #55
+  RAC #65
+  RAC #74
+  RAC #86
+  RAC #98
+  RAC #105
+  RAC #112
+  RAC #129
+  RAC #141
+  RAC #152
+  RAC #162
+  RAC #175
+  RAC #187
+  RAC #198
+
+RACs with errors (1):
+  RAC #121
+
+Full log saved to: wd-gw-cleanup-20241207_153045.log
