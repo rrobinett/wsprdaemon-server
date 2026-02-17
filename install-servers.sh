@@ -1,21 +1,22 @@
 #!/bin/bash
 # install-servers.sh - Install WSPRNET Scraper and WSPRDAEMON Server Services
-# Version: 1.7.0 - Added --check and --sync options for file synchronization
+# Version: 1.8.0 - Scripts installed as symlinks into the repo directory so
+#                  'git pull' changes take effect immediately without reinstalling
 #
 # Usage: sudo ./install-servers.sh --ch-admin USERNAME --ch-admin-password PASSWORD
-#        ./install-servers.sh --check    # Compare repo vs installed file timestamps
-#        ./install-servers.sh --sync     # Sync files (newer overwrites older)
+#        ./install-servers.sh --check    # Verify symlinks point to this repo
+#        sudo ./install-servers.sh --sync     # Repair any broken/missing symlinks
 #
 # This script:
 #   - Creates ClickHouse root admin user (credentials from command line, not stored in git)
 #   - Configures ClickHouse 'default' user as read-only with password 'wsprdaemon'
-#   - Installs Python scripts and wrapper scripts
+#   - Installs Python scripts and wrapper scripts as symlinks: /usr/local/bin -> repo
 #   - Creates systemd service files
 #   - Creates configuration file templates
 
 set -e
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_USER="wsprdaemon"
 INSTALL_DIR="/opt/wsprdaemon-server"
@@ -30,125 +31,112 @@ MANAGED_FILES=(
     "wsprnet_cache_manager.sh"
 )
 
-# Function to compare and sync files
+# Function to install a single managed file as a symlink
+install_symlink() {
+    local repo_file="$1"
+    local link="/usr/local/bin/$(basename "$repo_file")"
+
+    if [[ ! -f "$repo_file" ]]; then
+        return 0  # optional file not present in repo, skip
+    fi
+
+    chmod +x "$repo_file"
+
+    if [[ -L "$link" ]]; then
+        local current_target
+        current_target=$(readlink "$link")
+        if [[ "$current_target" == "$repo_file" ]]; then
+            return 0  # already correct
+        fi
+        echo "  Updating symlink: $link -> $repo_file (was -> $current_target)"
+        ln -sf "$repo_file" "$link"
+    elif [[ -f "$link" ]]; then
+        echo "  Replacing plain file with symlink: $link -> $repo_file"
+        rm -f "$link"
+        ln -s "$repo_file" "$link"
+    else
+        echo "  Creating symlink: $link -> $repo_file"
+        ln -s "$repo_file" "$link"
+    fi
+}
+
+# Function to check/repair symlinks
 check_and_sync_files() {
     local mode="$1"  # "check" or "sync"
-    local needs_restart=0
-    local files_updated=0
-    local files_differ=0
-    local repo_updated=0
-    
+    local problems=0
+    local fixed=0
+
     echo ""
-    echo "=== Checking file synchronization ==="
-    echo "Repository: $SCRIPT_DIR"
-    echo "Installed:  /usr/local/bin"
+    echo "=== Checking symlinks: /usr/local/bin -> $SCRIPT_DIR ==="
     echo ""
-    
+
     for file in "${MANAGED_FILES[@]}"; do
         local repo_file="$SCRIPT_DIR/$file"
-        local installed_file="/usr/local/bin/$file"
-        
-        # Check if repo file exists
+        local link="/usr/local/bin/$file"
+
+        # File is optional if not in repo
         if [[ ! -f "$repo_file" ]]; then
-            # Some files are optional (like wsprnet_cache_manager.sh)
-            if [[ -f "$installed_file" ]]; then
-                echo "⚠ $file: In /usr/local/bin but missing from repository"
-                if [[ "$mode" == "sync" ]]; then
-                    echo "  → Copying to repository..."
-                    cp "$installed_file" "$repo_file"
-                    echo "  ✓ Repository updated"
-                    files_updated=$((files_updated + 1))
-                    repo_updated=$((repo_updated + 1))
-                fi
+            if [[ -e "$link" || -L "$link" ]]; then
+                echo "⚠ $file: In /usr/local/bin but not in repo (orphan)"
             fi
             continue
         fi
-        
-        if [[ ! -f "$installed_file" ]]; then
-            echo "✗ $file: Not installed"
-            files_differ=$((files_differ + 1))
-            if [[ "$mode" == "sync" ]]; then
-                echo "  → Installing from repository..."
-                cp "$repo_file" "$installed_file"
-                chmod +x "$installed_file"
-                echo "  ✓ Installed"
-                files_updated=$((files_updated + 1))
-                needs_restart=1
-            fi
-            continue
-        fi
-        
-        # Compare content using diff
-        if diff -q "$repo_file" "$installed_file" >/dev/null 2>&1; then
-            echo "✓ $file: In sync"
-        else
-            # Files differ - determine which is newer by timestamp
-            local repo_time=$(stat -c %Y "$repo_file" 2>/dev/null)
-            local installed_time=$(stat -c %Y "$installed_file" 2>/dev/null)
-            local repo_date=$(stat -c %y "$repo_file" 2>/dev/null | cut -d. -f1)
-            local installed_date=$(stat -c %y "$installed_file" 2>/dev/null | cut -d. -f1)
-            
-            files_differ=$((files_differ + 1))
-            
-            if [[ "$installed_time" -gt "$repo_time" ]]; then
-                echo "✗ $file: DIFFERS (installed is newer)"
-                echo "    Repo:      $repo_date"
-                echo "    Installed: $installed_date"
-                
-                if [[ "$mode" == "sync" ]]; then
-                    echo "  → Updating repository version..."
-                    cp "$installed_file" "$repo_file"
-                    echo "  ✓ Repository updated (remember to git commit)"
-                    files_updated=$((files_updated + 1))
-                    repo_updated=$((repo_updated + 1))
-                fi
+
+        if [[ -L "$link" ]]; then
+            local target
+            target=$(readlink "$link")
+            if [[ "$target" == "$repo_file" ]]; then
+                echo "✓ $file: symlink -> $repo_file"
             else
-                echo "✗ $file: DIFFERS (repo is newer)"
-                echo "    Repo:      $repo_date"
-                echo "    Installed: $installed_date"
-                
+                echo "✗ $file: symlink points to wrong target: $target"
+                problems=$((problems + 1))
                 if [[ "$mode" == "sync" ]]; then
-                    echo "  → Updating installed version..."
-                    cp "$repo_file" "$installed_file"
-                    chmod +x "$installed_file"
-                    echo "  ✓ Updated"
-                    files_updated=$((files_updated + 1))
-                    needs_restart=1
+                    ln -sf "$repo_file" "$link"
+                    chmod +x "$repo_file"
+                    echo "  → Fixed: now -> $repo_file"
+                    fixed=$((fixed + 1))
                 fi
+            fi
+        elif [[ -f "$link" ]]; then
+            echo "✗ $file: plain file (not a symlink) in /usr/local/bin"
+            problems=$((problems + 1))
+            if [[ "$mode" == "sync" ]]; then
+                rm -f "$link"
+                ln -s "$repo_file" "$link"
+                chmod +x "$repo_file"
+                echo "  → Replaced with symlink -> $repo_file"
+                fixed=$((fixed + 1))
+            fi
+        else
+            echo "✗ $file: missing from /usr/local/bin"
+            problems=$((problems + 1))
+            if [[ "$mode" == "sync" ]]; then
+                ln -s "$repo_file" "$link"
+                chmod +x "$repo_file"
+                echo "  → Created symlink -> $repo_file"
+                fixed=$((fixed + 1))
             fi
         fi
     done
-    
+
     echo ""
     echo "=== Summary ==="
-    
+
     if [[ "$mode" == "check" ]]; then
-        if [[ $files_differ -gt 0 ]]; then
-            echo "Files out of sync: $files_differ"
-            echo ""
-            echo "Run 'sudo $0 --sync' to synchronize files"
+        if [[ $problems -gt 0 ]]; then
+            echo "Problems found: $problems"
+            echo "Run 'sudo $0 --sync' to repair symlinks"
             return 1
         else
-            echo "All files are in sync ✓"
+            echo "All symlinks are correct ✓"
+            echo "Note: 'git pull' changes take effect immediately - no reinstall needed"
             return 0
         fi
     else
-        # sync mode
-        if [[ $files_updated -gt 0 ]]; then
-            echo "Files synchronized: $files_updated"
-            if [[ $needs_restart -eq 1 ]]; then
-                echo ""
-                echo "⚠ RESTART REQUIRED: Installed files were updated."
-                echo "  Run: sudo systemctl restart wsprnet_scraper@wsprnet"
-                echo "  Run: sudo systemctl restart wsprdaemon_server@wsprdaemon"
-            fi
-            if [[ $repo_updated -gt 0 ]]; then
-                echo ""
-                echo "⚠ COMMIT REQUIRED: Repository files were updated from installed versions."
-                echo "  Run: cd $SCRIPT_DIR && git add -A && git commit -m 'Sync scripts from /usr/local/bin'"
-            fi
+        if [[ $fixed -gt 0 ]]; then
+            echo "Symlinks repaired: $fixed"
         else
-            echo "All files already in sync ✓"
+            echo "All symlinks already correct ✓"
         fi
         return 0
     fi
@@ -184,8 +172,8 @@ usage() {
     echo "install-servers.sh v$VERSION - Install WSPRNET Scraper and WSPRDAEMON Server"
     echo ""
     echo "Usage: $0 --ch-admin USERNAME --ch-admin-password PASSWORD"
-    echo "       $0 --check     # Compare repo vs installed file timestamps"
-    echo "       $0 --sync      # Sync files (newer overwrites older)"
+    echo "       $0 --check     # Verify symlinks point to this repo"
+    echo "       $0 --sync      # Repair broken/missing symlinks (requires sudo)"
     echo "       $0 --version   # Show version"
     echo ""
     echo "Required arguments for full install:"
@@ -284,13 +272,12 @@ $VENV_DIR/bin/pip install --upgrade pip --quiet
 $VENV_DIR/bin/pip install requests clickhouse-connect numpy --quiet
 echo "  Dependencies installed"
 
-# Install Python scripts
-echo "Installing Python scripts..."
-cp "$SCRIPT_DIR/wsprnet_scraper.py" /usr/local/bin/
-cp "$SCRIPT_DIR/wsprdaemon_server.py" /usr/local/bin/
-chmod +x /usr/local/bin/wsprnet_scraper.py
-chmod +x /usr/local/bin/wsprdaemon_server.py
-echo "  Python scripts installed"
+# Install scripts as symlinks so git pull takes effect immediately
+echo "Installing scripts as symlinks -> $SCRIPT_DIR ..."
+for file in "${MANAGED_FILES[@]}"; do
+    install_symlink "$SCRIPT_DIR/$file"
+done
+echo "  Scripts installed"
 
 # ============================================================================
 # Configure ClickHouse users
@@ -399,35 +386,7 @@ DEFAULTEOF
 fi
 
 # ============================================================================
-# Install wrapper scripts
-# ============================================================================
-echo "Installing wrapper scripts..."
-
-if [[ -f "$SCRIPT_DIR/wsprnet_scraper.sh" ]]; then
-    cp "$SCRIPT_DIR/wsprnet_scraper.sh" /usr/local/bin/
-    chmod +x /usr/local/bin/wsprnet_scraper.sh
-    echo "  Installed wsprnet_scraper.sh"
-else
-    echo "  ERROR: wsprnet_scraper.sh not found in $SCRIPT_DIR" >&2
-    exit 1
-fi
-
-if [[ -f "$SCRIPT_DIR/wsprdaemon_server.sh" ]]; then
-    cp "$SCRIPT_DIR/wsprdaemon_server.sh" /usr/local/bin/
-    chmod +x /usr/local/bin/wsprdaemon_server.sh
-    echo "  Installed wsprdaemon_server.sh"
-else
-    echo "  ERROR: wsprdaemon_server.sh not found in $SCRIPT_DIR" >&2
-    exit 1
-fi
-
-# Install cache manager if it exists in script dir
-if [[ -f "$SCRIPT_DIR/wsprnet_cache_manager.sh" ]]; then
-    cp "$SCRIPT_DIR/wsprnet_cache_manager.sh" /usr/local/bin/
-    chmod +x /usr/local/bin/wsprnet_cache_manager.sh
-    echo "  Installed wsprnet_cache_manager.sh"
-fi
-echo "  Wrapper scripts installed"
+# (wrapper scripts are installed as symlinks above)
 
 # ============================================================================
 # Create systemd service files
@@ -635,6 +594,10 @@ echo "4. Check status:"
 echo "     sudo systemctl status wsprnet_scraper@wsprnet"
 echo "     sudo systemctl status wsprdaemon_server@wsprdaemon"
 echo ""
-echo "To check file sync status later: $0 --check"
-echo "To sync files: sudo $0 --sync"
+echo "To check symlink status later: $0 --check"
+echo "To repair symlinks: sudo $0 --sync"
+echo ""
+echo "NOTE: Scripts run directly from $SCRIPT_DIR via symlinks."
+echo "      'git pull' in that directory takes effect immediately -"
+echo "      no reinstall or restart needed for script changes."
 echo ""

@@ -1,9 +1,10 @@
 #!/bin/bash
 #
 # wsprdaemon_server.sh - Wrapper script for WSPRDAEMON Server
-# Version: 4.1
-# Date: 2025-11-29
-# Changes: Uses root admin credentials for initial setup
+# Version: 4.2
+# Date: 2026-02-17
+# Changes: Remove --log-max-mb (dropped from Python script); fix --verbose flag
+#          (was passing numeric value as positional arg, now repeats -v per level)
 
 set -e
 
@@ -68,11 +69,16 @@ echo "Log: ${LOG_FILE}"
 echo "Loop interval: ${LOOP_INTERVAL} seconds"
 echo "Incoming dirs: ${INCOMING_DIRS}"
 
+# Build verbosity flags: VERBOSITY=1 -> "-v", VERBOSITY=2 -> "-v -v", etc.
+verbosity_flags=()
+for (( i=0; i<${VERBOSITY:-1}; i++ )); do
+    verbosity_flags+=("-v")
+done
+
 exec "${VENV_PYTHON}" "${SCRAPER_SCRIPT}" \
     --clickhouse-user "${CLICKHOUSE_ROOT_ADMIN_USER}" \
     --clickhouse-password "${CLICKHOUSE_ROOT_ADMIN_PASSWORD}" \
     --log-file "${LOG_FILE}" \
-    --log-max-mb "${LOG_MAX_MB:-10}" \
     --loop "${LOOP_INTERVAL}" \
-    --verbose "${VERBOSITY:-1}" \
+    "${verbosity_flags[@]}" \
     --incoming-dirs "${INCOMING_DIRS}"
