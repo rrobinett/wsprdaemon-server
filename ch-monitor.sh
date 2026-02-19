@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 CH_CONF="/etc/wsprdaemon/clickhouse.conf"
 STATE_FILE="/var/lib/wsprdaemon/ch-monitor-state.tsv"
 
@@ -190,6 +190,19 @@ cmd_dbs() {
             done <<< "$table_rows"
         fi
     done <<< "$db_rows"
+
+    echo ""
+    echo "  Incoming tbz queue:"
+    printf "  %-40s  %s\n" "DIRECTORY" "QUEUED"
+    printf "  %-40s  %s\n" "---------" "------"
+    for spooldir in /var/spool/wsprdaemon/from-gw1 /var/spool/wsprdaemon/from-gw2; do
+        if [[ -d "$spooldir" ]]; then
+            count=$(find "$spooldir" -maxdepth 1 -name "*.tbz" 2>/dev/null | wc -l)
+            printf "  %-40s  %s\n" "$spooldir" "$count"
+        else
+            printf "  %-40s  %s\n" "$spooldir" "(not found)"
+        fi
+    done
 
     echo ""
     echo "========================================================"
