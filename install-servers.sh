@@ -17,7 +17,7 @@
 
 set -e
 
-VERSION="2.3.0"
+VERSION="2.5.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_USER="wsprdaemon"
 INSTALL_DIR="/opt/wsprdaemon-server"
@@ -30,6 +30,7 @@ MANAGED_FILES=(
     "wsprdaemon_server.py"
     "wsprdaemon_server.sh"
     "wsprnet_cache_manager.sh"
+    "ch-monitor.sh"
 )
 
 # Function to install a single managed file as a symlink
@@ -310,17 +311,25 @@ print(ver)
             done <<< "$tables"
         fi
 
-        # Check recent data - warn if newest spot is older than 30 minutes
+        # Check recent data - warn if newest spot is older than 30 minutes AND queue is empty
         echo ""
         if echo "$tables" | grep -q "^spots$"; then
             newest=$($CH --query "SELECT max(time) FROM wsprdaemon.spots" 2>/dev/null || echo "")
             if [[ -n "$newest" && "$newest" != "1970-01-01 00:00:00" ]]; then
                 age_seconds=$($CH --query "SELECT toUnixTimestamp(now()) - toUnixTimestamp(max(time)) FROM wsprdaemon.spots" 2>/dev/null || echo "9999")
                 age_minutes=$(( age_seconds / 60 ))
+                # Count queued tbz files across all incoming dirs
+                queued_tbz=0
+                for spooldir in /var/spool/wsprdaemon/from-gw1 /var/spool/wsprdaemon/from-gw2; do
+                    n=$(find "$spooldir" -name "*.tbz" 2>/dev/null | wc -l)
+                    queued_tbz=$(( queued_tbz + n ))
+                done
                 if [[ $age_minutes -lt 30 ]]; then
                     echo "  Most recent spot: $newest (${age_minutes}m ago) ✓"
+                elif [[ $queued_tbz -gt 0 ]]; then
+                    echo "  Most recent spot: $newest (${age_minutes}m ago) - processing backlog of $queued_tbz tbz files ✓"
                 else
-                    echo "  Most recent spot: $newest (${age_minutes}m ago) - WARNING: may be stale ✗"
+                    echo "  Most recent spot: $newest (${age_minutes}m ago) - WARNING: queue empty but data is stale ✗"
                     VALIDATE_OK=false
                 fi
             fi
@@ -501,9 +510,13 @@ else
         fi
     done
 
-    # Create/update root admin user XML file (always overwrites)
-    echo "  Creating/updating ClickHouse root admin user: $CH_ADMIN_USER"
-    cat > /etc/clickhouse-server/users.d/${CH_ADMIN_USER}.xml << CHADMINEOF
+    # Create/update root admin user XML file - only write if changed
+    admin_xml="/etc/clickhouse-server/users.d/${CH_ADMIN_USER}.xml"
+    CH_USERS_CHANGED=false
+
+    # Build the desired content into a temp file for comparison
+    tmp_xml=$(mktemp)
+    cat > "$tmp_xml" << CHADMINEOF
 <?xml version="1.0"?>
 <clickhouse>
     <users>
@@ -523,9 +536,18 @@ else
     </users>
 </clickhouse>
 CHADMINEOF
-    chmod 600 /etc/clickhouse-server/users.d/${CH_ADMIN_USER}.xml
-    chown clickhouse:clickhouse /etc/clickhouse-server/users.d/${CH_ADMIN_USER}.xml
-    echo "    Created /etc/clickhouse-server/users.d/${CH_ADMIN_USER}.xml"
+
+    if [[ ! -f "$admin_xml" ]] || ! diff -q "$tmp_xml" "$admin_xml" >/dev/null 2>&1; then
+        echo "  Creating/updating ClickHouse root admin user: $CH_ADMIN_USER"
+        cp "$tmp_xml" "$admin_xml"
+        chmod 600 "$admin_xml"
+        chown clickhouse:clickhouse "$admin_xml"
+        echo "    Written $admin_xml"
+        CH_USERS_CHANGED=true
+    else
+        echo "  ClickHouse root admin user unchanged: $CH_ADMIN_USER ✓"
+    fi
+    rm -f "$tmp_xml"
 
     # Configure default user as read-only with password (only if not already configured)
     # Check if default user already has a password in users.xml or users.d
@@ -562,19 +584,23 @@ DEFAULTEOF
         echo "    Created /etc/clickhouse-server/users.d/default-readonly.xml"
     fi
 
-    # Restart ClickHouse to apply user changes
-    if systemctl is-active --quiet clickhouse-server; then
-        echo "  Restarting ClickHouse to apply user changes..."
-        systemctl restart clickhouse-server
-        sleep 2
+    # Restart ClickHouse only if user config changed
+    if [[ "$CH_USERS_CHANGED" == "true" ]]; then
         if systemctl is-active --quiet clickhouse-server; then
-            echo "    ClickHouse restarted successfully"
+            echo "  Restarting ClickHouse to apply user changes..."
+            systemctl restart clickhouse-server
+            sleep 2
+            if systemctl is-active --quiet clickhouse-server; then
+                echo "    ClickHouse restarted successfully"
+            else
+                echo "    WARNING: ClickHouse may have failed to restart"
+                echo "    Check: sudo systemctl status clickhouse-server"
+            fi
         else
-            echo "    WARNING: ClickHouse may have failed to restart"
-            echo "    Check: sudo systemctl status clickhouse-server"
+            echo "  Note: ClickHouse is not running - user config will apply on next start"
         fi
     else
-        echo "  Note: ClickHouse is not running - user config will apply on next start"
+        echo "  ClickHouse restart not needed (config unchanged)"
     fi
 fi
 
