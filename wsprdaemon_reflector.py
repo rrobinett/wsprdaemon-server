@@ -17,6 +17,11 @@ v2.6.5 changes:
 
 VERSION = "2.6.5"
 
+import sys as _sys
+if '--version' in _sys.argv:
+    print(f'wsprdaemon_reflector.py {VERSION}')
+    _sys.exit(0)
+
 import argparse
 import fnmatch
 import json
