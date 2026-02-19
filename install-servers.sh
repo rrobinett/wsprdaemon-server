@@ -1,11 +1,12 @@
 #!/bin/bash
 # install-servers.sh - Install WSPRNET Scraper and WSPRDAEMON Server Services
-# Version: 1.8.0 - Scripts installed as symlinks into the repo directory so
-#                  'git pull' changes take effect immediately without reinstalling
+# Version: 2.0.0 - Enhanced --validate: python/package versions, script versions,
+#                  spool dir file counts, table row counts, data freshness check
 #
 # Usage: sudo ./install-servers.sh --ch-admin USERNAME --ch-admin-password PASSWORD
-#        ./install-servers.sh --check    # Verify symlinks point to this repo
-#        sudo ./install-servers.sh --sync     # Repair any broken/missing symlinks
+#        ./install-servers.sh --check      # Verify symlinks point to this repo
+#        sudo ./install-servers.sh --sync  # Repair any broken/missing symlinks
+#        sudo ./install-servers.sh --validate  # Check services and tables are running
 #
 # This script:
 #   - Creates ClickHouse root admin user (credentials from command line, not stored in git)
@@ -16,7 +17,7 @@
 
 set -e
 
-VERSION="1.8.0"
+VERSION="2.3.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_USER="wsprdaemon"
 INSTALL_DIR="/opt/wsprdaemon-server"
@@ -158,6 +159,197 @@ if [[ "${1:-}" == "--sync" ]]; then
     exit $?
 fi
 
+# Handle --validate argument
+if [[ "${1:-}" == "--validate" ]]; then
+    if [[ $EUID -ne 0 ]]; then
+        echo "This command requires root (use sudo)"
+        exit 1
+    fi
+    echo "=== Validating WSPRDAEMON Server installation ==="
+    echo ""
+    VALIDATE_OK=true
+
+    # --- Python version ---
+    echo "--- Python ---"
+    if [[ -x "$VENV_DIR/bin/python3" ]]; then
+        py_ver=$("$VENV_DIR/bin/python3" --version 2>&1)
+        echo "  venv python: $py_ver ✓"
+    else
+        echo "  venv python not found: $VENV_DIR/bin/python3 ✗"
+        VALIDATE_OK=false
+    fi
+
+    # --- Python packages ---
+    echo ""
+    echo "--- Python packages ---"
+    for pkg in clickhouse_connect requests numpy; do
+        if ver=$("$VENV_DIR/bin/python3" -c "
+import importlib, importlib.metadata
+try:
+    ver = importlib.metadata.version('$pkg')
+except Exception:
+    import $pkg
+    ver = getattr($pkg, '__version__', 'installed')
+print(ver)
+" 2>/dev/null); then
+            echo "  $pkg: $ver ✓"
+        else
+            echo "  $pkg: NOT INSTALLED ✗"
+            VALIDATE_OK=false
+        fi
+    done
+
+    # --- Script versions ---
+    echo ""
+    echo "--- Script versions ---"
+    # Find venv python - may not be in $VENV_DIR if running --validate standalone
+    VENV_PY=""
+    for candidate in "$VENV_DIR/bin/python3" /opt/wsprdaemon-server/venv/bin/python3; do
+        if [[ -x "$candidate" ]]; then
+            VENV_PY="$candidate"
+            break
+        fi
+    done
+    for script in wsprdaemon_server.py wsprnet_scraper.py; do
+        link="/usr/local/bin/$script"
+        if [[ -L "$link" || -f "$link" ]]; then
+            target=$(readlink "$link" 2>/dev/null || echo "not a symlink")
+            if [[ -n "$VENV_PY" ]]; then
+                ver=$("$VENV_PY" "$link" --version 2>/dev/null || echo "unknown")
+            else
+                ver="(venv not found)"
+            fi
+            echo "  $script: $ver  ->  $target"
+        else
+            echo "  $script: not found in /usr/local/bin ✗"
+            VALIDATE_OK=false
+        fi
+    done
+
+    # --- Symlinks ---
+    echo ""
+    echo "--- Symlinks ---"
+    check_and_sync_files "check" || VALIDATE_OK=false
+
+    # --- Spool directories ---
+    echo ""
+    echo "--- Spool directories ---"
+    for dir in /var/spool/wsprdaemon/from-gw1 /var/spool/wsprdaemon/from-gw2; do
+        if [[ -d "$dir" ]]; then
+            count=$(find "$dir" -name "*.tbz" 2>/dev/null | wc -l)
+            owner=$(stat -c "%U:%G" "$dir")
+            echo "  $dir: $count tbz files, owner=$owner ✓"
+        else
+            echo "  $dir: missing ✗"
+            VALIDATE_OK=false
+        fi
+    done
+
+    # --- Log files ---
+    echo ""
+    echo "--- Log files ---"
+    for log in /var/log/wsprdaemon/wsprdaemon_server.log /var/log/wsprdaemon/wsprnet_scraper.log; do
+        if [[ -f "$log" ]]; then
+            lines=$(wc -l < "$log")
+            modified=$(stat -c "%y" "$log" | cut -d. -f1)
+            echo "  $log: $lines lines, last modified $modified ✓"
+        else
+            echo "  $log: not yet created (service may not have run)"
+        fi
+    done
+
+    # --- Service Status ---
+    echo ""
+    echo "--- Service Status ---"
+    for svc in wsprnet_scraper@wsprnet wsprdaemon_server@wsprdaemon; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            since=$(systemctl show "$svc" --property=ActiveEnterTimestamp --value 2>/dev/null || echo "unknown")
+            echo "  $svc: RUNNING ✓  (since $since)"
+        else
+            state=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
+            echo "  $svc: $state ✗"
+            journalctl -u "$svc" -n 10 --no-pager 2>/dev/null | sed "s/^/    /" || true
+            VALIDATE_OK=false
+        fi
+    done
+
+    # --- ClickHouse connectivity and tables ---
+    echo ""
+    echo "--- ClickHouse ---"
+    if [[ ! -f /etc/wsprdaemon/clickhouse.conf ]]; then
+        echo "  /etc/wsprdaemon/clickhouse.conf not found ✗"
+        VALIDATE_OK=false
+    else
+        source /etc/wsprdaemon/clickhouse.conf
+        CH="clickhouse-client --user $CLICKHOUSE_ROOT_ADMIN_USER --password $CLICKHOUSE_ROOT_ADMIN_PASSWORD"
+
+        if $CH --query "SELECT 1" >/dev/null 2>&1; then
+            echo "  ClickHouse connectivity: OK ✓"
+        else
+            echo "  ClickHouse connectivity: FAILED ✗"
+            VALIDATE_OK=false
+        fi
+
+        echo ""
+        echo "  Tables in wsprdaemon database:"
+        tables=$($CH --query "SHOW TABLES FROM wsprdaemon" 2>/dev/null || echo "")
+        if [[ -z "$tables" ]]; then
+            echo "    (none yet - service may still be starting)"
+        else
+            while IFS= read -r table; do
+                row_count=$($CH --query "SELECT count() FROM wsprdaemon.$table" 2>/dev/null || echo "error")
+                min_time=$($CH --query "SELECT min(time) FROM wsprdaemon.$table" 2>/dev/null || echo "")
+                max_time=$($CH --query "SELECT max(time) FROM wsprdaemon.$table" 2>/dev/null || echo "")
+                printf "    %-30s %12s rows  %s .. %s
+" "$table" "$row_count" "$min_time" "$max_time"
+                # Warn if table is empty after services have been running
+                if [[ "$row_count" == "0" ]] && systemctl is-active --quiet wsprdaemon_server@wsprdaemon; then
+                    echo "    WARNING: $table is empty but service is running ✗"
+                    VALIDATE_OK=false
+                fi
+            done <<< "$tables"
+        fi
+
+        # Check recent data - warn if newest spot is older than 30 minutes
+        echo ""
+        if echo "$tables" | grep -q "^spots$"; then
+            newest=$($CH --query "SELECT max(time) FROM wsprdaemon.spots" 2>/dev/null || echo "")
+            if [[ -n "$newest" && "$newest" != "1970-01-01 00:00:00" ]]; then
+                age_seconds=$($CH --query "SELECT toUnixTimestamp(now()) - toUnixTimestamp(max(time)) FROM wsprdaemon.spots" 2>/dev/null || echo "9999")
+                age_minutes=$(( age_seconds / 60 ))
+                if [[ $age_minutes -lt 30 ]]; then
+                    echo "  Most recent spot: $newest (${age_minutes}m ago) ✓"
+                else
+                    echo "  Most recent spot: $newest (${age_minutes}m ago) - WARNING: may be stale ✗"
+                    VALIDATE_OK=false
+                fi
+            fi
+        fi
+    fi
+
+    # --- tmpfiles.d / runtime dirs ---
+    echo ""
+    echo "--- Runtime directories ---"
+    for dir in /tmp/wsprdaemon /var/lib/wsprdaemon /var/log/wsprdaemon; do
+        if [[ -d "$dir" ]]; then
+            owner=$(stat -c "%U:%G" "$dir")
+            echo "  $dir: exists, owner=$owner ✓"
+        else
+            echo "  $dir: missing ✗"
+            VALIDATE_OK=false
+        fi
+    done
+
+    echo ""
+    if [[ "$VALIDATE_OK" == "true" ]]; then
+        echo "=== All checks passed ✓ ==="
+    else
+        echo "=== Some checks failed - see above ==="
+        exit 1
+    fi
+    exit 0
+fi
+
 # Handle --version argument
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
     echo "install-servers.sh version $VERSION"
@@ -172,9 +364,10 @@ usage() {
     echo "install-servers.sh v$VERSION - Install WSPRNET Scraper and WSPRDAEMON Server"
     echo ""
     echo "Usage: $0 --ch-admin USERNAME --ch-admin-password PASSWORD"
-    echo "       $0 --check     # Verify symlinks point to this repo"
-    echo "       $0 --sync      # Repair broken/missing symlinks (requires sudo)"
-    echo "       $0 --version   # Show version"
+    echo "       $0 --check       # Verify symlinks point to this repo"
+    echo "       $0 --sync        # Repair broken/missing symlinks (requires sudo)"
+    echo "       $0 --validate    # Check services and ClickHouse tables are running"
+    echo "       $0 --version     # Show version"
     echo ""
     echo "Required arguments for full install:"
     echo "  --ch-admin USERNAME           ClickHouse root admin username"
@@ -415,7 +608,7 @@ MemoryHigh=768M
 NoNewPrivileges=true
 PrivateTmp=false
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=read-only
 ReadWritePaths=/var/log/wsprdaemon /var/lib/wsprdaemon
 
 # Logging
@@ -569,35 +762,65 @@ echo "  Updated /etc/wsprdaemon/wsprdaemon.conf"
 echo "Reloading systemd..."
 systemctl daemon-reload
 
+# ============================================================================
+# Validate ClickHouse is reachable with admin credentials
+# ============================================================================
 echo ""
-echo "=== Installation complete! ==="
+echo "Validating ClickHouse connectivity..."
+if clickhouse-client --user "$CH_ADMIN_USER" --password "$CH_ADMIN_PASSWORD" \
+        --query "SELECT 1" >/dev/null 2>&1; then
+    echo "  ClickHouse reachable as $CH_ADMIN_USER ✓"
+else
+    echo "  WARNING: Cannot connect to ClickHouse as $CH_ADMIN_USER"
+    echo "  Check: sudo systemctl status clickhouse-server"
+    echo "  The services will not start correctly until ClickHouse is running."
+fi
+
+# ============================================================================
+# Enable and start services
+# ============================================================================
+echo ""
+echo "Enabling services to start on reboot..."
+systemctl enable wsprnet_scraper@wsprnet
+systemctl enable wsprdaemon_server@wsprdaemon
+echo "  Services enabled ✓"
+
+echo ""
+echo "Starting services..."
+
+# Stop first in case already running with old config
+systemctl stop wsprnet_scraper@wsprnet 2>/dev/null || true
+systemctl stop wsprdaemon_server@wsprdaemon 2>/dev/null || true
+sleep 1
+
+systemctl start wsprnet_scraper@wsprnet
+systemctl start wsprdaemon_server@wsprdaemon
+echo "  Services started"
+
+# ============================================================================
+# Post-install validation - reuse --validate logic
+# ============================================================================
+echo ""
+echo "Waiting 10 seconds for services to initialize..."
+sleep 10
+
 echo ""
 echo "ClickHouse users configured:"
 echo "  - Root admin: $CH_ADMIN_USER (localhost only, full access)"
 echo "  - default: read-only with password 'wsprdaemon' (any host)"
 echo ""
-echo "Installation directory: $INSTALL_DIR"
-echo "Virtual environment: $VENV_DIR"
-echo "Configuration files: /etc/wsprdaemon/"
-echo "Scripts: /usr/local/bin/"
-echo "Service templates: /etc/systemd/system/"
-echo ""
-echo "Next steps:"
-echo "1. Edit /etc/wsprdaemon/wsprnet.conf and set WSPRNET credentials"
-echo "2. Enable services:"
-echo "     sudo systemctl enable wsprnet_scraper@wsprnet"
-echo "     sudo systemctl enable wsprdaemon_server@wsprdaemon"
-echo "3. Start services:"
-echo "     sudo systemctl start wsprnet_scraper@wsprnet"
-echo "     sudo systemctl start wsprdaemon_server@wsprdaemon"
-echo "4. Check status:"
-echo "     sudo systemctl status wsprnet_scraper@wsprnet"
-echo "     sudo systemctl status wsprdaemon_server@wsprdaemon"
-echo ""
-echo "To check symlink status later: $0 --check"
-echo "To repair symlinks: sudo $0 --sync"
+echo "Useful commands:"
+echo "  systemctl status wsprdaemon_server@wsprdaemon"
+echo "  journalctl -u wsprdaemon_server@wsprdaemon -f"
+echo "  journalctl -u wsprnet_scraper@wsprnet -f"
+echo "  $0 --check          # verify symlinks"
+echo "  sudo $0 --sync      # repair symlinks"
+echo "  sudo $0 --validate  # full health check"
 echo ""
 echo "NOTE: Scripts run directly from $SCRIPT_DIR via symlinks."
 echo "      'git pull' in that directory takes effect immediately -"
 echo "      no reinstall or restart needed for script changes."
 echo ""
+
+# Run full validation
+exec "$0" --validate

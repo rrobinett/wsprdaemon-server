@@ -9,6 +9,16 @@ import argparse
 import json
 import sys
 import time
+
+# Handle --version before heavy imports so it works without the venv packages
+if '--version' in sys.argv:
+    # VERSION constant is defined below, so parse it directly from this file
+    import re as _re, os as _os
+    _src = open(_os.path.abspath(__file__)).read()
+    _m = _re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']', _src, _re.MULTILINE)
+    print(f'wsprnet_scraper.py {_m.group(1) if _m else "unknown"}')
+    sys.exit(0)
+
 import requests
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -706,7 +716,9 @@ def main():
     parser.add_argument('--log-max-mb', type=int, default=10, help='Max log size MB')
     parser.add_argument('--verbose', type=int, default=1, choices=[0, 1, 2], 
                         help='Verbosity level (ignored, for compatibility)')
-    
+    parser.add_argument('--version', action='version',
+                        version=f'wsprnet_scraper.py {VERSION}')
+
     args = parser.parse_args()
     
     # Validate credentials are not placeholder values

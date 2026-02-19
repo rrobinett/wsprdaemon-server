@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import clickhouse_connect
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"  # Fixed: 34-field spot parser, rglob directory structure, correct noise schema
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -88,212 +88,329 @@ def get_client_version(extraction_dir: Path) -> Tuple[Optional[str], Optional[st
     return client_version, running_jobs, receiver_descriptions
 
 
+def band_str_to_meters(band_str: str) -> Optional[int]:
+    """Convert a band string to metres.
+
+    Handles numeric bands and named variants used by wsprdaemon:
+        '17'   -> 17   '60eu' -> 60   '80eu' -> 80
+    Returns None for unrecognised strings.
+    """
+    m = re.match(r'^(\d+)', band_str)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def decode_rx_site_dir(rx_site_dir: str) -> Tuple[str, str]:
+    """Decode a RX_SITE directory name into (rx_sign, rx_grid).
+
+    wsprdaemon encodes as:  CALLSIGN=SUFFIX_GRID  e.g. AC0G=ND_EN16ov
+    where '=' replaces '/' in the callsign.
+    Returns (rx_sign, rx_grid); falls back to (raw, '') if format not recognised.
+    """
+    m = re.match(r'^(.+)_([A-Ra-r]{2}[0-9]{2}[A-Xa-x]{0,2})$', rx_site_dir)
+    if m:
+        return m.group(1).replace('=', '/'), m.group(2)
+    return rx_site_dir.replace('=', '/'), ''
+
+
 def parse_wsprd_output(file_path: Path, client_version: Optional[str]) -> List[Dict]:
-    """Parse wsprd output file and return list of spot records"""
+    """Parse a wsprdaemon extended spot file and return a list of spot records.
+
+    Each line has exactly 34 space-separated fields produced by
+    create_enhanced_spots_file_and_queue_to_posting_daemon() in decoding.sh
+    (output_field_name_list order):
+
+      0  spot_date                YYMMDD
+      1  spot_time                HHMM
+      2  spot_sync_quality        float
+      3  spot_snr                 int dB
+      4  spot_dt                  float seconds
+      5  spot_freq                float MHz
+      6  spot_call  (tx_sign)     string
+      7  spot_grid  (tx_loc)      string (or 'none')
+      8  spot_pwr                 int dBm
+      9  spot_drift               int Hz/min
+     10  spot_cycles              int
+     11  spot_jitter              int
+     12  spot_blocksize           int
+     13  spot_metric              int
+     14  spot_decodetype          int
+     15  spot_ipass               int
+     16  spot_nhardmin            int
+     17  spot_pkt_mode (code)     int
+     18  wspr_cycle_rms_noise     float dBm  (sox RMS)
+     19  wspr_cycle_fft_noise     float dBm  (C2 FFT)
+     20  band                     int metres
+     21  real_receiver_grid       string (rx_loc)
+     22  real_receiver_call_sign  string (rx_sign)
+     23  km (distance)            int
+     24  rx_az (rx_azimuth)       float degrees
+     25  rx_lat                   float
+     26  rx_lon                   float
+     27  tx_az (azimuth)          float degrees
+     28  tx_lat                   float
+     29  tx_lon                   float
+     30  v_lat                    float
+     31  v_lon                    float
+     32  wspr_cycle_kiwi_overloads_count  int
+     33  proxy_upload_this_spot   int
+    """
     spots = []
-    
+
     try:
         with open(file_path, 'r') as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
-                
+
                 parts = line.split()
-                if len(parts) < 10:
+                if len(parts) < 34:
+                    log(f"Skipping short line {line_num} ({len(parts)} fields) in "
+                        f"{file_path.name}: {line}", "DEBUG")
                     continue
-                
+
                 try:
-                    # Parse basic fields
                     spot = {
-                        'date': parts[0],      # YYMMDD
-                        'time': parts[1],      # HHMM
-                        'snr': int(parts[2]),
-                        'dt': float(parts[3]),
-                        'freq_hz': float(parts[4]),
-                        'drift': int(parts[5]),
-                        'callsign': parts[6],
-                        'grid': parts[7],
-                        'power_dbm': int(parts[8]),
-                        'distance': int(parts[9]) if len(parts) > 9 else 0,
+                        'date':          parts[0],
+                        'time':          parts[1],
+                        'sync_quality':  float(parts[2]),
+                        'snr':           int(float(parts[3])),
+                        'dt':            float(parts[4]),
+                        'freq_hz':       float(parts[5]) * 1_000_000.0,  # MHz -> Hz
+                        'tx_sign':       parts[6],
+                        'tx_loc':        parts[7] if parts[7].lower() != 'none' else '',
+                        'power_dbm':     int(float(parts[8])),
+                        'drift':         int(float(parts[9])),
+                        'decode_cycles': int(float(parts[10])),
+                        'jitter':        int(float(parts[11])),
+                        'blocksize':     int(float(parts[12])),
+                        'metric':        int(float(parts[13])),
+                        'osd_decode':    int(float(parts[14])),
+                        'ipass':         int(float(parts[15])),
+                        'nhardmin':      int(float(parts[16])),
+                        'code':          int(float(parts[17])),
+                        'rms_noise':     float(parts[18]),   # wspr_cycle_rms_noise
+                        'c2_noise':      float(parts[19]),   # wspr_cycle_fft_noise
+                        'band_m':        int(float(parts[20])),
+                        'rx_loc':        parts[21],
+                        'rx_sign_file':  parts[22],          # authoritative rx callsign
+                        'distance':      int(float(parts[23])),
+                        'rx_azimuth':    float(parts[24]),
+                        'rx_lat':        float(parts[25]),
+                        'rx_lon':        float(parts[26]),
+                        'azimuth':       float(parts[27]),
+                        'tx_lat':        float(parts[28]),
+                        'tx_lon':        float(parts[29]),
+                        'v_lat':         float(parts[30]),
+                        'v_lon':         float(parts[31]),
+                        'ov_count':      int(float(parts[32])),
+                        'proxy_upload':  int(float(parts[33])),
                     }
-                    
-                    # Extended fields from wsprd 3.x+
-                    if len(parts) >= 14:
-                        spot.update({
-                            'azimuth': int(parts[10]),
-                            'c2_noise': float(parts[11]),
-                            'jitter': int(parts[12]),
-                            'blocksize': int(parts[13]),
-                        })
-                    
-                    # Even more extended fields
-                    if len(parts) >= 22:
-                        spot.update({
-                            'sync_quality': int(parts[14]),
-                            'decode_cycles': int(parts[15]),
-                            'rms_noise': float(parts[16]),
-                            'ov_count': int(parts[17]),
-                            'metric': int(parts[18]),
-                            'osd_decode': int(parts[19]),
-                            'nhardmin': int(parts[20]),
-                            'ipass': int(parts[21]),
-                        })
-                    
+
                     if client_version:
                         spot['client_version'] = client_version
-                    
+
                     spots.append(spot)
-                    
-                except (ValueError, IndexError):
+
+                except (ValueError, IndexError) as e:
+                    log(f"Error parsing line {line_num} in {file_path.name}: {e} | {line}",
+                        "DEBUG")
                     continue
-    
+
     except Exception as e:
         log(f"Error reading {file_path}: {e}", "ERROR")
-    
+
     return spots
-
-
 def process_spot_files(extraction_dir: Path, client_version: Optional[str]) -> List[Dict]:
-    """Process all spot files (*_wsprd.txt or *_spots.txt) and return spot records"""
+    """Process all spot files inside an extracted tbz and return spot records.
+
+    Expected directory structure:
+        wsprdaemon/spots/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_spots.txt
+
+    rx_sign and rx_loc come from the parsed spot line (fields 22 and 21).
+    Directory-decoded values are used only as fallbacks.
+    """
     all_spots = []
-    
-    # Find spot files - match both _wsprd.txt and _spots.txt patterns
-    spot_files = list(extraction_dir.glob('*_wsprd.txt'))
-    spot_files.extend(extraction_dir.glob('*_spots.txt'))
-    spot_files = [f for f in spot_files if f.name != 'uploads_config.txt']
-    
-    if not spot_files:
+
+    spots_root = extraction_dir / 'wsprdaemon' / 'spots'
+    if not spots_root.exists():
         return []
-    
-    for spot_file in spot_files:
-        # Extract rx_id and band from filename
-        # Try patterns: RX_ID,BAND_wsprd.txt or RX_ID,BAND_spots.txt
-        match = re.match(r'([^,]+),(\d+)_(?:wsprd|spots)\.txt', spot_file.name)
-        if not match:
+
+    wsprd_files = list(spots_root.rglob('*_spots.txt'))
+    if not wsprd_files:
+        return []
+
+    for wsprd_file in wsprd_files:
+        rel_parts = wsprd_file.relative_to(spots_root).parts
+        if len(rel_parts) < 4:
+            log(f"Skipping spot file with unexpected path depth: {wsprd_file}", "WARNING")
             continue
-        
-        rx_id = match.group(1)
-        band = int(match.group(2))
-        
-        spots = parse_wsprd_output(spot_file, client_version)
-        
-        # Add rx_id and band to each spot
+
+        rx_site_dir = rel_parts[0]
+        rx_id       = rel_parts[1]
+        band_str    = rel_parts[2]
+
+        band = band_str_to_meters(band_str)
+        if band is None:
+            log(f"Skipping spot file with unrecognised band '{band_str}': {wsprd_file}",
+                "WARNING")
+            continue
+
+        rx_sign_dir, rx_grid_dir = decode_rx_site_dir(rx_site_dir)
+
+        spots = parse_wsprd_output(wsprd_file, client_version)
+
         for spot in spots:
-            spot['rx_id'] = rx_id
-            spot['band'] = band
-            # Use rx_id as rx_sign (we don't have the lookup table for archived data)
-            spot['rx_sign'] = rx_id
-            spot['rx_loc'] = ''
-            spot['rx_lat'] = 0.0
-            spot['rx_lon'] = 0.0
-        
+            spot['rx_id']  = rx_id
+            spot['band']   = band
+            spot['rx_sign'] = spot.pop('rx_sign_file', None) or rx_sign_dir
+            if not spot.get('rx_loc'):
+                spot['rx_loc'] = rx_grid_dir
+
         all_spots.extend(spots)
-    
+
     return all_spots
 
 
 def convert_spot_to_clickhouse(spot: Dict) -> Dict:
-    """Convert a spot record to ClickHouse format"""
-    date_str = spot['date']  # YYMMDD
-    time_str = spot['time']  # HHMM
-    
-    year = 2000 + int(date_str[0:2])
-    month = int(date_str[2:4])
-    day = int(date_str[4:6])
-    hour = int(time_str[0:2])
+    """Convert a parsed spot record to a ClickHouse insert dict."""
+    date_str = spot['date']   # YYMMDD
+    time_str = spot['time']   # HHMM
+
+    year   = 2000 + int(date_str[0:2])
+    month  = int(date_str[2:4])
+    day    = int(date_str[4:6])
+    hour   = int(time_str[0:2])
     minute = int(time_str[2:4])
-    
     timestamp = datetime(year, month, day, hour, minute)
-    
-    freq_hz = spot['freq_hz']
+
+    freq_hz  = spot['freq_hz']
     freq_mhz = freq_hz / 1_000_000.0
-    
+
     ch_record = {
-        'time': timestamp,
-        'band': spot['band'],
-        'rx_sign': spot['rx_sign'],
-        'rx_lat': spot['rx_lat'],
-        'rx_lon': spot['rx_lon'],
-        'rx_loc': spot['rx_loc'],
-        'tx_sign': spot['callsign'],
-        'tx_loc': spot['grid'],
-        'distance': spot['distance'],
-        'frequency': int(freq_hz),
+        'time':          timestamp,
+        'band':          spot['band'],
+        'rx_sign':       spot['rx_sign'],
+        'rx_lat':        spot.get('rx_lat', 0.0),
+        'rx_lon':        spot.get('rx_lon', 0.0),
+        'rx_loc':        spot.get('rx_loc', ''),
+        'tx_sign':       spot['tx_sign'],
+        'tx_loc':        spot.get('tx_loc', ''),
+        'tx_lat':        spot.get('tx_lat', 0.0),
+        'tx_lon':        spot.get('tx_lon', 0.0),
+        'distance':      spot.get('distance', 0),
+        'azimuth':       spot.get('azimuth', 0.0),
+        'rx_azimuth':    spot.get('rx_azimuth', 0.0),
+        'frequency':     int(freq_hz),
         'frequency_mhz': freq_mhz,
-        'power': spot['power_dbm'],
-        'snr': spot['snr'],
-        'drift': spot['drift'],
-        'rx_id': spot['rx_id'],
-        'dt': spot['dt'],
+        'power':         spot['power_dbm'],
+        'snr':           spot['snr'],
+        'drift':         spot.get('drift', 0),
+        'rx_id':         spot['rx_id'],
+        'dt':            spot['dt'],
+        'sync_quality':  spot.get('sync_quality', 0.0),
+        'decode_cycles': spot.get('decode_cycles', 0),
+        'jitter':        spot.get('jitter', 0),
+        'blocksize':     spot.get('blocksize', 0),
+        'metric':        spot.get('metric', 0),
+        'osd_decode':    spot.get('osd_decode', 0),
+        'nhardmin':      spot.get('nhardmin', 0),
+        'ipass':         spot.get('ipass', 0),
+        'code':          spot.get('code', 0),
+        'rms_noise':     spot.get('rms_noise', 0.0),
+        'c2_noise':      spot.get('c2_noise', 0.0),
+        'v_lat':         spot.get('v_lat', 0.0),
+        'v_lon':         spot.get('v_lon', 0.0),
+        'ov_count':      spot.get('ov_count', 0),
+        'proxy_upload':  spot.get('proxy_upload', 0),
+        'band_m':        spot.get('band_m', spot.get('band', 0)),
+        'version':       spot.get('client_version', None),
+        'rx_status':     'No Info',
     }
-    
-    # Add extended fields if present
-    for field in ['azimuth', 'c2_noise', 'jitter', 'blocksize', 'sync_quality',
-                  'decode_cycles', 'rms_noise', 'ov_count', 'metric', 'osd_decode',
-                  'nhardmin', 'ipass']:
-        if field in spot:
-            ch_record[field] = spot[field]
-    
-    if 'client_version' in spot:
-        ch_record['version'] = spot['client_version']
-    
+
     return ch_record
 
 
 def process_noise_files(extraction_dir: Path) -> List[Dict]:
-    """Process noise files and return noise records"""
+    """Process noise files inside an extracted tbz and return noise records.
+
+    Expected directory structure:
+        wsprdaemon/noise/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_noise.txt
+
+    File content: exactly 15 space-separated values (NOISE_LINE_FIELDS_COUNT=15):
+        fields  0-11  12 sox dB measurements (3 windows x 4 stats)
+        field   12    rms_level  — calibrated RMS noise (sox, Float32 dBm)
+        field   13    c2_level   — calibrated C2/FFT noise (Float32 dBm)
+        field   14    ov         — A/D overload count (Int32)
+
+    Maps to noise table columns: time, site, receiver, rx_loc, band (String),
+                                  rms_level, c2_level, ov
+    """
     noise_records = []
-    
-    noise_files = list(extraction_dir.glob('*_noise.txt'))
-    
+
+    noise_root = extraction_dir / 'wsprdaemon' / 'noise'
+    if not noise_root.exists():
+        return []
+
+    noise_files = list(noise_root.rglob('*_noise.txt'))
     if not noise_files:
         return []
-    
+
     for noise_file in noise_files:
-        match = re.match(r'([^,]+),(\d+)_noise\.txt', noise_file.name)
-        if not match:
+        rel_parts = noise_file.relative_to(noise_root).parts
+        if len(rel_parts) < 4:
+            log(f"Skipping noise file with unexpected path depth: {noise_file}", "WARNING")
             continue
-        
-        rx_id = match.group(1)
-        band = int(match.group(2))
-        
+
+        rx_site_dir = rel_parts[0]
+        rx_id       = rel_parts[1]   # maps to 'receiver' column
+        band_str    = rel_parts[2]   # stored as String: '17', '60eu', etc.
+
+        rx_sign_dir, rx_grid_dir = decode_rx_site_dir(rx_site_dir)
+
+        m = re.match(r'(\d{6})_(\d{4})_noise\.txt', noise_file.name)
+        if not m:
+            log(f"Skipping noise file with unexpected name: {noise_file.name}", "WARNING")
+            continue
+
+        date_str = m.group(1)
+        time_str = m.group(2)
         try:
-            with open(noise_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    
-                    parts = line.split()
-                    if len(parts) < 4:
-                        continue
-                    
-                    date_str = parts[0]  # YYMMDD
-                    time_str = parts[1]  # HHMM
-                    freq_hz = int(parts[2])
-                    noise_level = float(parts[3])
-                    
-                    year = 2000 + int(date_str[0:2])
-                    month = int(date_str[2:4])
-                    day = int(date_str[4:6])
-                    hour = int(time_str[0:2])
-                    minute = int(time_str[2:4])
-                    
-                    timestamp = datetime(year, month, day, hour, minute)
-                    
-                    noise_records.append({
-                        'time': timestamp,
-                        'rx_id': rx_id,
-                        'band_m': band,
-                        'freq_hz': freq_hz,
-                        'noise_level': noise_level,
-                        'noise_count': 1
-                    })
-        
+            timestamp = datetime(
+                2000 + int(date_str[0:2]), int(date_str[2:4]), int(date_str[4:6]),
+                int(time_str[0:2]), int(time_str[2:4])
+            )
+        except ValueError as e:
+            log(f"Skipping noise file with bad timestamp {noise_file.name}: {e}", "WARNING")
+            continue
+
+        try:
+            content = noise_file.read_text().strip()
+            if not content:
+                continue
+
+            fields = content.split()
+            if len(fields) != 15:
+                log(f"Skipping noise file with {len(fields)} fields "
+                    f"(expected 15): {noise_file.name}", "WARNING")
+                continue
+
+            noise_records.append({
+                'time':      timestamp,
+                'site':      rx_sign_dir,   # rx callsign  e.g. AC0G/ND
+                'receiver':  rx_id,         # rx device id e.g. KA9Q_DXE
+                'rx_loc':    rx_grid_dir,   # Maidenhead   e.g. EN16ov
+                'band':      band_str,      # String       e.g. '17', '60eu'
+                'rms_level': float(fields[12]),
+                'c2_level':  float(fields[13]),
+                'ov':        int(float(fields[14])),
+            })
+
         except Exception as e:
-            log(f"Error processing noise file {noise_file.name}: {e}", "WARNING")
-    
+            log(f"Error processing noise file {noise_file}: {e}", "WARNING")
+
     return noise_records
 
 

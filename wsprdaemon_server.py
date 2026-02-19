@@ -20,7 +20,7 @@ import clickhouse_connect
 import logging
 
 # Version
-VERSION = "2.14.0"  # Added: system setup for tmpfiles.d and required directories
+VERSION = "2.20.0"  # Fixed: O(n^2) processed-file scan replaced with single load per cycle
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -29,7 +29,7 @@ DEFAULT_CONFIG = {
     'clickhouse_user': '',
     'clickhouse_password': '',
     'clickhouse_database': 'wsprdaemon',
-    'clickhouse_spots_table': 'spots_extended',
+    'clickhouse_spots_table': 'spots',
     'clickhouse_noise_table': 'noise',
     'incoming_tbz_dirs': [],  # Must be specified via --incoming-dirs
     'extraction_dir': '/var/lib/wsprdaemon/extraction',
@@ -266,93 +266,83 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
         else:
             log(f"Database {config['clickhouse_database']} already exists", "INFO")
 
-        # Create spots table - HARMONIZED with wsprnet.spots schema
+        # Create spots table
+        #   - azimuth/rx_azimuth are Float32 (not Int32 — fractional degrees matter)
+        #   - id column omitted (no upstream source in tbz data)
+        #   - ALIAS columns omitted (add manually if needed)
+        #   - ReplacingMergeTree so re-runs are idempotent
         create_spots_table_sql = f"""
         CREATE TABLE IF NOT EXISTS {config['clickhouse_database']}.{config['clickhouse_spots_table']}
         (
-            -- Harmonized columns matching wsprnet.spots schema (with aliases for old names)
-            id           Nullable(UInt64)        CODEC(Delta(8), ZSTD(1)),
-            time         DateTime                CODEC(Delta(4), ZSTD(1)),
-            band         Int16                   CODEC(T64, ZSTD(1)),
-            rx_sign      LowCardinality(String)  CODEC(LZ4),
-            rx_lat       Float32                 CODEC(Delta(4), ZSTD(3)),
-            rx_lon       Float32                 CODEC(Delta(4), ZSTD(3)),
-            rx_loc       LowCardinality(String)  CODEC(LZ4),
-            tx_sign      LowCardinality(String)  CODEC(LZ4),
-            tx_lat       Float32                 CODEC(Delta(4), ZSTD(3)),
-            tx_lon       Float32                 CODEC(Delta(4), ZSTD(3)),
-            tx_loc       LowCardinality(String)  CODEC(LZ4),
-            distance     Int32                   CODEC(T64, ZSTD(1)),
-            azimuth      Int32                   CODEC(T64, ZSTD(1)),
-            rx_azimuth   Int32                   CODEC(T64, ZSTD(1)),
-            frequency    UInt64                  CODEC(Delta(8), ZSTD(3)),
-            power        Int8                    CODEC(T64, ZSTD(1)),
-            snr          Int8                    CODEC(Delta(4), ZSTD(3)),
-            drift        Int8                    CODEC(Delta(4), ZSTD(3)),
-            version      LowCardinality(Nullable(String)) CODEC(LZ4),
-            code         Int8                    CODEC(ZSTD(1)),
-            
-            -- Wsprdaemon-specific additional fields
-            frequency_mhz Float64                CODEC(Delta(8), ZSTD(3)),
-            rx_id        LowCardinality(String)  CODEC(LZ4),
-            v_lat        Float32                 CODEC(Delta(4), ZSTD(3)),
-            v_lon        Float32                 CODEC(Delta(4), ZSTD(3)),
-            c2_noise     Float32                 CODEC(Delta(4), ZSTD(3)),
-            sync_quality UInt16                  CODEC(ZSTD(1)),
-            dt           Float32                 CODEC(Delta(4), ZSTD(3)),
-            decode_cycles UInt32                 CODEC(T64, ZSTD(1)),
-            jitter       Int16                   CODEC(T64, ZSTD(1)),
-            rms_noise    Float32                 CODEC(Delta(4), ZSTD(3)),
-            blocksize    UInt16                  CODEC(T64, ZSTD(1)),
-            metric       Int16                   CODEC(T64, ZSTD(1)),
-            osd_decode   UInt8                   CODEC(T64, ZSTD(1)),
-            nhardmin     UInt16                  CODEC(T64, ZSTD(1)),
-            ipass        UInt8                   CODEC(T64, ZSTD(1)),
-            proxy_upload UInt8                   CODEC(T64, ZSTD(1)),
-            ov_count     UInt32                  CODEC(T64, ZSTD(1)),
-            rx_status    LowCardinality(String) DEFAULT 'No Info' CODEC(LZ4),
-            band_m       Int16                   CODEC(T64, ZSTD(1)),
-            
-            -- Compatibility aliases for wsprnet.org queries
-            Spotnum      UInt64  ALIAS id,
-            Date         UInt32  ALIAS toUnixTimestamp(time),
-            Reporter     String  ALIAS rx_sign,
-            ReporterGrid String  ALIAS rx_loc,
-            dB           Int8    ALIAS snr,
-            freq         Float64 ALIAS frequency_mhz,
-            MHz          Float64 ALIAS frequency_mhz,
-            CallSign     String  ALIAS tx_sign,
-            Grid         String  ALIAS tx_loc,
-            Power        Int8    ALIAS power,
-            Drift        Int8    ALIAS drift,
-            Band         Int16   ALIAS band,
-            rx_az        UInt16  ALIAS rx_azimuth,
-            frequency_hz UInt64  ALIAS frequency
+            time          DateTime                          CODEC(Delta(4), ZSTD(1)),
+            band          Int16                             CODEC(T64, ZSTD(1)),
+            rx_sign       LowCardinality(String)            CODEC(LZ4),
+            rx_lat        Float32                           CODEC(Delta(4), ZSTD(3)),
+            rx_lon        Float32                           CODEC(Delta(4), ZSTD(3)),
+            rx_loc        LowCardinality(String)            CODEC(LZ4),
+            tx_sign       LowCardinality(String)            CODEC(LZ4),
+            tx_lat        Float32                           CODEC(Delta(4), ZSTD(3)),
+            tx_lon        Float32                           CODEC(Delta(4), ZSTD(3)),
+            tx_loc        LowCardinality(String)            CODEC(LZ4),
+            distance      Int32                             CODEC(T64, ZSTD(1)),
+            azimuth       Float32                           CODEC(Delta(4), ZSTD(3)),
+            rx_azimuth    Float32                           CODEC(Delta(4), ZSTD(3)),
+            frequency     UInt64                            CODEC(Delta(8), ZSTD(3)),
+            power         Int8                              CODEC(T64, ZSTD(1)),
+            snr           Int8                              CODEC(Delta(4), ZSTD(3)),
+            drift         Int8                              CODEC(Delta(4), ZSTD(3)),
+            version       LowCardinality(Nullable(String))  CODEC(LZ4),
+            code          Int8                              CODEC(ZSTD(1)),
+            frequency_mhz Float64                           CODEC(Delta(8), ZSTD(3)),
+            rx_id         LowCardinality(String)            CODEC(LZ4),
+            v_lat         Float32                           CODEC(Delta(4), ZSTD(3)),
+            v_lon         Float32                           CODEC(Delta(4), ZSTD(3)),
+            c2_noise      Float32                           CODEC(Delta(4), ZSTD(3)),
+            sync_quality  UInt16                            CODEC(ZSTD(1)),
+            dt            Float32                           CODEC(Delta(4), ZSTD(3)),
+            decode_cycles UInt32                            CODEC(T64, ZSTD(1)),
+            jitter        Int16                             CODEC(T64, ZSTD(1)),
+            rms_noise     Float32                           CODEC(Delta(4), ZSTD(3)),
+            blocksize     UInt16                            CODEC(T64, ZSTD(1)),
+            metric        Int16                             CODEC(T64, ZSTD(1)),
+            osd_decode    UInt8                             CODEC(T64, ZSTD(1)),
+            nhardmin      UInt16                            CODEC(T64, ZSTD(1)),
+            ipass         UInt8                             CODEC(T64, ZSTD(1)),
+            proxy_upload  UInt8                             CODEC(T64, ZSTD(1)),
+            ov_count      UInt32                            CODEC(T64, ZSTD(1)),
+            rx_status     LowCardinality(String) DEFAULT 'No Info' CODEC(LZ4),
+            band_m        Int16                             CODEC(T64, ZSTD(1))
         )
-        ENGINE = MergeTree()
+        ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMM(time)
-        ORDER BY time
+        ORDER BY (time, rx_sign, tx_sign, frequency)
         SETTINGS index_granularity = 8192
         """
         admin_client.command(create_spots_table_sql)
         log(f"Table {config['clickhouse_database']}.{config['clickhouse_spots_table']} ready", "INFO")
 
         # Create noise table
+        #   site     = rx callsign from RX_SITE directory  (e.g. AC0G/ND)
+        #   receiver = rx device from RECEIVER directory   (e.g. KA9Q_DXE)
+        #   rx_loc   = Maidenhead grid from RX_SITE suffix (e.g. EN16ov)
+        #   band     = band string from BAND directory     (e.g. '17', '60eu')
+        #   rms_level / c2_level = fields[12] / fields[13] from the 15-field noise line
+        #   ov       = fields[14], A/D overload count
         create_noise_table_sql = f"""
         CREATE TABLE IF NOT EXISTS {config['clickhouse_database']}.{config['clickhouse_noise_table']}
         (
-            time         DateTime                CODEC(Delta(4), ZSTD(1)),
-            rx_id        LowCardinality(String)  CODEC(LZ4),
-            rx_sign      LowCardinality(String)  CODEC(LZ4),
-            rx_grid      LowCardinality(String)  CODEC(LZ4),
-            band_m       Int16                   CODEC(T64, ZSTD(1)),
-            freq_hz      UInt64                  CODEC(Delta(8), ZSTD(3)),
-            noise_level  Float32                 CODEC(Delta(4), ZSTD(3)),
-            noise_count  UInt32                  CODEC(T64, ZSTD(1))
+            time       DateTime                CODEC(Delta(4), ZSTD(1)),
+            site       LowCardinality(String)  CODEC(LZ4),
+            receiver   LowCardinality(String)  CODEC(LZ4),
+            rx_loc     LowCardinality(String)  CODEC(LZ4),
+            band       LowCardinality(String)  CODEC(LZ4),
+            rms_level  Float32                 CODEC(Delta(4), ZSTD(3)),
+            c2_level   Float32                 CODEC(Delta(4), ZSTD(3)),
+            ov         Int32                   CODEC(T64, ZSTD(1))
         )
-        ENGINE = MergeTree()
+        ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMM(time)
-        ORDER BY (rx_id, time, band_m)
+        ORDER BY (time, site, receiver, band)
         SETTINGS index_granularity = 8192
         """
         admin_client.command(create_noise_table_sql)
@@ -377,18 +367,21 @@ def find_tbz_files(dirs: List[str]) -> List[Path]:
     return sorted(tbz_files)
 
 
-def is_tbz_processed(tbz_file: Path, processed_file: Path) -> bool:
-    """Check if a .tbz file has already been processed"""
+def load_processed_set(processed_file: Path) -> set:
+    """Load the set of already-processed tbz file paths from disk."""
     if not processed_file.exists():
-        return False
-    
+        return set()
     try:
         with open(processed_file, 'r') as f:
-            processed = set(line.strip() for line in f if line.strip())
-        return str(tbz_file) in processed
+            return set(line.strip() for line in f if line.strip())
     except Exception as e:
         log(f"Error reading processed file: {e}", "WARNING")
-        return False
+        return set()
+
+
+def is_tbz_processed(tbz_file: Path, processed_set: set) -> bool:
+    """Check if a .tbz file has already been processed (uses pre-loaded set)."""
+    return str(tbz_file) in processed_set
 
 
 def mark_tbz_processed(tbz_file: Path, processed_file: Path, max_size: int):
@@ -469,233 +462,297 @@ def get_client_version(extraction_dir: Path) -> Tuple[Optional[str], Optional[st
 
 
 def parse_wsprd_output(file_path: Path, client_version: Optional[str]) -> List[Dict]:
-    """Parse wsprd output file and return list of spot records"""
+    """Parse a wsprdaemon extended spot file and return a list of spot records.
+
+    The file is produced by decoding.sh create_enhanced_spots_file_and_queue_to_posting_daemon().
+    Each line has exactly 34 space-separated fields in this order (defined by
+    output_field_name_list in decoding.sh):
+
+      0  spot_date                  YYMMDD
+      1  spot_time                  HHMM
+      2  spot_sync_quality          float
+      3  spot_snr                   int   dB
+      4  spot_dt                    float seconds
+      5  spot_freq                  float MHz
+      6  spot_call  (tx_sign)       string
+      7  spot_grid  (tx_loc)        string  (or 'none' when absent)
+      8  spot_pwr                   int   dBm
+      9  spot_drift                 int   Hz/min
+     10  spot_cycles (decode_cycles) int
+     11  spot_jitter                int
+     12  spot_blocksize             int
+     13  spot_metric                int
+     14  spot_decodetype (osd_decode) int
+     15  spot_ipass                 int
+     16  spot_nhardmin              int
+     17  spot_pkt_mode (code)       int
+     18  wspr_cycle_rms_noise       float dBm  (sox RMS measurement)
+     19  wspr_cycle_fft_noise       float dBm  (C2 FFT measurement)
+     20  band                       int   metres (e.g. 17, 20, 40)
+     21  real_receiver_grid (rx_loc) string
+     22  real_receiver_call_sign (rx_sign) string
+     23  km   (distance)            int
+     24  rx_az (rx_azimuth)         float degrees
+     25  rx_lat                     float
+     26  rx_lon                     float
+     27  tx_az (azimuth)            float degrees
+     28  tx_lat                     float
+     29  tx_lon                     float
+     30  v_lat                      float
+     31  v_lon                      float
+     32  wspr_cycle_kiwi_overloads_count (ov_count) int
+     33  proxy_upload_this_spot     int  (0 or 1)
+    """
     spots = []
-    
+
     try:
         with open(file_path, 'r') as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
-                
+
                 parts = line.split()
-                if len(parts) < 10:
-                    log(f"Skipping malformed line {line_num} in {file_path.name}: {line}", "DEBUG")
+                if len(parts) < 34:
+                    log(f"Skipping short line {line_num} ({len(parts)} fields) in "
+                        f"{file_path.name}: {line}", "DEBUG")
                     continue
-                
+
                 try:
-                    # Parse basic fields (common to all wsprd versions)
                     spot = {
-                        'date': parts[0],      # YYMMDD
-                        'time': parts[1],      # HHMM
-                        'snr': int(parts[2]),
-                        'dt': float(parts[3]),
-                        'freq_hz': float(parts[4]),
-                        'drift': int(parts[5]),
-                        'callsign': parts[6],
-                        'grid': parts[7],
-                        'power_dbm': int(parts[8]),
-                        'distance': int(parts[9]) if len(parts) > 9 else 0,
+                        # Timing / identity
+                        'date':          parts[0],            # YYMMDD
+                        'time':          parts[1],            # HHMM
+                        'sync_quality':  float(parts[2]),
+                        'snr':           int(float(parts[3])),
+                        'dt':            float(parts[4]),
+                        'freq_hz':       float(parts[5]) * 1_000_000.0,  # MHz -> Hz
+                        'tx_sign':       parts[6],
+                        'tx_loc':        parts[7] if parts[7].lower() != 'none' else '',
+                        'power_dbm':     int(float(parts[8])),
+                        'drift':         int(float(parts[9])),
+                        # Decoder quality metrics
+                        'decode_cycles': int(float(parts[10])),
+                        'jitter':        int(float(parts[11])),
+                        'blocksize':     int(float(parts[12])),
+                        'metric':        int(float(parts[13])),
+                        'osd_decode':    int(float(parts[14])),
+                        'ipass':         int(float(parts[15])),
+                        'nhardmin':      int(float(parts[16])),
+                        'code':          int(float(parts[17])),  # spot_pkt_mode
+                        # Noise levels (RMS=sox, c2=FFT) — note field order in file
+                        'rms_noise':     float(parts[18]),   # wspr_cycle_rms_noise
+                        'c2_noise':      float(parts[19]),   # wspr_cycle_fft_noise
+                        # Derived geo fields from add_derived()
+                        'band_m':        int(float(parts[20])),
+                        'rx_loc':        parts[21],
+                        'rx_sign_file':  parts[22],          # authoritative rx callsign
+                        'distance':      int(float(parts[23])),
+                        'rx_azimuth':    float(parts[24]),
+                        'rx_lat':        float(parts[25]),
+                        'rx_lon':        float(parts[26]),
+                        'azimuth':       float(parts[27]),
+                        'tx_lat':        float(parts[28]),
+                        'tx_lon':        float(parts[29]),
+                        'v_lat':         float(parts[30]),
+                        'v_lon':         float(parts[31]),
+                        'ov_count':      int(float(parts[32])),
+                        'proxy_upload':  int(float(parts[33])),
                     }
-                    
-                    # Extended fields from wsprd 3.x+ (if available)
-                    if len(parts) >= 14:
-                        spot.update({
-                            'azimuth': int(parts[10]),
-                            'c2_noise': float(parts[11]),
-                            'jitter': int(parts[12]),
-                            'blocksize': int(parts[13]),
-                        })
-                    
-                    # Even more extended fields from latest wsprd
-                    if len(parts) >= 22:
-                        spot.update({
-                            'sync_quality': int(parts[14]),
-                            'decode_cycles': int(parts[15]),
-                            'rms_noise': float(parts[16]),
-                            'ov_count': int(parts[17]),
-                            'metric': int(parts[18]),
-                            'osd_decode': int(parts[19]),
-                            'nhardmin': int(parts[20]),
-                            'ipass': int(parts[21]),
-                        })
-                    
-                    # Add client version if available
+
                     if client_version:
                         spot['client_version'] = client_version
-                    
+
                     spots.append(spot)
-                    
+
                 except (ValueError, IndexError) as e:
-                    log(f"Error parsing line {line_num} in {file_path.name}: {e}", "DEBUG")
+                    log(f"Error parsing line {line_num} in {file_path.name}: {e} | {line}",
+                        "DEBUG")
                     continue
-    
+
     except Exception as e:
         log(f"Error reading {file_path}: {e}", "ERROR")
-    
+
     return spots
 
 
+def band_str_to_meters(band_str: str) -> Optional[int]:
+    """Convert a band string to metres.  Handles numeric bands and named variants.
+
+    wsprdaemon uses the band directory name as the band identifier, e.g.:
+        '17'    -> 17  (17-metre band)
+        '60eu'  -> 60  (European 60m allocation, treated as 60m)
+        '80eu'  -> 80
+    Returns None for unrecognised strings.
+    """
+    # Strip trailing non-numeric suffix (e.g. '60eu' -> '60')
+    m = re.match(r'^(\d+)', band_str)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def decode_rx_site_dir(rx_site_dir: str) -> Tuple[str, str]:
+    """Decode a RX_SITE directory name into (rx_sign, rx_grid).
+
+    wsprdaemon encodes the callsign/grid as:
+        CALLSIGN=SUFFIX_GRID   e.g.  AC0G=ND_EN16ov
+    where '=' replaces '/' in the callsign and '_GRID' is appended.
+
+    Returns (rx_sign, rx_grid).  If the format is not recognised both
+    values default to the raw directory string / empty string.
+    """
+    # Split off the grid: last '_XXXXXX' segment (4–6 char Maidenhead)
+    m = re.match(r'^(.+)_([A-Ra-r]{2}[0-9]{2}[A-Xa-x]{0,2})$', rx_site_dir)
+    if m:
+        sign_part = m.group(1).replace('=', '/')
+        grid_part = m.group(2)
+        return sign_part, grid_part
+    # Fallback: no recognisable grid suffix
+    return rx_site_dir.replace('=', '/'), ''
+
+
 def process_spot_files(extraction_dir: Path, client_version: Optional[str],
-                      client, database: str, table: str) -> List[Dict]:
-    """Process all wsprd output files and return combined spot records"""
+                       client, database: str, table: str) -> List[Dict]:
+    """Process all spot files inside an extracted tbz and return spot records.
+
+    Expected directory structure inside the tbz:
+        wsprdaemon/spots/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_spots.txt
+
+    rx_sign and rx_loc come directly from the parsed spot line (fields 22 and 21).
+    The directory-decoded values are used only as a fallback when those fields
+    are absent or empty.
+    """
     all_spots = []
-    
-    # Find all wsprd output files
-    wsprd_files = list(extraction_dir.glob('*.txt'))
-    wsprd_files = [f for f in wsprd_files if f.name != 'uploads_config.txt']
-    
-    if not wsprd_files:
-        log("No wsprd output files found", "DEBUG")
+
+    spots_root = extraction_dir / 'wsprdaemon' / 'spots'
+    if not spots_root.exists():
+        log("No spots directory found in tbz", "DEBUG")
         return []
-    
-    log(f"Processing {len(wsprd_files)} wsprd output files", "DEBUG")
-    
+
+    wsprd_files = list(spots_root.rglob('*_spots.txt'))
+    if not wsprd_files:
+        log("No spot files found", "DEBUG")
+        return []
+
+    log(f"Processing {len(wsprd_files)} spot files", "DEBUG")
+
     for wsprd_file in wsprd_files:
-        # Extract rx_id and band from filename
-        # Format: RX_ID,BAND_wsprd.txt or similar
-        match = re.match(r'([^,]+),(\d+)_wsprd\.txt', wsprd_file.name)
-        if not match:
-            log(f"Skipping file with unexpected name: {wsprd_file.name}", "WARNING")
+        # Path: spots_root / RX_SITE / RECEIVER / BAND / YYMMDD_HHMM_spots.txt
+        rel_parts = wsprd_file.relative_to(spots_root).parts
+        if len(rel_parts) < 4:
+            log(f"Skipping spot file with unexpected path depth: {wsprd_file}", "WARNING")
             continue
-        
-        rx_id = match.group(1)
-        band = int(match.group(2))
-        
-        # Parse the file
+
+        rx_site_dir = rel_parts[0]   # e.g. AC0G=ND_EN16ov
+        rx_id       = rel_parts[1]   # e.g. KA9Q_DXE
+        band_str    = rel_parts[2]   # e.g. '17', '60eu'
+
+        band = band_str_to_meters(band_str)
+        if band is None:
+            log(f"Skipping spot file with unrecognised band '{band_str}': {wsprd_file}",
+                "WARNING")
+            continue
+
+        # Decode directory-based identity (fallback values)
+        rx_sign_dir, rx_grid_dir = decode_rx_site_dir(rx_site_dir)
+
         spots = parse_wsprd_output(wsprd_file, client_version)
-        
-        # Get receiver info from ClickHouse (rx_sign, rx_loc, rx_lat, rx_lon)
-        try:
-            result = client.query(f"""
-                SELECT rx_sign, rx_loc, rx_lat, rx_lon
-                FROM {database}.{table}
-                WHERE rx_id = '{rx_id}'
-                ORDER BY time DESC
-                LIMIT 1
-            """)
-            
-            if result.result_rows:
-                rx_sign, rx_loc, rx_lat, rx_lon = result.result_rows[0]
-            else:
-                # Fallback: use rx_id as rx_sign if not found
-                rx_sign = rx_id
-                rx_loc = ''
-                rx_lat = 0.0
-                rx_lon = 0.0
-                log(f"No receiver info found for {rx_id}, using rx_id as rx_sign", "DEBUG")
-        except Exception as e:
-            log(f"Error getting receiver info for {rx_id}: {e}", "DEBUG")
-            rx_sign = rx_id
-            rx_loc = ''
-            rx_lat = 0.0
-            rx_lon = 0.0
-        
-        # Add rx_id, band, and receiver info to each spot
+
         for spot in spots:
-            spot['rx_id'] = rx_id
-            spot['band'] = band
-            spot['rx_sign'] = rx_sign
-            spot['rx_loc'] = rx_loc
-            spot['rx_lat'] = rx_lat
-            spot['rx_lon'] = rx_lon
-        
+            spot['rx_id']  = rx_id
+            spot['band']   = band
+            # rx_sign_file (field 22) is the authoritative callsign written by decoding.sh
+            spot['rx_sign'] = spot.pop('rx_sign_file', None) or rx_sign_dir
+            # rx_loc (field 21) is already in spot; use dir value only if blank
+            if not spot.get('rx_loc'):
+                spot['rx_loc'] = rx_grid_dir
+
         all_spots.extend(spots)
-    
+
     log(f"Processed {len(all_spots)} total spots", "DEBUG")
     return all_spots
 
 
 def convert_spot_to_clickhouse(spot: Dict) -> Dict:
-    """Convert a spot record to ClickHouse format"""
-    # Parse date/time
-    date_str = spot['date']  # YYMMDD
-    time_str = spot['time']  # HHMM
-    
-    # Convert YYMMDD to YYYY-MM-DD
-    year = 2000 + int(date_str[0:2])
-    month = int(date_str[2:4])
-    day = int(date_str[4:6])
-    hour = int(time_str[0:2])
+    """Convert a parsed spot record to a ClickHouse insert dict."""
+    date_str = spot['date']   # YYMMDD
+    time_str = spot['time']   # HHMM
+
+    year   = 2000 + int(date_str[0:2])
+    month  = int(date_str[2:4])
+    day    = int(date_str[4:6])
+    hour   = int(time_str[0:2])
     minute = int(time_str[2:4])
-    
     timestamp = datetime(year, month, day, hour, minute)
-    
-    # Convert frequency to MHz
-    freq_hz = spot['freq_hz']
+
+    freq_hz  = spot['freq_hz']
     freq_mhz = freq_hz / 1_000_000.0
-    
-    # Build ClickHouse record
+
     ch_record = {
-        'time': timestamp,
-        'band': spot['band'],
-        'rx_sign': spot['rx_sign'],
-        'rx_lat': spot['rx_lat'],
-        'rx_lon': spot['rx_lon'],
-        'rx_loc': spot['rx_loc'],
-        'tx_sign': spot['callsign'],
-        'tx_loc': spot['grid'],
-        'distance': spot['distance'],
-        'frequency': int(freq_hz),
+        'time':          timestamp,
+        'band':          spot['band'],          # metres, e.g. 17
+        'rx_sign':       spot['rx_sign'],
+        'rx_lat':        spot.get('rx_lat', 0.0),
+        'rx_lon':        spot.get('rx_lon', 0.0),
+        'rx_loc':        spot.get('rx_loc', ''),
+        'tx_sign':       spot['tx_sign'],
+        'tx_loc':        spot.get('tx_loc', ''),
+        'tx_lat':        spot.get('tx_lat', 0.0),
+        'tx_lon':        spot.get('tx_lon', 0.0),
+        'distance':      spot.get('distance', 0),
+        'azimuth':       spot.get('azimuth', 0.0),
+        'rx_azimuth':    spot.get('rx_azimuth', 0.0),
+        'frequency':     int(freq_hz),
         'frequency_mhz': freq_mhz,
-        'power': spot['power_dbm'],
-        'snr': spot['snr'],
-        'drift': spot['drift'],
-        'rx_id': spot['rx_id'],
-        'dt': spot['dt'],
+        'power':         spot['power_dbm'],
+        'snr':           spot['snr'],
+        'drift':         spot.get('drift', 0),
+        'rx_id':         spot['rx_id'],
+        'dt':            spot['dt'],
+        'sync_quality':  spot.get('sync_quality', 0.0),
+        'decode_cycles': spot.get('decode_cycles', 0),
+        'jitter':        spot.get('jitter', 0),
+        'blocksize':     spot.get('blocksize', 0),
+        'metric':        spot.get('metric', 0),
+        'osd_decode':    spot.get('osd_decode', 0),
+        'nhardmin':      spot.get('nhardmin', 0),
+        'ipass':         spot.get('ipass', 0),
+        'code':          spot.get('code', 0),
+        'rms_noise':     spot.get('rms_noise', 0.0),
+        'c2_noise':      spot.get('c2_noise', 0.0),
+        'v_lat':         spot.get('v_lat', 0.0),
+        'v_lon':         spot.get('v_lon', 0.0),
+        'ov_count':      spot.get('ov_count', 0),
+        'proxy_upload':  spot.get('proxy_upload', 0),
+        'band_m':        spot.get('band_m', spot.get('band', 0)),
+        'version':       spot.get('client_version', None),
+        'rx_status':     'No Info',
     }
-    
-    # Add extended fields if present
-    if 'azimuth' in spot:
-        ch_record['azimuth'] = spot['azimuth']
-    if 'c2_noise' in spot:
-        ch_record['c2_noise'] = spot['c2_noise']
-    if 'jitter' in spot:
-        ch_record['jitter'] = spot['jitter']
-    if 'blocksize' in spot:
-        ch_record['blocksize'] = spot['blocksize']
-    if 'sync_quality' in spot:
-        ch_record['sync_quality'] = spot['sync_quality']
-    if 'decode_cycles' in spot:
-        ch_record['decode_cycles'] = spot['decode_cycles']
-    if 'rms_noise' in spot:
-        ch_record['rms_noise'] = spot['rms_noise']
-    if 'ov_count' in spot:
-        ch_record['ov_count'] = spot['ov_count']
-    if 'metric' in spot:
-        ch_record['metric'] = spot['metric']
-    if 'osd_decode' in spot:
-        ch_record['osd_decode'] = spot['osd_decode']
-    if 'nhardmin' in spot:
-        ch_record['nhardmin'] = spot['nhardmin']
-    if 'ipass' in spot:
-        ch_record['ipass'] = spot['ipass']
-    if 'client_version' in spot:
-        ch_record['version'] = spot['client_version']
-    
+
     return ch_record
 
 
-def insert_spots(client, spots: List[Dict], database: str, table: str, 
+def insert_spots(client, spots: List[Dict], database: str, table: str,
                 max_per_insert: int = 50000) -> bool:
     """Insert spots into ClickHouse in batches"""
     if not spots:
         return True
-    
+
     try:
-        # Convert spots to ClickHouse format
         ch_records = [convert_spot_to_clickhouse(spot) for spot in spots]
-        
-        # Insert in batches
+        # Use column order from first record so clickhouse_connect receives
+        # a list-of-lists with explicit column_names rather than keying by int
+        column_names = list(ch_records[0].keys())
         total = len(ch_records)
         for i in range(0, total, max_per_insert):
             batch = ch_records[i:i+max_per_insert]
-            client.insert(f'{database}.{table}', batch)
+            data = [[row[col] for col in column_names] for row in batch]
+            client.insert(f'{database}.{table}', data, column_names=column_names)
             log(f"Inserted batch {i//max_per_insert + 1} ({len(batch)} spots)", "DEBUG")
-        
+
         return True
-        
+
     except Exception as e:
         log(f"Error inserting spots: {e}", "ERROR")
         import traceback
@@ -704,68 +761,109 @@ def insert_spots(client, spots: List[Dict], database: str, table: str,
 
 
 def process_noise_files(extraction_dir: Path, running_jobs: Optional[str],
-                       receiver_descriptions: Optional[str]) -> List[Dict]:
-    """Process noise files and return noise records"""
+                        receiver_descriptions: Optional[str]) -> List[Dict]:
+    """Process noise files inside an extracted tbz and return noise records.
+
+    Expected directory structure inside the tbz:
+        wsprdaemon/noise/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_noise.txt
+
+    File content (from noise-graphing.sh queue_noise_signal_levels_to_wsprdaemon):
+        A single line of exactly 15 space-separated values:
+          fields 0-12  : 13 sox dB measurement floats (3 windows × 4 stats + min RMS)
+          field  13    : rms_level  — sox RMS noise after calibration (Float32 dBm)
+          field  14    : c2_level   — C2/FFT noise after calibration  (Float32 dBm)
+          field  15    : ov         — A/D overload count              (Int32)
+
+    Wait — decoding.sh line 2414 builds:
+        sox_signals_rms_fft_and_overload_info = "${rms_line} ${fft_noise_level_float} ${new_sdr_overloads_count}"
+    where rms_line itself is 13 values (12 sox dB values + the selected rms scalar).
+    Total = 13 + 1 + 1 = 15.  NOISE_LINE_FIELDS_COUNT = 15 confirms this.
+
+    So field indices (0-based):
+        [12]  rms_level  (the min-of-pre/post RMS Tr dB scalar, sox-calibrated)
+        [13]  c2_level   (fft_noise_level_float, C2-calibrated)
+        [14]  ov         (integer overload count)
+
+    Noise table schema columns: time, site, receiver, rx_loc, band (String), rms_level, c2_level, ov
+    """
     noise_records = []
-    
-    # Find all noise files
-    noise_files = list(extraction_dir.glob('*_noise.txt'))
-    
+
+    noise_root = extraction_dir / 'wsprdaemon' / 'noise'
+    if not noise_root.exists():
+        log("No noise directory found in tbz", "DEBUG")
+        return []
+
+    noise_files = list(noise_root.rglob('*_noise.txt'))
     if not noise_files:
         log("No noise files found", "DEBUG")
         return []
-    
+
     log(f"Processing {len(noise_files)} noise files", "DEBUG")
-    
+
     for noise_file in noise_files:
-        # Extract rx_id and band from filename
-        match = re.match(r'([^,]+),(\d+)_noise\.txt', noise_file.name)
-        if not match:
+        # Path: noise_root / RX_SITE / RECEIVER / BAND / YYMMDD_HHMM_noise.txt
+        rel_parts = noise_file.relative_to(noise_root).parts
+        if len(rel_parts) < 4:
+            log(f"Skipping noise file with unexpected path depth: {noise_file}", "WARNING")
+            continue
+
+        rx_site_dir = rel_parts[0]   # e.g. AC0G=ND_EN16ov
+        rx_id       = rel_parts[1]   # RECEIVER dir  -> maps to 'receiver' column
+        band_str    = rel_parts[2]   # e.g. '17', '60eu' -> stored as String in noise table
+
+        rx_sign_dir, rx_grid_dir = decode_rx_site_dir(rx_site_dir)
+
+        # Parse timestamp from filename: YYMMDD_HHMM_noise.txt
+        m = re.match(r'(\d{6})_(\d{4})_noise\.txt', noise_file.name)
+        if not m:
             log(f"Skipping noise file with unexpected name: {noise_file.name}", "WARNING")
             continue
-        
-        rx_id = match.group(1)
-        band = int(match.group(2))
-        
-        # Parse noise file
+
+        date_str = m.group(1)   # YYMMDD
+        time_str = m.group(2)   # HHMM
+        try:
+            year   = 2000 + int(date_str[0:2])
+            month  = int(date_str[2:4])
+            day    = int(date_str[4:6])
+            hour   = int(time_str[0:2])
+            minute = int(time_str[2:4])
+            timestamp = datetime(year, month, day, hour, minute)
+        except ValueError as e:
+            log(f"Skipping noise file with bad timestamp {noise_file.name}: {e}", "WARNING")
+            continue
+
+        # Parse the 15-field noise line
         try:
             with open(noise_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    
-                    parts = line.split()
-                    if len(parts) < 4:
-                        continue
-                    
-                    # Parse: YYMMDD HHMM freq_hz noise_level
-                    date_str = parts[0]  # YYMMDD
-                    time_str = parts[1]  # HHMM
-                    freq_hz = int(parts[2])
-                    noise_level = float(parts[3])
-                    
-                    # Convert date/time
-                    year = 2000 + int(date_str[0:2])
-                    month = int(date_str[2:4])
-                    day = int(date_str[4:6])
-                    hour = int(time_str[0:2])
-                    minute = int(time_str[2:4])
-                    
-                    timestamp = datetime(year, month, day, hour, minute)
-                    
-                    noise_records.append({
-                        'time': timestamp,
-                        'rx_id': rx_id,
-                        'band_m': band,
-                        'freq_hz': freq_hz,
-                        'noise_level': noise_level,
-                        'noise_count': 1  # Placeholder
-                    })
-        
+                content = f.read().strip()
+            if not content:
+                continue
+
+            fields = content.split()
+            if len(fields) != 15:
+                log(f"Skipping noise file with {len(fields)} fields "
+                    f"(expected 15): {noise_file.name}", "WARNING")
+                continue
+
+            rms_level = float(fields[12])
+            c2_level  = float(fields[13])
+            ov        = int(float(fields[14]))
+
+            noise_records.append({
+                'time':       timestamp,
+                'site':       rx_sign_dir,   # rx callsign  e.g. AC0G/ND
+                'receiver':   rx_id,         # rx device id e.g. KA9Q_DXE
+                'rx_loc':     rx_grid_dir,   # Maidenhead   e.g. EN16ov
+                'band':       band_str,      # String       e.g. '17', '60eu'
+                'rms_level':  rms_level,
+                'c2_level':   c2_level,
+                'ov':         ov,
+                # Optional metadata from uploads_config.txt
+            })
+
         except Exception as e:
-            log(f"Error processing noise file {noise_file.name}: {e}", "WARNING")
-    
+            log(f"Error processing noise file {noise_file}: {e}", "WARNING")
+
     log(f"Processed {len(noise_records)} noise records", "DEBUG")
     return noise_records
 
@@ -775,17 +873,18 @@ def insert_noise(client, noise_records: List[Dict], database: str, table: str,
     """Insert noise records into ClickHouse in batches"""
     if not noise_records:
         return True
-    
+
     try:
-        # Insert in batches
+        column_names = list(noise_records[0].keys())
         total = len(noise_records)
         for i in range(0, total, max_per_insert):
             batch = noise_records[i:i+max_per_insert]
-            client.insert(f'{database}.{table}', batch)
+            data = [[row[col] for col in column_names] for row in batch]
+            client.insert(f'{database}.{table}', data, column_names=column_names)
             log(f"Inserted noise batch {i//max_per_insert + 1} ({len(batch)} records)", "DEBUG")
-        
+
         return True
-        
+
     except Exception as e:
         log(f"Error inserting noise: {e}", "ERROR")
         import traceback
@@ -807,6 +906,12 @@ def main():
                        help='Increase verbosity (use -v for INFO, -vv for DEBUG)')
     parser.add_argument('--setup-system', action='store_true',
                        help='Set up system directories and tmpfiles.d (requires root)')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Parse tbz files but do not insert to database')
+    parser.add_argument('--spots-table', default=None,
+                       help='Override default spots table name')
+    parser.add_argument('--noise-table', default=None,
+                       help='Override default noise table name')
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
     
     args = parser.parse_args()
@@ -839,6 +944,17 @@ def main():
     config['clickhouse_user'] = args.clickhouse_user
     config['clickhouse_password'] = args.clickhouse_password
 
+    # Apply table name overrides
+    if args.spots_table:
+        config['clickhouse_spots_table'] = args.spots_table
+    if args.noise_table:
+        config['clickhouse_noise_table'] = args.noise_table
+
+    # Dry-run mode
+    config['dry_run'] = args.dry_run
+    if args.dry_run:
+        log("DRY RUN mode - no database inserts will be performed", "INFO")
+
     # Parse incoming directories from command line
     config['incoming_tbz_dirs'] = [d.strip() for d in args.incoming_dirs.split(',') if d.strip()]
     if not config['incoming_tbz_dirs']:
@@ -847,17 +963,17 @@ def main():
 
     log(f"Incoming directories: {config['incoming_tbz_dirs']}", "INFO")
 
-    # Always run setup to ensure database and tables exist
-    log("Running setup to ensure ClickHouse is configured...", "INFO")
-    success = setup_clickhouse_tables(
-        admin_user=args.clickhouse_user,
-        admin_password=args.clickhouse_password,
-        config=config
-    )
-
-    if not success:
-        log("Setup failed - cannot continue", "ERROR")
-        sys.exit(1)
+    # Run table setup (skip in dry-run mode)
+    if not config.get('dry_run'):
+        log("Running setup to ensure ClickHouse is configured...", "INFO")
+        success = setup_clickhouse_tables(
+            admin_user=args.clickhouse_user,
+            admin_password=args.clickhouse_password,
+            config=config
+        )
+        if not success:
+            log("Setup failed - cannot continue", "ERROR")
+            sys.exit(1)
 
     # Connect to ClickHouse
     try:
@@ -897,11 +1013,14 @@ def main():
 
         log(f"Found {len(tbz_files)} .tbz files", "INFO")
 
+        # Load processed set once — O(1) per file instead of O(n) disk reads
+        processed_set = load_processed_set(processed_file)
+
         # Filter out already processed files
-        unprocessed = [f for f in tbz_files if not is_tbz_processed(f, processed_file)]
-        
+        unprocessed = [f for f in tbz_files if not is_tbz_processed(f, processed_set)]
+
         # Clean up zombie files (exist on disk but already marked processed)
-        zombies = [f for f in tbz_files if is_tbz_processed(f, processed_file)]
+        zombies = [f for f in tbz_files if is_tbz_processed(f, processed_set)]
         if zombies:
             log(f"Found {len(zombies)} zombie files (marked processed but not deleted)", "INFO")
             for zombie in zombies:
@@ -948,51 +1067,53 @@ def main():
             else:
                 log("No CLIENT_VERSION found in uploads_config.txt", "DEBUG")
 
-            # Process spots with retry
-            spots = process_spot_files(extraction_dir, client_version, 
-                                      client, config['clickhouse_database'], 
+            # Process spots
+            spots = process_spot_files(extraction_dir, client_version,
+                                      client, config['clickhouse_database'],
                                       config['clickhouse_spots_table'])
-            if spots:
+            log(f"Parsed {len(spots)} spots from {tbz_file.name}", "INFO")
+            if spots and not config.get('dry_run'):
                 max_retries = 3
                 retry_delay = 2  # seconds
                 success = False
-                
+
                 for attempt in range(max_retries):
-                    if insert_spots(client, spots, config['clickhouse_database'], 
+                    if insert_spots(client, spots, config['clickhouse_database'],
                                   config['clickhouse_spots_table'], config['max_spots_per_insert']):
-                        log(f"Successfully processed {len(spots)} spots from {tbz_file.name}", "INFO")
+                        log(f"Inserted {len(spots)} spots from {tbz_file.name}", "INFO")
                         success = True
                         break
                     else:
                         if attempt < max_retries - 1:
                             log(f"Failed to insert spots from {tbz_file.name}, retrying in {retry_delay} seconds... (attempt {attempt+1}/{max_retries})", "WARNING")
                             time.sleep(retry_delay)
-                            retry_delay *= 2  # Exponential backoff
+                            retry_delay *= 2
                         else:
                             log(f"Failed to insert spots from {tbz_file.name} after {max_retries} attempts", "ERROR")
-                
+
                 if not success:
                     log(f"Skipping {tbz_file.name} - will retry on next cycle", "WARNING")
                     continue
 
-            # Process noise with retry
+            # Process noise
             noise_records = process_noise_files(extraction_dir, running_jobs, receiver_descriptions)
-            if noise_records:
+            log(f"Parsed {len(noise_records)} noise records from {tbz_file.name}", "INFO")
+            if noise_records and not config.get('dry_run'):
                 max_retries = 3
                 retry_delay = 2  # seconds
                 success = False
-                
+
                 for attempt in range(max_retries):
                     if insert_noise(client, noise_records, config['clickhouse_database'],
                                   config['clickhouse_noise_table'], config['max_noise_per_insert']):
-                        log(f"Successfully processed {len(noise_records)} noise records from {tbz_file.name}", "INFO")
+                        log(f"Inserted {len(noise_records)} noise records from {tbz_file.name}", "INFO")
                         success = True
                         break
                     else:
                         if attempt < max_retries - 1:
                             log(f"Failed to insert noise from {tbz_file.name}, retrying in {retry_delay} seconds... (attempt {attempt+1}/{max_retries})", "WARNING")
                             time.sleep(retry_delay)
-                            retry_delay *= 2  # Exponential backoff
+                            retry_delay *= 2
                         else:
                             log(f"Failed to insert noise from {tbz_file.name} after {max_retries} attempts", "ERROR")
                 
@@ -1000,15 +1121,14 @@ def main():
                     log(f"Skipping {tbz_file.name} - will retry on next cycle", "WARNING")
                     continue
 
-            # Mark as processed
-            mark_tbz_processed(tbz_file, processed_file, config['max_processed_file_size'])
-
-            # Delete source .tbz file
-            try:
-                tbz_file.unlink()
-                log(f"Deleted {tbz_file.name}", "INFO")
-            except Exception as e:
-                log(f"Failed to delete {tbz_file.name}: {e}", "WARNING")
+            # Mark as processed and delete source (skip in dry-run)
+            if not config.get('dry_run'):
+                mark_tbz_processed(tbz_file, processed_file, config['max_processed_file_size'])
+                try:
+                    tbz_file.unlink()
+                    log(f"Deleted {tbz_file.name}", "INFO")
+                except Exception as e:
+                    log(f"Failed to delete {tbz_file.name}: {e}", "WARNING")
 
         # Clean up extraction directory
         if extraction_dir.exists():
