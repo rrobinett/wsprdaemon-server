@@ -3,3 +3,5 @@ wd-register-clients.need-update
 save/
 __pycache__/
 files.zip
+*.log
+tar-bulk-loader-state.json
