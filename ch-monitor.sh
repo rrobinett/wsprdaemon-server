@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 CH_CONF="/etc/wsprdaemon/clickhouse.conf"
 STATE_FILE="/var/lib/wsprdaemon/ch-monitor-state.tsv"
 
@@ -69,7 +69,7 @@ state_get_rows() {
     local db="$1" tbl="$2"
     if [[ -f "$STATE_FILE" ]]; then
         awk -F'\t' -v db="$db" -v tbl="$tbl" \
-            '$1==db && $2==tbl {print $3; exit} END{if(NR==0||!found) print -1}' \
+            '$1==db && $2==tbl {print $3; found=1; exit} END{if(!found) print -1}' \
             "$STATE_FILE"
     else
         echo -1
@@ -80,7 +80,7 @@ state_get_time() {
     local db="$1" tbl="$2"
     if [[ -f "$STATE_FILE" ]]; then
         awk -F'\t' -v db="$db" -v tbl="$tbl" \
-            '$1==db && $2==tbl {print $4; exit}' \
+            '$1==db && $2==tbl {print $4; found=1; exit} END{if(!found) print 0}' \
             "$STATE_FILE"
     else
         echo 0
