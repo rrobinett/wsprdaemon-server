@@ -1,244 +1,283 @@
 #!/bin/bash
-# ch-backup-all.sh - Backup all ClickHouse tables to a date-named directory
-# Default format: Native+gzip (smaller, better for network transfer)
-# Native BACKUP format: --native (faster restore, larger files)
-# Default destination: /srv/wd_archive/ch-archives/
-# Override destination: --dest /mnt/ch_archive
-# Large tables (> LARGE_TABLE_GB) are backed up one at a time sequentially.
-# Small tables are backed up in parallel (up to MAX_PARALLEL at once).
-# Version: 3.2.0
+#
+# ch-backup-all.sh - Backup all ClickHouse user tables to dated archive directory
+# Version: 1.2.0
+#
+# Modes:
+#   --local  [base_dir]   Fast uncompressed native format for local HD
+#                         Default: /srv/ch_archive/ch-backups
+#   --offsite [base_dir]  pigz-compressed native.gz for offsite HD
+#                         Default: /mnt/offsite/ch-backups
+#   --status [backup_dir] Show progress of running/completed backup
+#
+# Usage:
+#   ch-backup-all.sh --local                   Nightly local backup
+#   ch-backup-all.sh --offsite /mnt/usb1       Offsite backup to USB drive
+#   ch-backup-all.sh --status                  Check most recent backup progress
+#   ch-backup-all.sh --status /path/to/backup  Check specific backup progress
+#
 
-CH_USER="chadmin"
-CH_PASS="ch2025wd"
-CH_OS_USER="clickhouse"
-DEFAULT_DEST="/srv/wd_archive"
-BACKUP_FORMAT="gzip"
-LARGE_TABLE_GB=20      # tables larger than this run sequentially
-MAX_PARALLEL=4         # max concurrent jobs for small tables
+set -euo pipefail
 
-# --- Parse arguments ---
-DEST_MOUNT=""
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --dest)
-            DEST_MOUNT="$2"
-            shift 2
-            ;;
-        --native)
-            BACKUP_FORMAT="native"
-            shift
-            ;;
-        --parallel)
-            MAX_PARALLEL="$2"
-            shift 2
-            ;;
-        --large-threshold)
-            LARGE_TABLE_GB="$2"
-            shift 2
-            ;;
-        --help|-h)
-            echo "Usage: $0 [--dest <mount_point>] [--native] [--parallel N] [--large-threshold GB]"
-            echo ""
-            echo "  --dest PATH           Backup destination mount point (default: $DEFAULT_DEST)"
-            echo "  --native              Use ClickHouse native BACKUP format instead of Native+gzip"
-            echo "  --parallel N          Max concurrent jobs for small tables (default: $MAX_PARALLEL)"
-            echo "  --large-threshold GB  Tables larger than this run sequentially (default: ${LARGE_TABLE_GB}GB)"
-            echo ""
-            echo "Examples:"
-            echo "  $0                              # gzip backup to $DEFAULT_DEST"
-            echo "  $0 --dest /mnt/ch_archive1      # gzip backup to secondary drive"
-            echo "  $0 --native --dest /mnt/ch_archive1"
-            exit 0
-            ;;
-        *)
-            echo "ERROR: Unknown argument: $1"
-            echo "Usage: $0 [--dest <mount_point>] [--native] [--parallel N]"
-            exit 1
-            ;;
-    esac
-done
+VERSION="1.2.0"
+CH_CONF="/etc/wsprdaemon/clickhouse.conf"
+STATE_FILE_NAME="backup-state.tsv"
 
-DEST_MOUNT="${DEST_MOUNT:-$DEFAULT_DEST}"
+DEFAULT_LOCAL_BASE="/srv/ch_archive/ch-backups"
+DEFAULT_OFFSITE_BASE="/mnt/offsite/ch-backups"
 
-# --- Validate destination is a real mount point ---
-if ! mountpoint -q "$DEST_MOUNT"; then
-    echo "ERROR: '$DEST_MOUNT' is not a mounted filesystem."
-    echo ""
-    echo "Currently mounted drives:"
-    df -h | grep -E '^/dev/'
+STATUS_SEARCH_PATHS=(
+    /srv/ch_archive/ch-backups
+    /mnt/wd_archive1/ch-archives
+    /srv/wd_archive/ch-archives
+    /mnt/offsite/ch-backups
+)
+
+if [[ ! -f "$CH_CONF" ]]; then
+    echo "ERROR: ClickHouse config not found: $CH_CONF" >&2
     exit 1
 fi
+source "$CH_CONF"
+CH_USER="${CLICKHOUSE_ROOT_ADMIN_USER}"
+CH_PASS="${CLICKHOUSE_ROOT_ADMIN_PASSWORD}"
 
-# --- Check available space ---
-AVAIL_GB=$(df -BG "$DEST_MOUNT" | awk 'NR==2 {gsub("G",""); print $4}')
-echo "Destination:       $DEST_MOUNT"
-echo "Available space:   ${AVAIL_GB}GB"
-echo "Backup format:     ${BACKUP_FORMAT}"
-echo "Large table cutoff: ${LARGE_TABLE_GB}GB (sequential)"
-echo "Small table jobs:  up to ${MAX_PARALLEL} parallel"
-if [[ "$AVAIL_GB" -lt 100 ]]; then
-    echo "WARNING: Less than 100GB available on $DEST_MOUNT"
-fi
+ch_query() {
+    clickhouse-client --user "$CH_USER" --password "$CH_PASS" \
+        --max_execution_time 0 --receive_timeout 604800 \
+        --query "$1"
+}
 
-# --- Set up backup directory ---
-BACKUP_BASE="${DEST_MOUNT}/ch-archives"
-DATE_DIR=$(date +%Y-%m-%d_%H%M%S)
-BACKUP_DIR="${BACKUP_BASE}/${DATE_DIR}"
-
-if [[ "$BACKUP_FORMAT" == "native" ]]; then
-    sudo mkdir -p "$BACKUP_DIR" || { echo "ERROR: Cannot create $BACKUP_DIR"; exit 1; }
-    sudo chown -R ${CH_OS_USER}:${CH_OS_USER} "$BACKUP_DIR"
-else
-    mkdir -p "$BACKUP_DIR" || { echo "ERROR: Cannot create $BACKUP_DIR"; exit 1; }
-fi
-
-echo "Backup directory:  $BACKUP_DIR"
-echo "Started:           $(date)"
-echo ""
-
-# --- Get all tables with sizes in bytes for sorting ---
-# Columns: database, name, total_rows, human_size, bytes
-TABLES=$(clickhouse-client --user "$CH_USER" --password "$CH_PASS" --query "
-    SELECT database, name, total_rows, formatReadableSize(total_bytes), total_bytes
-    FROM system.tables
-    WHERE database NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA', 'TEMPORARY')
-    AND engine NOT LIKE '%View%'
-    AND engine NOT LIKE '%Distributed%'
-    AND engine NOT IN ('Memory', 'Log', 'TinyLog')
-    ORDER BY total_bytes DESC
-    FORMAT TSV")
-
-if [[ -z "$TABLES" ]]; then
-    echo "ERROR: No tables found or cannot connect to ClickHouse."
-    exit 1
-fi
-
-# Split into large (sequential) and small (parallel) lists
-LARGE_THRESHOLD_BYTES=$(( LARGE_TABLE_GB * 1024 * 1024 * 1024 ))
-LARGE_TABLES=()
-SMALL_TABLES=()
-while IFS=$'\t' read -r db tbl rows size bytes; do
-    if [[ "$bytes" -gt "$LARGE_THRESHOLD_BYTES" ]]; then
-        LARGE_TABLES+=("${db}|${tbl}|${rows}|${size}")
-    else
-        SMALL_TABLES+=("${db}|${tbl}|${rows}|${size}")
-    fi
-done <<< "$TABLES"
-
-TABLE_COUNT=$(echo "$TABLES" | wc -l)
-echo "Tables to back up: $TABLE_COUNT  (${#LARGE_TABLES[@]} large sequential, ${#SMALL_TABLES[@]} small parallel)"
-echo ""
-
-# --- Helper: back up one table, print result ---
-FAILED_TABLES=()
-
-backup_one() {
-    local db="$1"
-    local tbl="$2"
-    local full_table="${db}.${tbl}"
-
-    if [[ "$BACKUP_FORMAT" == "native" ]]; then
-        sudo mkdir -p "$BACKUP_DIR/$db"
-        sudo chown ${CH_OS_USER}:${CH_OS_USER} "$BACKUP_DIR/$db"
-        clickhouse-client --user "$CH_USER" --password "$CH_PASS" \
-            --query "BACKUP TABLE ${full_table} TO File('${BACKUP_DIR}/${db}/${tbl}/')" \
-            > /dev/null 2>&1
-    else
-        mkdir -p "$BACKUP_DIR/$db"
-        clickhouse-client --user "$CH_USER" --password "$CH_PASS" \
-            --query "SELECT * FROM ${full_table} FORMAT Native" | \
-            gzip -1 > "${BACKUP_DIR}/${db}/${tbl}.native.gz"
+human_bytes() {
+    local bytes="$1"
+    if   (( bytes >= 1073741824 )); then printf "%.1f GB" "$(echo "scale=1; $bytes/1073741824" | bc)"
+    elif (( bytes >= 1048576 ));    then printf "%.1f MB" "$(echo "scale=1; $bytes/1048576"    | bc)"
+    elif (( bytes >= 1024 ));       then printf "%.1f KB" "$(echo "scale=1; $bytes/1024"       | bc)"
+    else printf "%d B" "$bytes"
     fi
 }
 
-report_result() {
-    local status="$1"
-    local db="$2"
-    local tbl="$3"
-    local full_table="${db}.${tbl}"
-    local backup_size
+cmd_status() {
+    local archive_dir="${1:-}"
 
-    if [[ "$BACKUP_FORMAT" == "native" ]]; then
-        backup_size=$(du -sh "$BACKUP_DIR/$db/$tbl" 2>/dev/null | cut -f1)
-    else
-        backup_size=$(du -sh "$BACKUP_DIR/$db/${tbl}.native.gz" 2>/dev/null | cut -f1)
-    fi
-
-    if [[ $status -eq 0 ]]; then
-        printf "OK:   %-50s (%s)\n" "$full_table" "$backup_size"
-    else
-        printf "FAIL: %-50s\n" "$full_table"
-        FAILED_TABLES+=("$full_table")
-    fi
-}
-
-# --- Phase 1: Large tables, one at a time ---
-if [[ ${#LARGE_TABLES[@]} -gt 0 ]]; then
-    echo "=== Phase 1: Large tables (sequential) ==="
-    for entry in "${LARGE_TABLES[@]}"; do
-        IFS='|' read -r db tbl rows size <<< "$entry"
-        echo "Backing up: ${db}.${tbl}  (${rows} rows, ${size})"
-        backup_one "$db" "$tbl"
-        report_result $? "$db" "$tbl"
-    done
-    echo ""
-fi
-
-# --- Phase 2: Small tables, in parallel ---
-if [[ ${#SMALL_TABLES[@]} -gt 0 ]]; then
-    echo "=== Phase 2: Small tables (parallel, max ${MAX_PARALLEL}) ==="
-    declare -A PIDS
-    declare -A JOB_DB
-    declare -A JOB_TBL
-    ACTIVE=0
-    idx=0
-
-    while [[ $idx -lt ${#SMALL_TABLES[@]} || $ACTIVE -gt 0 ]]; do
-        # Launch jobs up to MAX_PARALLEL
-        while [[ $idx -lt ${#SMALL_TABLES[@]} && $ACTIVE -lt $MAX_PARALLEL ]]; do
-            IFS='|' read -r db tbl rows size <<< "${SMALL_TABLES[$idx]}"
-            echo "Starting: ${db}.${tbl}  (${rows} rows, ${size})"
-            backup_one "$db" "$tbl" &
-            pid=$!
-            PIDS[$idx]=$pid
-            JOB_DB[$idx]=$db
-            JOB_TBL[$idx]=$tbl
-            ACTIVE=$((ACTIVE + 1))
-            idx=$((idx + 1))
-        done
-
-        # Reap one completed job
-        for job_idx in "${!PIDS[@]}"; do
-            pid=${PIDS[$job_idx]}
-            if ! kill -0 "$pid" 2>/dev/null; then
-                wait "$pid"
-                status=$?
-                report_result $status "${JOB_DB[$job_idx]}" "${JOB_TBL[$job_idx]}"
-                unset PIDS[$job_idx]
-                ACTIVE=$((ACTIVE - 1))
-                break
+    if [[ -z "$archive_dir" ]]; then
+        for base in "${STATUS_SEARCH_PATHS[@]}"; do
+            if [[ -d "$base" ]]; then
+                local candidate
+                candidate=$(ls -1td "${base}"/20* 2>/dev/null | head -1)
+                if [[ -n "$candidate" && -f "${candidate}/${STATE_FILE_NAME}" ]]; then
+                    archive_dir="$candidate"
+                    break
+                fi
             fi
         done
-        sleep 0.5
-    done
+    fi
+
+    if [[ -z "$archive_dir" || ! -d "$archive_dir" ]]; then
+        echo "ERROR: No backup directory found. Pass path as argument." >&2
+        exit 1
+    fi
+
+    local state_file="${archive_dir}/${STATE_FILE_NAME}"
+    if [[ ! -f "$state_file" ]]; then
+        echo "ERROR: No state file found in ${archive_dir}" >&2
+        exit 1
+    fi
+
+    local mode
+    mode=$(grep "^#mode:" "$state_file" | cut -d: -f2 || echo "unknown")
+
+    echo "========================================================"
+    echo "  Backup Status: $(basename "$archive_dir")"
+    echo "  Directory:     $archive_dir"
+    echo "  Mode:          ${mode}"
+    echo "  Time now:      $(date -u)"
+    echo "========================================================"
     echo ""
-fi
 
-# --- Summary ---
-FAILED=${#FAILED_TABLES[@]}
-echo "Completed:  $(date)"
-echo "Backup dir: $BACKUP_DIR"
-TOTAL=$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1)
-echo "Total size: $TOTAL"
-echo ""
+    local total=0 done_count=0 running=0 pending=0
+    local total_expected_bytes=0 total_written_bytes=0
 
-if [[ $FAILED -eq 0 ]]; then
-    echo "All ${TABLE_COUNT} tables backed up successfully"
-    exit 0
-else
-    echo "WARNING: $FAILED of ${TABLE_COUNT} table(s) failed:"
-    for t in "${FAILED_TABLES[@]}"; do
-        echo "  $t"
+    printf "  %-42s  %10s  %10s  %6s  %s\n" "TABLE" "EXPECTED" "WRITTEN" "PCT" "STATUS"
+    printf "  %-42s  %10s  %10s  %6s  %s\n" "-----" "--------" "-------" "---" "------"
+
+    while IFS=$'\t' read -r db tbl expected_rows expected_bytes; do
+        [[ "$db" == \#* ]] && continue
+        total=$(( total + 1 ))
+        total_expected_bytes=$(( total_expected_bytes + expected_bytes ))
+
+        local outfile_gz="${archive_dir}/${db}.${tbl}.native.gz"
+        local outfile_native="${archive_dir}/${db}.${tbl}.native"
+        local outfile status written_bytes pct
+
+        if [[ -f "$outfile_gz" ]]; then
+            outfile="$outfile_gz"
+        elif [[ -f "$outfile_native" ]]; then
+            outfile="$outfile_native"
+        else
+            outfile=""
+        fi
+
+        if [[ -n "$outfile" ]]; then
+            written_bytes=$(stat -c%s "$outfile" 2>/dev/null || echo 0)
+            total_written_bytes=$(( total_written_bytes + written_bytes ))
+            if lsof "$outfile" 2>/dev/null | grep -qE "pigz|clickhouse"; then
+                status="RUNNING"
+                running=$(( running + 1 ))
+            else
+                status="DONE"
+                done_count=$(( done_count + 1 ))
+            fi
+            if (( expected_bytes > 0 )); then
+                pct=$(awk "BEGIN{printf \"%.0f%%\", 100*${written_bytes}/${expected_bytes}}")
+            else
+                pct="?"
+            fi
+        else
+            written_bytes=0
+            status="PENDING"
+            pct="0%"
+            pending=$(( pending + 1 ))
+        fi
+
+        printf "  %-42s  %10s  %10s  %6s  %s\n" \
+               "${db}.${tbl}" \
+               "$(human_bytes "$expected_bytes")" \
+               "$(human_bytes "$written_bytes")" \
+               "$pct" "$status"
+
+    done < "$state_file"
+
+    echo ""
+    echo "  Summary: ${done_count} done / ${running} running / ${pending} pending / ${total} total"
+    echo "  Written: $(human_bytes "$total_written_bytes") of $(human_bytes "$total_expected_bytes")"
+    if (( total_expected_bytes > 0 )); then
+        local overall_pct
+        overall_pct=$(awk "BEGIN{printf \"%.1f%%\", 100*${total_written_bytes}/${total_expected_bytes}}")
+        echo "  Overall: ${overall_pct} complete"
+    fi
+    echo "  Dir size: $(du -sh "$archive_dir" 2>/dev/null | cut -f1)"
+    echo "========================================================"
+}
+
+run_backup() {
+    local backup_dir="$1"
+    local compress="$2"   # "yes" or "no"
+    local mode="$3"
+
+    mkdir -p "$backup_dir"
+    echo "Mode:             $mode ($([ "$compress" = yes ] && echo "pigz compressed" || echo "uncompressed native"))"
+    echo "Backup directory: $backup_dir"
+    echo "Started:          $(date -u)"
+    echo ""
+
+    local tables
+    tables=$(ch_query "
+        SELECT database, name, total_rows, total_bytes
+        FROM system.tables
+        WHERE database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+          AND engine NOT LIKE '%View%'
+        ORDER BY total_bytes DESC
+        FORMAT TSV")
+
+    { echo "#mode:${mode}"; echo "$tables"; } > "${backup_dir}/${STATE_FILE_NAME}"
+
+    local pids=()
+    declare -A table_pids
+
+    while IFS=$'\t' read -r db tbl rows bytes; do
+        local size
+        size=$(human_bytes "${bytes:-0}")
+        echo "Starting: ${db}.${tbl}  (${rows} rows, ${size})"
+
+        ch_query "SHOW CREATE TABLE ${db}.${tbl}" \
+            > "${backup_dir}/${db}.${tbl}.schema.sql"
+
+        if [[ "$compress" == "yes" ]]; then
+            clickhouse-client --user "$CH_USER" --password "$CH_PASS" \
+                --max_execution_time 0 --receive_timeout 604800 \
+                --query "SELECT * FROM ${db}.${tbl} FORMAT Native" \
+                | pigz > "${backup_dir}/${db}.${tbl}.native.gz" &
+        else
+            clickhouse-client --user "$CH_USER" --password "$CH_PASS" \
+                --max_execution_time 0 --receive_timeout 604800 \
+                --query "SELECT * FROM ${db}.${tbl} FORMAT Native" \
+                > "${backup_dir}/${db}.${tbl}.native" &
+        fi
+
+        local pid=$!
+        pids+=($pid)
+        table_pids[$pid]="${db}.${tbl}"
+        echo "  PID $pid"
+    done <<< "$tables"
+
+    echo ""
+    echo "All ${#pids[@]} backup jobs running."
+    echo "Monitor with: $0 --status $backup_dir"
+    echo "Waiting for completion..."
+    echo ""
+
+    local failed=0
+    for pid in "${pids[@]}"; do
+        local tbl="${table_pids[$pid]}"
+        if wait "$pid"; then
+            local f sz
+            f=$(ls "${backup_dir}/${tbl}.native.gz" "${backup_dir}/${tbl}.native" 2>/dev/null | head -1)
+            sz=$(ls -lh "$f" 2>/dev/null | awk '{print $5}')
+            echo "OK:   ${tbl}  (${sz})"
+        else
+            echo "FAIL: ${tbl}"
+            failed=$(( failed + 1 ))
+        fi
     done
-    exit 1
-fi
+
+    echo ""
+    echo "Completed: $(date -u)"
+    echo "Backup dir: $backup_dir"
+    echo "Total size: $(du -sh "$backup_dir" | cut -f1)"
+    if (( failed > 0 )); then
+        echo "FAILURES: $failed tables failed"
+        exit 1
+    fi
+    echo "All tables backed up successfully"
+}
+
+usage() {
+    echo "ch-backup-all.sh v${VERSION}"
+    echo ""
+    echo "Usage:"
+    echo "  $0 --local   [base_dir]    Uncompressed backup to local HD"
+    echo "                              Default: ${DEFAULT_LOCAL_BASE}"
+    echo "  $0 --offsite [base_dir]    pigz-compressed backup for offsite HD"
+    echo "                              Default: ${DEFAULT_OFFSITE_BASE}"
+    echo "  $0 --status  [backup_dir]  Show progress (auto-finds most recent)"
+    echo "  $0 --version"
+}
+
+CMD="${1:-}"
+shift || true
+
+case "$CMD" in
+    --local)
+        BASE="${1:-$DEFAULT_LOCAL_BASE}"
+        run_backup "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "no" "local"
+        ;;
+    --offsite)
+        BASE="${1:-$DEFAULT_OFFSITE_BASE}"
+        run_backup "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "yes" "offsite"
+        ;;
+    --status)
+        cmd_status "${1:-}"
+        ;;
+    --version)
+        echo "ch-backup-all.sh v${VERSION}"
+        ;;
+    --help|-h|"")
+        usage
+        ;;
+    *)
+        echo "ERROR: Unknown command: $CMD"
+        echo ""
+        usage
+        exit 1
+        ;;
+esac
