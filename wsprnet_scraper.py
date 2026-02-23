@@ -2,7 +2,9 @@
 """
 WSPRNET Scraper - Simple Always-Cache Architecture
 - Download thread: Always saves JSON to cache
-- Insert thread: Processes cached files in order
+- Insert thread: Processes cached files in order with retry on failure
+- Target table: wspr.rx (supports PREWHERE for time-based queries)
+- Automatic retry with exponential backoff for failed inserts
 No complex gap logic, just save everything and process in order.
 """
 import argparse
@@ -31,7 +33,7 @@ import threading
 import glob
 
 # Version
-VERSION = "2.4.0"  # Fixed Maidenhead grid conversion: 'll' subsquare for 4-char, no double-centering for 6-char
+VERSION = "2.5.1"  # Changed to wspr.rx table, added retry tracking with exponential backoff
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -41,8 +43,8 @@ DEFAULT_CONFIG = {
     'clickhouse_port': 8123,
     'clickhouse_user': '',
     'clickhouse_password': '',
-    'clickhouse_database': 'wsprnet',
-    'clickhouse_table': 'spots',
+    'clickhouse_database': 'wspr',
+    'clickhouse_table': 'rx',
     'wsprnet_url': 'http://www.wsprnet.org/drupal/wsprnet/spots/json',
     'wsprnet_login_url': 'http://www.wsprnet.org/drupal/rest/user/login',
     'band': 'All',
@@ -519,12 +521,22 @@ def process_spot(spot: Dict) -> Optional[tuple]:
 
 
 def insert_cached_file(client, cache_file: Path, database: str, table: str) -> bool:
-    """Process and insert a cached file"""
+    """Process and insert a cached file with retry tracking"""
     try:
         with open(cache_file, 'r') as f:
-            cache_data = json.load(f)
+            try:
+                cache_data = json.load(f)
+            except json.JSONDecodeError as je:
+                # Corrupted/truncated download - quarantine, don't retry forever
+                bad_dir = cache_file.parent / 'bad'
+                bad_dir.mkdir(exist_ok=True)
+                bad_path = bad_dir / cache_file.name
+                cache_file.rename(bad_path)
+                log(f"Corrupted JSON in {cache_file.name} at char {je.pos}: {je.msg} - quarantined to bad/", "WARNING")
+                return True  # Don't trigger backoff for a parse error
         
         spots = cache_data.get('spots', [])
+        retry_count = cache_data.get('retry_count', 0)
         
         if not spots:
             log(f"Cache file {cache_file.name} has no spots, deleting")
@@ -555,7 +567,10 @@ def insert_cached_file(client, cache_file: Path, database: str, table: str) -> b
         # Get highest spotnum from inserted rows
         highest_spotnum = max(row[0] for row in rows)
         
-        log(f"Inserted {len(rows)} spots from {cache_file.name} (highest id: {highest_spotnum})")
+        if retry_count > 0:
+            log(f"Inserted {len(rows)} spots from {cache_file.name} (highest id: {highest_spotnum}) [retry {retry_count}]")
+        else:
+            log(f"Inserted {len(rows)} spots from {cache_file.name} (highest id: {highest_spotnum})")
         
         # Delete cache file after successful insert
         cache_file.unlink()
@@ -563,12 +578,29 @@ def insert_cached_file(client, cache_file: Path, database: str, table: str) -> b
         return True
         
     except Exception as e:
-        log(f"Failed to insert {cache_file.name}: {e}", "ERROR")
+        # Update retry count in cache file
+        try:
+            with open(cache_file, 'r') as f:
+                cache_data = json.load(f)
+            
+            retry_count = cache_data.get('retry_count', 0) + 1
+            cache_data['retry_count'] = retry_count
+            cache_data['last_error'] = str(e)
+            cache_data['last_retry'] = datetime.utcnow().isoformat()
+            
+            with open(cache_file, 'w') as f:
+                json.dump(cache_data, f, indent=2)
+            
+            log(f"Failed to insert {cache_file.name} (retry {retry_count}): {e}", "ERROR")
+            log(f"Spots cached for retry - file will be retried later", "INFO")
+        except Exception as write_error:
+            log(f"Failed to update retry count for {cache_file.name}: {write_error}", "ERROR")
+        
         return False
 
 
 def insert_thread_worker(config: Dict, cache_dir: str, database: str, table: str, stop_event: threading.Event):
-    """Worker thread that processes cached files"""
+    """Worker thread that processes cached files with retry backoff"""
     log("Insert thread started")
     
     # Create separate ClickHouse client for this thread
@@ -584,6 +616,8 @@ def insert_thread_worker(config: Dict, cache_dir: str, database: str, table: str
         log(f"Insert thread: Failed to connect to ClickHouse: {e}", "ERROR")
         return
     
+    consecutive_failures = 0
+    
     while not stop_event.is_set():
         try:
             # Get oldest cached file
@@ -591,14 +625,27 @@ def insert_thread_worker(config: Dict, cache_dir: str, database: str, table: str
             
             if cached_files:
                 oldest_file = cached_files[0]
+                
                 # Insert the file
-                insert_cached_file(client, oldest_file, database, table)
+                success = insert_cached_file(client, oldest_file, database, table)
+                
+                if success:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    # Backoff delay: increase wait time with consecutive failures
+                    # 5s, 10s, 20s, 30s, max 60s
+                    backoff_delay = min(5 * (2 ** min(consecutive_failures - 1, 3)), 60)
+                    log(f"Insert failed, backing off for {backoff_delay} seconds (failure #{consecutive_failures})", "WARNING")
+                    time.sleep(backoff_delay)
             else:
                 # No files, sleep briefly
+                consecutive_failures = 0
                 time.sleep(1)
                 
         except Exception as e:
             log(f"Insert thread error: {e}", "ERROR")
+            consecutive_failures += 1
             time.sleep(5)
     
     log("Insert thread stopped")
@@ -683,7 +730,7 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
         )
         ENGINE = MergeTree
         PARTITION BY toYYYYMM(time)
-        ORDER BY (time, id)
+        ORDER BY (time, band, id)
         SETTINGS index_granularity = 8192
         """
         
