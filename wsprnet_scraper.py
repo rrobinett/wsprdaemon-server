@@ -31,9 +31,10 @@ import os
 from datetime import datetime
 import threading
 import glob
+from datetime import timezone
 
 # Version
-VERSION = "2.5.1"  # Changed to wspr.rx table, added retry tracking with exponential backoff
+VERSION = "2.5.2"  # Fix: clamp negative frequency to 0; convert Date int to datetime for DateTime column
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -442,9 +443,10 @@ def process_spot(spot: Dict) -> Optional[tuple]:
             return None
             
         try:
-            date = int(spot.get('Date', 0))
+            date_int = int(spot.get('Date', 0))
+            date = datetime.fromtimestamp(date_int, tz=timezone.utc).replace(tzinfo=None) if date_int > 0 else datetime(1970, 1, 1)
         except:
-            date = 0
+            date = datetime(1970, 1, 1)
             
         reporter = str(spot.get('Reporter', ''))
         reporter_grid = str(spot.get('ReporterGrid', ''))
@@ -501,9 +503,11 @@ def process_spot(spot: Dict) -> Optional[tuple]:
         # Calculate rx_azimuth
         rx_azimuth = calculate_azimuth(tx_lat, tx_lon, rx_lat, rx_lon)
         
-        # Convert frequency to Hz
+        # Convert frequency to Hz; clamp negatives (bad wsprnet data) to 0
         try:
             frequency_hz = int(mhz * 1_000_000)
+            if frequency_hz < 0:
+                frequency_hz = 0
         except:
             frequency_hz = 0
         
