@@ -1,9 +1,14 @@
 #!/bin/bash
 ###############################################################################
-### wd-register-client.sh v3.4.2
+### wd-register-client.sh v3.5.0
 ###
 ### Script to register WSPRDAEMON client stations for SFTP uploads
 ### Creates user accounts on gateway servers and configures client access
+###
+### v3.5.0 Changes:
+###   - NEW: manual-setup mode for creating accounts without RAC access
+###   - Usage: ./wd-register-client.sh manual-setup <USERNAME> <SSH_PUBKEY>
+###   - Creates user on both gw1 and gw2, outputs config line for client
 ###
 ### v3.4.2 Changes:
 ###   - FIX: Add sudo to rm when verifying peer gateway upload (wsprdaemon can't
@@ -49,7 +54,7 @@
 ###
 ###############################################################################
 
-declare VERSION="3.4.2"
+declare VERSION="3.5.0"
 
 if [[ -f ~/wsprdaemon/bash-aliases ]]; then
     source ~/wsprdaemon/bash-aliases
@@ -1018,6 +1023,204 @@ function wd-client-to-server-setup()
 }
 
 ###############################################################################
+### Manual Setup Mode (no RAC access required)
+###############################################################################
+
+### Create user accounts manually when RAC access is not available
+### Usage: wd-register-client.sh manual-setup <USERNAME> <SSH_PUBKEY_FILE_OR_STRING>
+manual_setup_user() {
+    local username="$1"
+    local pubkey_input="$2"
+    
+    # Validate username
+    if [[ ! "${username}" =~ ^[A-Z0-9]+$ ]]; then
+        echo "ERROR: Username must contain only uppercase letters and numbers"
+        echo "       Got: '${username}'"
+        return 1
+    fi
+    
+    # Get the public key - either from file or direct string
+    local pubkey=""
+    if [[ -f "${pubkey_input}" ]]; then
+        pubkey=$(<"${pubkey_input}")
+    else
+        pubkey="${pubkey_input}"
+    fi
+    
+    # Validate it looks like an SSH public key
+    if [[ ! "${pubkey}" =~ ^ssh- ]]; then
+        echo "ERROR: Public key must start with 'ssh-rsa', 'ssh-ed25519', etc."
+        echo "       Got: '${pubkey:0:50}...'"
+        return 1
+    fi
+    
+    echo "=== Manual User Setup ==="
+    echo "Username: ${username}"
+    echo "Public key: ${pubkey:0:60}..."
+    echo ""
+    
+    # Determine local and peer gateways
+    local local_hostname=$(hostname -s | tr '[:upper:]' '[:lower:]')
+    local local_fqdn=""
+    local peer_gateway=""
+    local peer_fqdn=""
+    
+    case "${local_hostname}" in
+        gw1|gw1-*)
+            local_fqdn="gw1.wsprdaemon.org"
+            peer_gateway="gw2"
+            peer_fqdn="gw2.wsprdaemon.org"
+            ;;
+        gw2|gw2-*)
+            local_fqdn="gw2.wsprdaemon.org"
+            peer_gateway="gw1"
+            peer_fqdn="gw1.wsprdaemon.org"
+            ;;
+        *)
+            echo "ERROR: Must run on gw1 or gw2"
+            return 1
+            ;;
+    esac
+    
+    ###########################################################################
+    ### Create user on local gateway
+    ###########################################################################
+    
+    echo "Creating user on local gateway: ${local_fqdn}"
+    
+    # Check for sftponly group (from wd-client-to-server-setup)
+    wd-ensure-sftponly-group
+    
+    # Create user if doesn't exist
+    if id "${username}" > /dev/null 2>&1; then
+        echo "User ${username} already exists on local gateway"
+    else
+        if ! sudo useradd -m -s /bin/false -G sftponly "${username}"; then
+            echo "ERROR: Failed to create user ${username}"
+            return 1
+        fi
+        echo "Created user ${username}"
+    fi
+    
+    # Set chroot ownership (must be root:root)
+    if ! sudo chown root:root "/home/${username}"; then
+        echo "ERROR: Failed to set chroot ownership"
+        return 1
+    fi
+    
+    # Create .ssh directory
+    if ! sudo mkdir -p "/home/${username}/.ssh"; then
+        echo "ERROR: Failed to create .ssh directory"
+        return 1
+    fi
+    
+    # Install public key
+    if ! echo "${pubkey}" | sudo tee "/home/${username}/.ssh/authorized_keys" > /dev/null; then
+        echo "ERROR: Failed to write authorized_keys"
+        return 1
+    fi
+    
+    # Set permissions
+    if ! sudo chmod 700 "/home/${username}/.ssh"; then
+        echo "ERROR: Failed to set .ssh permissions"
+        return 1
+    fi
+    
+    if ! sudo chmod 600 "/home/${username}/.ssh/authorized_keys"; then
+        echo "ERROR: Failed to set authorized_keys permissions"
+        return 1
+    fi
+    
+    if ! sudo chown -R "${username}:${username}" "/home/${username}/.ssh"; then
+        echo "ERROR: Failed to set .ssh ownership"
+        return 1
+    fi
+    
+    # Lock the account (disable password login)
+    if ! sudo passwd -l "${username}" > /dev/null 2>&1; then
+        echo "ERROR: Failed to lock user account"
+        return 1
+    fi
+    
+    # Create uploads directory
+    if ! sudo mkdir -p "/home/${username}/uploads"; then
+        echo "ERROR: Failed to create uploads directory"
+        return 1
+    fi
+    
+    if ! sudo chown "${username}:${username}" "/home/${username}/uploads"; then
+        echo "ERROR: Failed to set uploads ownership"
+        return 1
+    fi
+    
+    if ! sudo chmod 755 "/home/${username}/uploads"; then
+        echo "ERROR: Failed to set uploads permissions"
+        return 1
+    fi
+    
+    echo "User ${username} setup complete on ${local_fqdn}"
+    
+    ###########################################################################
+    ### Create duplicate user on peer gateway
+    ###########################################################################
+    
+    if [[ -n "${peer_gateway}" ]]; then
+        echo ""
+        echo "Creating duplicate user on peer gateway: ${peer_fqdn}"
+        
+        if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "${peer_gateway}" "
+            # Create sftponly group if needed
+            if ! getent group sftponly > /dev/null 2>&1; then
+                sudo groupadd sftponly
+            fi
+            
+            # Create user if not exists
+            if ! id '${username}' > /dev/null 2>&1; then
+                sudo useradd -m -s /bin/false -G sftponly '${username}'
+                sudo chown root:root '/home/${username}'
+                sudo chmod 755 '/home/${username}'
+            fi
+            
+            # Setup SSH directory and key
+            sudo mkdir -p '/home/${username}/.ssh'
+            sudo chmod 700 '/home/${username}/.ssh'
+            echo '${pubkey}' | sudo tee '/home/${username}/.ssh/authorized_keys' > /dev/null
+            sudo chmod 600 '/home/${username}/.ssh/authorized_keys'
+            sudo chown -R '${username}:${username}' '/home/${username}/.ssh'
+            sudo passwd -l '${username}' > /dev/null 2>&1
+            
+            # Create uploads directory
+            sudo mkdir -p '/home/${username}/uploads'
+            sudo chown '${username}:${username}' '/home/${username}/uploads'
+            sudo chmod 755 '/home/${username}/uploads'
+            
+            echo 'User setup complete on peer'
+        " 2>/dev/null; then
+            echo "User ${username} created on ${peer_fqdn}"
+        else
+            echo "WARNING: Could not create user on ${peer_fqdn} (peer may be unreachable)"
+            echo "         Run this script on ${peer_gateway} to complete setup"
+        fi
+    fi
+    
+    ###########################################################################
+    ### Output config line for wsprdaemon.conf
+    ###########################################################################
+    
+    echo ""
+    echo "=== Setup Complete ==="
+    echo ""
+    echo "Add this line to the CLIENT's /etc/wsprdaemon/wsprdaemon.conf:"
+    echo ""
+    echo "WD_SERVER_USER_LIST=(\"${username}@${local_fqdn}\" \"${username}@${peer_fqdn}\")"
+    echo ""
+    echo "Test SFTP upload from client:"
+    echo "  echo 'test' > /tmp/test.txt"
+    echo "  sftp ${username}@${local_fqdn} <<< 'put /tmp/test.txt uploads/test.txt'"
+    echo ""
+}
+
+###############################################################################
 ### Command Line Handling
 ###############################################################################
 
@@ -1032,11 +1235,31 @@ if [[ "${1-}" == "-V" || "${1-}" == "--version" ]]; then
     exit 0
 fi
 
+# Handle manual-setup command (no RAC access needed)
+if [[ "${1-}" == "manual-setup" ]]; then
+    if [[ $# -lt 3 ]]; then
+        echo "ERROR: manual-setup requires USERNAME and SSH_PUBKEY"
+        echo "Usage: $0 manual-setup <USERNAME> <SSH_PUBKEY_FILE_OR_STRING>"
+        echo ""
+        echo "Examples:"
+        echo "  $0 manual-setup N6GN4 ~/.ssh/id_ed25519.pub"
+        echo "  $0 manual-setup N6GN4 'ssh-ed25519 AAAA...'"
+        exit 1
+    fi
+    
+    username="$2"
+    pubkey_input="$3"
+    
+    manual_setup_user "${username}" "${pubkey_input}"
+    exit $?
+fi
+
 # Validate arguments before calling the function
 if [[ $# -lt 1 ]]; then
     echo "ERROR: Missing required argument"
     echo ""
     echo "Usage: $0 <RAC_NUMBER> [client_user]"
+    echo "   or: $0 manual-setup <USERNAME> <SSH_PUBKEY_FILE_OR_STRING>"
     echo "   or: $0 clean-gw-keys <RAC_NUMBER> [client_user]"
     echo "   or: $0 scan-and-clean-all [client_user]"
     echo "   or: $0 -V|--version"
@@ -1044,23 +1267,28 @@ if [[ $# -lt 1 ]]; then
     echo "Arguments:"
     echo "  RAC_NUMBER    : The Remote Access Channel number (positive integer)"
     echo "  client_user   : Optional. The username on the client (default: wsprdaemon)"
+    echo "  USERNAME      : Uppercase username for manual setup (e.g., N6GN4)"
+    echo "  SSH_PUBKEY... : Path to SSH public key file OR the key itself as a string"
     echo ""
     echo "Commands:"
-    echo "  $0 <RAC_NUMBER>                  - Full client registration"
-    echo "  $0 clean-gw-keys <RAC_NUMBER>    - Only remove GW1/GW2 keys from one client"
-    echo "  $0 scan-and-clean-all            - Scan all RACs 1-213 and clean where possible"
-    echo "  $0 -V|--version                  - Show version"
+    echo "  $0 <RAC_NUMBER>                         - Full client registration via RAC"
+    echo "  $0 manual-setup <USER> <PUBKEY>         - Create user without RAC access"
+    echo "  $0 clean-gw-keys <RAC_NUMBER>           - Only remove GW1/GW2 keys from one client"
+    echo "  $0 scan-and-clean-all                   - Scan all RACs 1-213 and clean where possible"
+    echo "  $0 -V|--version                         - Show version"
     echo ""
     echo "Prerequisites:"
-    echo "  Requires wd-rac project with encrypted config files:"
+    echo "  For RAC commands: Requires wd-rac project with encrypted config files:"
     echo "    ${WD_RAC_PROJECT_DIR}/conf/rac-master.conf.enc"
-    echo "  You will be prompted for the passphrase (NOT cached for security)."
+    echo "  For manual-setup: No prerequisites, just username and SSH public key"
     echo ""
-    echo "Example:"
-    echo "  $0 129                           # Register RAC 129"
-    echo "  $0 129 myuser                    # Register with custom username"
-    echo "  $0 clean-gw-keys 129             # Clean only RAC 129"
-    echo "  $0 scan-and-clean-all            # Scan and clean all accessible RACs"
+    echo "Examples:"
+    echo "  $0 129                                  # Register RAC 129"
+    echo "  $0 129 myuser                           # Register with custom username"
+    echo "  $0 manual-setup N6GN4 ~/.ssh/id_ed25519.pub  # Manual setup with key file"
+    echo "  $0 manual-setup N6GN4 'ssh-ed25519 AAAA...'  # Manual setup with key string"
+    echo "  $0 clean-gw-keys 129                    # Clean only RAC 129"
+    echo "  $0 scan-and-clean-all                   # Scan and clean all accessible RACs"
     exit 1
 fi
 
