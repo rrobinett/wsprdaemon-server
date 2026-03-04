@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-VERSION="3.6.0"
+VERSION="3.11.0"
 CH_CONF="/etc/wsprdaemon/clickhouse.conf"
 STATE_FILE_NAME="backup-state.tsv"
 
@@ -77,22 +77,6 @@ find_backup_dir() {
         done
     done
     echo "${best%/}"
-}
-
-get_uncompressed_sizes() {
-    ch_query "
-        SELECT t.database, t.name, t.total_rows,
-               coalesce(p.uncompressed_bytes, t.total_bytes) AS estimated_bytes
-        FROM system.tables t
-        LEFT JOIN (
-            SELECT database, table, sum(data_uncompressed_bytes) AS uncompressed_bytes
-            FROM system.parts WHERE active = 1
-            GROUP BY database, table
-        ) p ON p.database = t.database AND p.table = t.name
-        WHERE t.database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
-          AND t.engine NOT LIKE '%View%'
-        ORDER BY estimated_bytes DESC
-        FORMAT TSV"
 }
 
 get_current_sizes() {
@@ -163,6 +147,11 @@ cmd_status() {
     printf "  %-42s  %10s  %10s  %6s  %s\n" "TABLE" "EXPECTED" "WRITTEN" "PCT" "STATUS"
     printf "  %-42s  %10s  %10s  %6s  %s\n" "-----" "--------" "-------" "---" "------"
 
+    # Snapshot running processes once before the loop to avoid stdin conflict
+    local ps_tmp
+    ps_tmp=$(mktemp)
+    ps auxww 2>/dev/null > "$ps_tmp"
+
     while IFS=$'\t' read -r db tbl expected_rows expected_bytes; do
         [[ "$db" == \#* ]] && continue
         total=$(( total + 1 ))
@@ -184,14 +173,14 @@ cmd_status() {
             fi
         elif [[ -f "$outfile_zst" ]]; then
             written_bytes=$(stat -c%s "$outfile_zst" 2>/dev/null || echo 0)
-            if ps aux 2>/dev/null | grep -v grep | grep -qF "${outfile_zst}"; then
+            if grep -v grep "$ps_tmp" | grep -qF "${outfile_zst}"; then
                 status="RUNNING"; running=$(( running + 1 ))
             else
                 status="DONE"; done_count=$(( done_count + 1 ))
             fi
         elif [[ -f "$outfile_gz" ]]; then
             written_bytes=$(stat -c%s "$outfile_gz" 2>/dev/null || echo 0)
-            if ps aux 2>/dev/null | grep -v grep | grep -qF "${outfile_gz}"; then
+            if grep -v grep "$ps_tmp" | grep -qF "${outfile_gz}"; then
                 status="RUNNING"; running=$(( running + 1 ))
             else
                 status="DONE"; done_count=$(( done_count + 1 ))
@@ -216,6 +205,7 @@ cmd_status() {
                "$pct" "$status"
 
     done < "$state_file"
+    rm -f "$ps_tmp"
 
     echo ""
     echo "  Summary: ${done_count} done / ${running} running / ${pending} pending / ${total} total"
@@ -299,7 +289,7 @@ run_zstd_backup() {
     echo ""
 
     local tables
-    tables=$(get_uncompressed_sizes)
+    tables=$(get_current_sizes)
     { echo "#mode:${mode}"; echo "$tables"; } > "${backup_dir}/${STATE_FILE_NAME}"
 
     local pids=()
@@ -362,7 +352,7 @@ run_zstd_backup_seq() {
     echo ""
 
     local tables
-    tables=$(get_uncompressed_sizes)
+    tables=$(get_current_sizes)
     { echo "#mode:${mode}"; echo "$tables"; } > "${backup_dir}/${STATE_FILE_NAME}"
 
     local failed=0
