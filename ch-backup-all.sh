@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-VERSION="3.11.0"
+VERSION="3.13.0"
 CH_CONF="/etc/wsprdaemon/clickhouse.conf"
 STATE_FILE_NAME="backup-state.tsv"
 
@@ -58,7 +58,7 @@ human_bytes() {
 }
 
 find_backup_dir() {
-    local arg="${1:-}"
+    local arg="${1%/}"  # strip trailing slash from tab-completion
     if [[ -n "$arg" ]]; then
         echo "$arg"; return
     fi
@@ -116,6 +116,7 @@ cmd_status() {
         echo "ERROR: No backup directory found. Pass path as argument." >&2; exit 1
     fi
 
+    archive_dir="${archive_dir//\/\//\/}"  # normalize double slashes
     local state_file="${archive_dir}/${STATE_FILE_NAME}"
     if [[ ! -f "$state_file" ]]; then
         echo "ERROR: No state file found in ${archive_dir}" >&2; exit 1
@@ -173,14 +174,14 @@ cmd_status() {
             fi
         elif [[ -f "$outfile_zst" ]]; then
             written_bytes=$(stat -c%s "$outfile_zst" 2>/dev/null || echo 0)
-            if grep -v grep "$ps_tmp" | grep -qF "${outfile_zst}"; then
+            if grep -v grep "$ps_tmp" | grep -qF "$(basename "${outfile_zst}")"; then
                 status="RUNNING"; running=$(( running + 1 ))
             else
                 status="DONE"; done_count=$(( done_count + 1 ))
             fi
         elif [[ -f "$outfile_gz" ]]; then
             written_bytes=$(stat -c%s "$outfile_gz" 2>/dev/null || echo 0)
-            if grep -v grep "$ps_tmp" | grep -qF "${outfile_gz}"; then
+            if grep -v grep "$ps_tmp" | grep -qF "$(basename "${outfile_gz}")"; then
                 status="RUNNING"; running=$(( running + 1 ))
             else
                 status="DONE"; done_count=$(( done_count + 1 ))
@@ -429,27 +430,27 @@ shift || true
 
 case "$CMD" in
     --local)
-        BASE="${1:-$DEFAULT_LOCAL_BASE}"
+        BASE="${1:-$DEFAULT_LOCAL_BASE}"; BASE="${BASE%/}"
         run_native_backup "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "local-native"
         ;;
     --local-zstd)
-        BASE="${1:-$DEFAULT_LOCAL_BASE}"
+        BASE="${1:-$DEFAULT_LOCAL_BASE}"; BASE="${BASE%/}"
         run_zstd_backup "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "local-zstd" "${ZSTD_LEVEL_LOCAL}"
         ;;
     --offsite)
-        BASE="${1:-$DEFAULT_OFFSITE_BASE}"
+        BASE="${1:-$DEFAULT_OFFSITE_BASE}"; BASE="${BASE%/}"
         run_native_backup "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "offsite-native"
         ;;
     --offsite-zstd)
-        BASE="${1:-$DEFAULT_OFFSITE_BASE}"
+        BASE="${1:-$DEFAULT_OFFSITE_BASE}"; BASE="${BASE%/}"
         run_zstd_backup "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "offsite-zstd" "${ZSTD_LEVEL_OFFSITE}"
         ;;
     --local-zstd-seq)
-        BASE="${1:-$DEFAULT_LOCAL_BASE}"
+        BASE="${1:-$DEFAULT_LOCAL_BASE}"; BASE="${BASE%/}"
         run_zstd_backup_seq "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "local-zstd-seq" "${ZSTD_LEVEL_LOCAL}"
         ;;
     --offsite-zstd-seq)
-        BASE="${1:-$DEFAULT_OFFSITE_BASE}"
+        BASE="${1:-$DEFAULT_OFFSITE_BASE}"; BASE="${BASE%/}"
         run_zstd_backup_seq "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "offsite-zstd-seq" "${ZSTD_LEVEL_OFFSITE}"
         ;;
     --status)
