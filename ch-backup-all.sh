@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-VERSION="3.4.0"
+VERSION="3.6.0"
 CH_CONF="/etc/wsprdaemon/clickhouse.conf"
 STATE_FILE_NAME="backup-state.tsv"
 
@@ -62,16 +62,37 @@ find_backup_dir() {
     if [[ -n "$arg" ]]; then
         echo "$arg"; return
     fi
+    # Find the most recently modified backup across all search paths
+    local best="" best_time=0
     for base in "${STATUS_SEARCH_PATHS[@]}"; do
-        if [[ -d "$base" ]]; then
-            local candidate
-            candidate=$(ls -1td "${base}"/20* 2>/dev/null | head -1)
-            if [[ -n "$candidate" && -f "${candidate}/${STATE_FILE_NAME}" ]]; then
-                echo "$candidate"; return
+        [[ -d "$base" ]] || continue
+        for candidate in "${base}"/20*/; do
+            [[ -f "${candidate}/${STATE_FILE_NAME}" ]] || continue
+            local mtime
+            mtime=$(stat -c%Y "$candidate" 2>/dev/null || echo 0)
+            if (( mtime > best_time )); then
+                best_time=$mtime
+                best="$candidate"
             fi
-        fi
+        done
     done
-    echo ""
+    echo "${best%/}"
+}
+
+get_uncompressed_sizes() {
+    ch_query "
+        SELECT t.database, t.name, t.total_rows,
+               coalesce(p.uncompressed_bytes, t.total_bytes) AS estimated_bytes
+        FROM system.tables t
+        LEFT JOIN (
+            SELECT database, table, sum(data_uncompressed_bytes) AS uncompressed_bytes
+            FROM system.parts WHERE active = 1
+            GROUP BY database, table
+        ) p ON p.database = t.database AND p.table = t.name
+        WHERE t.database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+          AND t.engine NOT LIKE '%View%'
+        ORDER BY estimated_bytes DESC
+        FORMAT TSV"
 }
 
 get_current_sizes() {
@@ -163,14 +184,14 @@ cmd_status() {
             fi
         elif [[ -f "$outfile_zst" ]]; then
             written_bytes=$(stat -c%s "$outfile_zst" 2>/dev/null || echo 0)
-            if lsof "$outfile_zst" 2>/dev/null | grep -qE "clickhous|zstd"; then
+            if ps aux 2>/dev/null | grep -v grep | grep -qF "${outfile_zst}"; then
                 status="RUNNING"; running=$(( running + 1 ))
             else
                 status="DONE"; done_count=$(( done_count + 1 ))
             fi
         elif [[ -f "$outfile_gz" ]]; then
             written_bytes=$(stat -c%s "$outfile_gz" 2>/dev/null || echo 0)
-            if lsof "$outfile_gz" 2>/dev/null | grep -qE "clickhous|pigz"; then
+            if ps aux 2>/dev/null | grep -v grep | grep -qF "${outfile_gz}"; then
                 status="RUNNING"; running=$(( running + 1 ))
             else
                 status="DONE"; done_count=$(( done_count + 1 ))
@@ -278,7 +299,7 @@ run_zstd_backup() {
     echo ""
 
     local tables
-    tables=$(get_current_sizes)
+    tables=$(get_uncompressed_sizes)
     { echo "#mode:${mode}"; echo "$tables"; } > "${backup_dir}/${STATE_FILE_NAME}"
 
     local pids=()
@@ -341,7 +362,7 @@ run_zstd_backup_seq() {
     echo ""
 
     local tables
-    tables=$(get_current_sizes)
+    tables=$(get_uncompressed_sizes)
     { echo "#mode:${mode}"; echo "$tables"; } > "${backup_dir}/${STATE_FILE_NAME}"
 
     local failed=0
