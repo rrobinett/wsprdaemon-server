@@ -1,23 +1,30 @@
 #!/bin/bash
 #
-# ch-backup-all.sh - Backup all ClickHouse user tables using native BACKUP command
-# Version: 3.0.0
+# ch-backup-all.sh - Backup all ClickHouse user tables
+# Version: 3.3.0
 #
 # Usage:
-#   ch-backup-all.sh --local   [base_dir]   Native backup to local HD (default: /srv/wd_archive/ch-backups)
-#   ch-backup-all.sh --offsite [base_dir]   Native backup to offsite HD (default: /mnt/offsite/ch-backups)
-#   ch-backup-all.sh --status  [backup_dir] Show progress of most recent or specified backup
-#   ch-backup-all.sh --restore [backup_dir] Restore all tables from a backup directory
+#   ch-backup-all.sh --local        [base_dir]  ClickHouse native backup (default: /mnt/ch_archive1/ch-backups)
+#   ch-backup-all.sh --local-zstd   [base_dir]  zstd-compressed pipe backup (faster on spinning disk)
+#   ch-backup-all.sh --offsite      [base_dir]  ClickHouse native backup (default: /mnt/offsite/ch-backups)
+#   ch-backup-all.sh --offsite-zstd [base_dir]  zstd-compressed pipe backup
+#   ch-backup-all.sh --status       [backup_dir] Show progress of most recent or specified backup
+#   ch-backup-all.sh --refresh      [backup_dir] Refresh stale size estimates in state file
+#   ch-backup-all.sh --restore      [backup_dir] Restore all tables from a native backup
 #
 
 set -euo pipefail
 
-VERSION="3.2.0"
+VERSION="3.4.0"
 CH_CONF="/etc/wsprdaemon/clickhouse.conf"
 STATE_FILE_NAME="backup-state.tsv"
 
-DEFAULT_LOCAL_BASE="/srv/wd_archive/ch-backups"
+DEFAULT_LOCAL_BASE="/mnt/ch_archive1/ch-backups"
 DEFAULT_OFFSITE_BASE="/mnt/offsite/ch-backups"
+
+ZSTD_CORES=4          # cores per zstd instance; with 9 parallel tables x 4 = 36 total
+ZSTD_LEVEL_LOCAL=1    # local backup: fast compression, space less critical
+ZSTD_LEVEL_OFFSITE=3  # offsite backup: better compression for smaller transfer size
 
 STATUS_SEARCH_PATHS=(
     /mnt/ch_archive1/ch-backups
@@ -53,20 +60,48 @@ human_bytes() {
 find_backup_dir() {
     local arg="${1:-}"
     if [[ -n "$arg" ]]; then
-        echo "$arg"
-        return
+        echo "$arg"; return
     fi
     for base in "${STATUS_SEARCH_PATHS[@]}"; do
         if [[ -d "$base" ]]; then
             local candidate
             candidate=$(ls -1td "${base}"/20* 2>/dev/null | head -1)
             if [[ -n "$candidate" && -f "${candidate}/${STATE_FILE_NAME}" ]]; then
-                echo "$candidate"
-                return
+                echo "$candidate"; return
             fi
         fi
     done
     echo ""
+}
+
+get_current_sizes() {
+    ch_query "
+        SELECT t.database, t.name, t.total_rows,
+               coalesce(p.compressed_bytes, t.total_bytes) AS estimated_bytes
+        FROM system.tables t
+        LEFT JOIN (
+            SELECT database, table, sum(data_compressed_bytes) AS compressed_bytes
+            FROM system.parts WHERE active = 1
+            GROUP BY database, table
+        ) p ON p.database = t.database AND p.table = t.name
+        WHERE t.database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+          AND t.engine NOT LIKE '%View%'
+        ORDER BY estimated_bytes DESC
+        FORMAT TSV"
+}
+
+cmd_refresh() {
+    local archive_dir
+    archive_dir=$(find_backup_dir "${1:-}")
+    if [[ -z "$archive_dir" || ! -d "$archive_dir" ]]; then
+        echo "ERROR: No backup directory found." >&2; exit 1
+    fi
+    local state_file="${archive_dir}/${STATE_FILE_NAME}"
+    local mode
+    mode=$(grep "^#mode:" "$state_file" | cut -d: -f2 || echo "unknown")
+    echo "Refreshing size estimates in: $state_file"
+    { echo "#mode:${mode}"; get_current_sizes; } > "${state_file}"
+    echo "Done. Run --status to see updated sizes."
 }
 
 cmd_status() {
@@ -113,34 +148,44 @@ cmd_status() {
         total_expected_bytes=$(( total_expected_bytes + expected_bytes ))
 
         local outdir="${archive_dir}/${db}.${tbl}"
+        local outfile_zst="${archive_dir}/${db}.${tbl}.native.zst"
+        local outfile_gz="${archive_dir}/${db}.${tbl}.native.gz"
         local status written_bytes pct
 
+        # Determine output and whether it's running
         if [[ -d "$outdir" ]]; then
+            # Native backup mode
             written_bytes=$(sudo du -sb "$outdir" 2>/dev/null | awk '{print $1}' || echo 0)
-            total_written_bytes=$(( total_written_bytes + written_bytes ))
-            # Check system.backups for running status
-            local running_check
-            running_check=$(ch_query "
-                SELECT count() FROM system.backups
-                WHERE status = 'CREATING_BACKUP'
-                AND name LIKE '%${db}.${tbl}%'" 2>/dev/null || echo 0)
-            if [[ "$running_check" -gt 0 ]]; then
-                status="RUNNING"
-                running=$(( running + 1 ))
+            if lsof "$outdir" 2>/dev/null | grep -q "clickhous"; then
+                status="RUNNING"; running=$(( running + 1 ))
             else
-                status="DONE"
-                done_count=$(( done_count + 1 ))
+                status="DONE"; done_count=$(( done_count + 1 ))
             fi
-            if (( expected_bytes > 0 )); then
-                pct=$(awk "BEGIN{printf \"%.0f%%\", 100*${written_bytes}/${expected_bytes}}")
+        elif [[ -f "$outfile_zst" ]]; then
+            written_bytes=$(stat -c%s "$outfile_zst" 2>/dev/null || echo 0)
+            if lsof "$outfile_zst" 2>/dev/null | grep -qE "clickhous|zstd"; then
+                status="RUNNING"; running=$(( running + 1 ))
             else
-                pct="?"
+                status="DONE"; done_count=$(( done_count + 1 ))
+            fi
+        elif [[ -f "$outfile_gz" ]]; then
+            written_bytes=$(stat -c%s "$outfile_gz" 2>/dev/null || echo 0)
+            if lsof "$outfile_gz" 2>/dev/null | grep -qE "clickhous|pigz"; then
+                status="RUNNING"; running=$(( running + 1 ))
+            else
+                status="DONE"; done_count=$(( done_count + 1 ))
             fi
         else
             written_bytes=0
-            status="PENDING"
+            status="PENDING"; pending=$(( pending + 1 ))
+        fi
+
+        total_written_bytes=$(( total_written_bytes + written_bytes ))
+
+        if (( expected_bytes > 0 && written_bytes > 0 )); then
+            pct=$(awk "BEGIN{printf \"%.0f%%\", 100*${written_bytes}/${expected_bytes}}")
+        else
             pct="0%"
-            pending=$(( pending + 1 ))
         fi
 
         printf "  %-42s  %10s  %10s  %6s  %s\n" \
@@ -179,12 +224,11 @@ cmd_status() {
     echo "========================================================"
 }
 
-run_backup() {
+run_native_backup() {
     local backup_dir="$1"
     local mode="$2"
 
     mkdir -p "$backup_dir"
-    # Ensure clickhouse user can write to backup dir
     chown clickhouse:clickhouse "$backup_dir"
 
     echo "ch-backup-all.sh v${VERSION}"
@@ -193,36 +237,16 @@ run_backup() {
     echo "Started:          $(date -u)"
     echo ""
 
-    # Get all user tables ordered by compressed size descending
     local tables
-    tables=$(ch_query "
-        SELECT t.database, t.name, t.total_rows,
-               coalesce(p.compressed_bytes, t.total_bytes) AS estimated_bytes
-        FROM system.tables t
-        LEFT JOIN (
-            SELECT database, table, sum(data_compressed_bytes) AS compressed_bytes
-            FROM system.parts WHERE active = 1
-            GROUP BY database, table
-        ) p ON p.database = t.database AND p.table = t.name
-        WHERE t.database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
-          AND t.engine NOT LIKE '%View%'
-        ORDER BY estimated_bytes DESC
-        FORMAT TSV")
-
+    tables=$(get_current_sizes)
     { echo "#mode:${mode}"; echo "$tables"; } > "${backup_dir}/${STATE_FILE_NAME}"
 
     local failed=0
-
     while IFS=$'\t' read -r db tbl rows bytes; do
         local size
         size=$(human_bytes "${bytes:-0}")
         echo "Starting: ${db}.${tbl}  (${rows} rows, ${size})"
-
-        # Save schema
-        ch_query "SHOW CREATE TABLE ${db}.${tbl}" \
-            > "${backup_dir}/${db}.${tbl}.schema.sql"
-
-        # Run native backup sequentially
+        ch_query "SHOW CREATE TABLE ${db}.${tbl}" > "${backup_dir}/${db}.${tbl}.schema.sql"
         if ch_query "BACKUP TABLE ${db}.${tbl} TO File('${backup_dir}/${db}.${tbl}')"; then
             local sz
             sz=$(sudo du -sh "${backup_dir}/${db}.${tbl}" 2>/dev/null | cut -f1)
@@ -235,12 +259,115 @@ run_backup() {
 
     echo ""
     echo "Completed: $(date -u)"
-    echo "Backup dir: $backup_dir"
     echo "Total size: $(sudo du -sh "$backup_dir" | cut -f1)"
-    if (( failed > 0 )); then
-        echo "FAILURES: $failed tables failed"
-        exit 1
-    fi
+    if (( failed > 0 )); then echo "FAILURES: $failed tables failed"; exit 1; fi
+    echo "All tables backed up successfully"
+}
+
+run_zstd_backup() {
+    local backup_dir="$1"
+    local mode="$2"
+    local zstd_level="$3"
+
+    mkdir -p "$backup_dir"
+
+    echo "ch-backup-all.sh v${VERSION}"
+    echo "Mode:             $mode (zstd -${zstd_level} compressed, ${ZSTD_CORES} cores/table)"
+    echo "Backup directory: $backup_dir"
+    echo "Started:          $(date -u)"
+    echo ""
+
+    local tables
+    tables=$(get_current_sizes)
+    { echo "#mode:${mode}"; echo "$tables"; } > "${backup_dir}/${STATE_FILE_NAME}"
+
+    local pids=()
+    declare -A table_pids
+
+    while IFS=$'\t' read -r db tbl rows bytes; do
+        local size
+        size=$(human_bytes "${bytes:-0}")
+        echo "Starting: ${db}.${tbl}  (${rows} rows, ${size})"
+        ch_query "SHOW CREATE TABLE ${db}.${tbl}" > "${backup_dir}/${db}.${tbl}.schema.sql"
+
+        clickhouse-client --user "$CH_USER" --password "$CH_PASS" \
+            --max_execution_time 0 --receive_timeout 604800 \
+            --query "SELECT * FROM ${db}.${tbl} FORMAT Native" \
+            | zstd -q -T"${ZSTD_CORES}" -"${zstd_level}" -o "${backup_dir}/${db}.${tbl}.native.zst" &
+
+        local pid=$!
+        pids+=($pid)
+        table_pids[$pid]="${db}.${tbl}"
+        echo "  PID $pid"
+    done <<< "$tables"
+
+    echo ""
+    echo "All ${#pids[@]} backup jobs running."
+    echo "Monitor with: $0 --status $backup_dir"
+    echo "Waiting for completion..."
+    echo ""
+
+    local failed=0
+    for pid in "${pids[@]}"; do
+        local tbl="${table_pids[$pid]}"
+        if wait "$pid"; then
+            local sz
+            sz=$(ls -lh "${backup_dir}/${tbl}.native.zst" 2>/dev/null | awk '{print $5}')
+            echo "OK:   ${tbl}  (${sz})"
+        else
+            echo "FAIL: ${tbl}"
+            failed=$(( failed + 1 ))
+        fi
+    done
+
+    echo ""
+    echo "Completed: $(date -u)"
+    echo "Total size: $(du -sh "$backup_dir" | cut -f1)"
+    if (( failed > 0 )); then echo "FAILURES: $failed tables failed"; exit 1; fi
+    echo "All tables backed up successfully"
+}
+
+run_zstd_backup_seq() {
+    local backup_dir="$1"
+    local mode="$2"
+    local zstd_level="$3"
+
+    mkdir -p "$backup_dir"
+
+    echo "ch-backup-all.sh v${VERSION}"
+    echo "Mode:             $mode (zstd -${zstd_level} sequential, ${ZSTD_CORES} cores/table)"
+    echo "Backup directory: $backup_dir"
+    echo "Started:          $(date -u)"
+    echo ""
+
+    local tables
+    tables=$(get_current_sizes)
+    { echo "#mode:${mode}"; echo "$tables"; } > "${backup_dir}/${STATE_FILE_NAME}"
+
+    local failed=0
+    while IFS=$'\t' read -r db tbl rows bytes; do
+        local size
+        size=$(human_bytes "${bytes:-0}")
+        echo "Starting: ${db}.${tbl}  (${rows} rows, ${size})"
+        ch_query "SHOW CREATE TABLE ${db}.${tbl}" > "${backup_dir}/${db}.${tbl}.schema.sql"
+
+        if clickhouse-client --user "$CH_USER" --password "$CH_PASS" \
+                --max_execution_time 0 --receive_timeout 604800 \
+                --query "SELECT * FROM ${db}.${tbl} FORMAT Native" \
+                | zstd -q -T"${ZSTD_CORES}" -"${zstd_level}" -o "${backup_dir}/${db}.${tbl}.native.zst"; then
+            local sz
+            sz=$(ls -lh "${backup_dir}/${db}.${tbl}.native.zst" 2>/dev/null | awk '{print $5}')
+            echo "OK:   ${db}.${tbl}  (${sz})"
+        else
+            echo "FAIL: ${db}.${tbl}"
+            failed=$(( failed + 1 ))
+        fi
+    done <<< "$tables"
+
+    echo ""
+    echo "Completed: $(date -u)"
+    echo "Total size: $(du -sh "$backup_dir" | cut -f1)"
+    if (( failed > 0 )); then echo "FAILURES: $failed tables failed"; exit 1; fi
     echo "All tables backed up successfully"
 }
 
@@ -253,7 +380,6 @@ cmd_restore() {
     if [[ ! -f "$state_file" ]]; then
         echo "ERROR: No state file found in ${archive_dir}" >&2; exit 1
     fi
-
     echo "Restoring from: $archive_dir"
     while IFS=$'\t' read -r db tbl rows bytes; do
         [[ "$db" == \#* ]] && continue
@@ -263,7 +389,7 @@ cmd_restore() {
             ch_query "RESTORE TABLE ${db}.${tbl} FROM File('${outdir}')"
             echo "  OK"
         else
-            echo "  SKIP ${db}.${tbl} (no backup dir found)"
+            echo "  SKIP ${db}.${tbl} (no native backup dir found)"
         fi
     done < "$state_file"
     echo "Restore complete."
@@ -273,12 +399,17 @@ usage() {
     echo "ch-backup-all.sh v${VERSION}"
     echo ""
     echo "Usage:"
-    echo "  $0 --local   [base_dir]    Native backup to local HD"
-    echo "                              Default: ${DEFAULT_LOCAL_BASE}"
-    echo "  $0 --offsite [base_dir]    Native backup to offsite HD"
-    echo "                              Default: ${DEFAULT_OFFSITE_BASE}"
-    echo "  $0 --status  [backup_dir]  Show progress (auto-finds most recent)"
-    echo "  $0 --restore [backup_dir]  Restore all tables from backup"
+    echo "  $0 --local        [base_dir]   ClickHouse native backup (sequential, low CPU)"
+    echo "                                  Default: ${DEFAULT_LOCAL_BASE}"
+    echo "  $0 --local-zstd   [base_dir]   zstd pipe backup (parallel, faster on spinning disk)"
+    echo "                                  Default: ${DEFAULT_LOCAL_BASE}"
+    echo "  $0 --offsite      [base_dir]   ClickHouse native backup for offsite"
+    echo "                                  Default: ${DEFAULT_OFFSITE_BASE}"
+    echo "  $0 --offsite-zstd [base_dir]   zstd pipe backup for offsite"
+    echo "                                  Default: ${DEFAULT_OFFSITE_BASE}"
+    echo "  $0 --status       [backup_dir] Show progress (auto-finds most recent)"
+    echo "  $0 --refresh      [backup_dir] Refresh stale size estimates"
+    echo "  $0 --restore      [backup_dir] Restore all tables from native backup"
     echo "  $0 --version"
 }
 
@@ -288,14 +419,33 @@ shift || true
 case "$CMD" in
     --local)
         BASE="${1:-$DEFAULT_LOCAL_BASE}"
-        run_backup "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "local"
+        run_native_backup "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "local-native"
+        ;;
+    --local-zstd)
+        BASE="${1:-$DEFAULT_LOCAL_BASE}"
+        run_zstd_backup "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "local-zstd" "${ZSTD_LEVEL_LOCAL}"
         ;;
     --offsite)
         BASE="${1:-$DEFAULT_OFFSITE_BASE}"
-        run_backup "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "offsite"
+        run_native_backup "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "offsite-native"
+        ;;
+    --offsite-zstd)
+        BASE="${1:-$DEFAULT_OFFSITE_BASE}"
+        run_zstd_backup "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "offsite-zstd" "${ZSTD_LEVEL_OFFSITE}"
+        ;;
+    --local-zstd-seq)
+        BASE="${1:-$DEFAULT_LOCAL_BASE}"
+        run_zstd_backup_seq "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "local-zstd-seq" "${ZSTD_LEVEL_LOCAL}"
+        ;;
+    --offsite-zstd-seq)
+        BASE="${1:-$DEFAULT_OFFSITE_BASE}"
+        run_zstd_backup_seq "${BASE}/$(date -u '+%Y-%m-%d_%H%M%S')" "offsite-zstd-seq" "${ZSTD_LEVEL_OFFSITE}"
         ;;
     --status)
         cmd_status "${1:-}"
+        ;;
+    --refresh)
+        cmd_refresh "${1:-}"
         ;;
     --restore)
         cmd_restore "${1:-}"
@@ -308,7 +458,6 @@ case "$CMD" in
         ;;
     *)
         echo "ERROR: Unknown command: $CMD"
-        echo ""
         usage
         exit 1
         ;;
