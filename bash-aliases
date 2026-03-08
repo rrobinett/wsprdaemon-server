@@ -2677,3 +2677,10 @@ alias wduz='wd -u z'
 alias wdus='wd -u s'
 alias r='reset'
 
+### WD server-specific aliases
+alias cda='cd /srv/wd_data/archive'
+alias cdl='cd /var/log/wsprdaemon'
+alias cds='cd /var/spool/wsprdaemon'
+
+alias tfd='tail -f /var/log/wsprdaemon/wsprdaemon_server.log'
+alias tfn='tail -f /var/log/wsprdaemon/wsprnet_scraper.log'
