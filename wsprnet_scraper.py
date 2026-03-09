@@ -34,7 +34,7 @@ import glob
 from datetime import timezone
 
 # Version
-VERSION = "2.5.2"  # Fix: clamp negative frequency to 0; convert Date int to datetime for DateTime column
+VERSION = "2.6.1"  # Partial JSON recovery: extract valid spots from truncated/corrupted cache files
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -51,7 +51,9 @@ DEFAULT_CONFIG = {
     'band': 'All',
     'exclude_special': 0,
     'loop_interval': 20,
-    'cache_dir': '/var/lib/wsprnet/cache'
+    'cache_dir': '/var/lib/wsprnet/cache',
+    'batch_flush_rows': 100000,   # flush accumulated rows when this many are pending
+    'batch_flush_seconds': 10     # flush if this many seconds have passed since last flush
 }
 
 # Logging configuration
@@ -603,10 +605,109 @@ def insert_cached_file(client, cache_file: Path, database: str, table: str) -> b
         return False
 
 
+def recover_spots_from_corrupt_json(cache_file: Path) -> List[Dict]:
+    """Attempt to extract valid spots from a truncated or corrupted JSON cache file.
+
+    The cache file structure is:
+        {"timestamp": ..., "spots": [ {spot1}, {spot2}, ... ]}
+
+    Truncation typically cuts off mid-array, leaving valid spot objects before
+    the truncation point.  Strategy:
+      1. Try normal json.load — if it works, return spots normally.
+      2. Find the 'spots' array opening bracket, then walk forward collecting
+         complete JSON objects one at a time using a depth counter.
+      3. Return however many complete spot dicts were found.
+    """
+    try:
+        text = cache_file.read_text(encoding='utf-8', errors='replace')
+    except Exception as e:
+        log(f"Recovery: cannot read {cache_file.name}: {e}", "WARNING")
+        return []
+
+    # Fast path: file is actually valid
+    try:
+        data = json.loads(text)
+        return data.get('spots', [])
+    except json.JSONDecodeError:
+        pass
+
+    # Find the start of the spots array
+    marker = '"spots"'
+    marker_pos = text.find(marker)
+    if marker_pos == -1:
+        log(f"Recovery: no 'spots' key found in {cache_file.name}", "WARNING")
+        return []
+
+    array_start = text.find('[', marker_pos + len(marker))
+    if array_start == -1:
+        log(f"Recovery: no '[' after 'spots' in {cache_file.name}", "WARNING")
+        return []
+
+    # Walk the array character by character, extracting complete objects
+    recovered = []
+    i = array_start + 1
+    n = len(text)
+
+    while i < n:
+        # Skip whitespace and commas between objects
+        while i < n and text[i] in ' \t\n\r,':
+            i += 1
+        if i >= n or text[i] != '{':
+            break
+
+        # Find the matching closing brace using depth counting
+        depth = 0
+        in_string = False
+        escape_next = False
+        obj_start = i
+
+        for j in range(i, n):
+            ch = text[j]
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == '\\' and in_string:
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    # Complete object found
+                    obj_text = text[obj_start:j+1]
+                    try:
+                        obj = json.loads(obj_text)
+                        recovered.append(obj)
+                    except json.JSONDecodeError:
+                        pass  # skip malformed object
+                    i = j + 1
+                    break
+        else:
+            # Reached end of text without closing brace — incomplete object
+            break
+
+    return recovered
+
+
 def insert_thread_worker(config: Dict, cache_dir: str, database: str, table: str, stop_event: threading.Event):
-    """Worker thread that processes cached files with retry backoff"""
+    """Worker thread that accumulates rows across cache files and flushes in batches."""
     log("Insert thread started")
-    
+
+    column_names = [
+        'id', 'time', 'band', 'rx_sign', 'rx_lat', 'rx_lon', 'rx_loc',
+        'tx_sign', 'tx_lat', 'tx_lon', 'tx_loc', 'distance', 'azimuth',
+        'rx_azimuth', 'frequency', 'power', 'snr', 'drift', 'version', 'code'
+    ]
+
+    batch_flush_rows    = config.get('batch_flush_rows', 100000)
+    batch_flush_seconds = config.get('batch_flush_seconds', 10)
+
     # Create separate ClickHouse client for this thread
     try:
         client = clickhouse_connect.get_client(
@@ -619,39 +720,132 @@ def insert_thread_worker(config: Dict, cache_dir: str, database: str, table: str
     except Exception as e:
         log(f"Insert thread: Failed to connect to ClickHouse: {e}", "ERROR")
         return
-    
+
     consecutive_failures = 0
-    
+    pending_rows  = []          # accumulated rows not yet inserted
+    pending_files = []          # cache files whose rows are in pending_rows
+    last_flush    = time.time()
+
+    def flush_batch():
+        """Insert pending_rows and delete pending_files on success."""
+        nonlocal pending_rows, pending_files, last_flush, consecutive_failures
+        if not pending_rows:
+            pending_files = []
+            last_flush = time.time()
+            return True
+        try:
+            client.insert(f"{database}.{table}", pending_rows, column_names=column_names)
+            highest = max(r[0] for r in pending_rows)
+            log(f"Flushed {len(pending_rows)} rows from {len(pending_files)} cache files "
+                f"(highest id: {highest})")
+            for cf in pending_files:
+                try:
+                    cf.unlink()
+                except Exception as e:
+                    log(f"Failed to delete cache file {cf.name}: {e}", "WARNING")
+            pending_rows  = []
+            pending_files = []
+            last_flush    = time.time()
+            consecutive_failures = 0
+            return True
+        except Exception as e:
+            consecutive_failures += 1
+            backoff = min(5 * (2 ** min(consecutive_failures - 1, 3)), 60)
+            log(f"Batch insert failed ({len(pending_rows)} rows, "
+                f"{len(pending_files)} files): {e} — backoff {backoff}s "
+                f"(failure #{consecutive_failures})", "ERROR")
+            # Update retry counts in all pending cache files
+            for cf in pending_files:
+                try:
+                    with open(cf, 'r') as f:
+                        cd = json.load(f)
+                    cd['retry_count'] = cd.get('retry_count', 0) + 1
+                    cd['last_error']  = str(e)
+                    cd['last_retry']  = datetime.utcnow().isoformat()
+                    with open(cf, 'w') as f:
+                        json.dump(cd, f, indent=2)
+                except Exception as we:
+                    log(f"Failed to update retry count for {cf.name}: {we}", "WARNING")
+            last_flush = time.time()
+            time.sleep(backoff)
+            return False
+
     while not stop_event.is_set():
         try:
-            # Get oldest cached file
             cached_files = get_cached_files(cache_dir)
-            
+
             if cached_files:
-                oldest_file = cached_files[0]
-                
-                # Insert the file
-                success = insert_cached_file(client, oldest_file, database, table)
-                
-                if success:
-                    consecutive_failures = 0
-                else:
-                    consecutive_failures += 1
-                    # Backoff delay: increase wait time with consecutive failures
-                    # 5s, 10s, 20s, 30s, max 60s
-                    backoff_delay = min(5 * (2 ** min(consecutive_failures - 1, 3)), 60)
-                    log(f"Insert failed, backing off for {backoff_delay} seconds (failure #{consecutive_failures})", "WARNING")
-                    time.sleep(backoff_delay)
+                # Pick the oldest file not already in pending_files
+                pending_set = set(pending_files)
+                for cache_file in cached_files:
+                    if cache_file in pending_set:
+                        continue
+
+                    # Load and parse the cache file, with partial recovery on corruption
+                    try:
+                        with open(cache_file, 'r') as f:
+                            try:
+                                cache_data = json.load(f)
+                                spots = cache_data.get('spots', [])
+                            except json.JSONDecodeError as je:
+                                log(f"Corrupted JSON in {cache_file.name} at char {je.pos}: "
+                                    f"{je.msg} — attempting partial recovery", "WARNING")
+                                spots = recover_spots_from_corrupt_json(cache_file)
+                                if spots:
+                                    log(f"Recovered {len(spots)} spots from corrupted {cache_file.name}", "INFO")
+                                else:
+                                    bad_dir = cache_file.parent / 'bad'
+                                    bad_dir.mkdir(exist_ok=True)
+                                    cache_file.rename(bad_dir / cache_file.name)
+                                    log(f"No spots recoverable from {cache_file.name} — quarantined", "WARNING")
+                                    continue
+                    except Exception as e:
+                        log(f"Cannot open {cache_file.name}: {e}", "WARNING")
+                        continue
+                    if not spots:
+                        cache_file.unlink()
+                        continue
+
+                    rows = [r for r in (process_spot(s) for s in spots) if r is not None]
+                    if not rows:
+                        cache_file.unlink()
+                        continue
+
+                    pending_rows.extend(rows)
+                    pending_files.append(cache_file)
+
+                    # Check flush thresholds
+                    elapsed = time.time() - last_flush
+                    if len(pending_rows) >= batch_flush_rows or elapsed >= batch_flush_seconds:
+                        log(f"Flush trigger: {len(pending_rows)} rows, "
+                            f"{len(pending_files)} files, {elapsed:.1f}s elapsed")
+                        flush_batch()
+                        break   # restart outer loop to re-scan cache dir
+
             else:
-                # No files, sleep briefly
-                consecutive_failures = 0
+                # No cache files — flush whatever's pending then idle
+                if pending_rows:
+                    log(f"Cache empty — flushing remaining {len(pending_rows)} rows")
+                    flush_batch()
+                else:
+                    consecutive_failures = 0
                 time.sleep(1)
-                
+
+            # Time-based flush even if we haven't hit the row threshold
+            if pending_rows and (time.time() - last_flush) >= batch_flush_seconds:
+                log(f"Timeout flush: {len(pending_rows)} rows from {len(pending_files)} files")
+                flush_batch()
+
         except Exception as e:
             log(f"Insert thread error: {e}", "ERROR")
             consecutive_failures += 1
             time.sleep(5)
-    
+
+    # Final flush on shutdown
+    if pending_rows:
+        log(f"Shutdown flush: {len(pending_rows)} rows from {len(pending_files)} files")
+        flush_batch()
+
     log("Insert thread stopped")
 
 
