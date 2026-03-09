@@ -4,6 +4,7 @@ WSPRDAEMON Server - Process .tbz files from wsprdaemon clients
 Usage: wsprdaemon_server.py --clickhouse-user <user> --clickhouse-password <pass> [options]
 """
 
+import io
 import argparse
 import json
 import sys
@@ -13,6 +14,10 @@ import re
 import tarfile
 import shutil
 import subprocess
+import queue
+import threading
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
@@ -20,7 +25,7 @@ import clickhouse_connect
 import logging
 
 # Version
-VERSION = "2.20.0"  # Fixed: O(n^2) processed-file scan replaced with single load per cycle
+VERSION = "2.24.1"  # Fix mark_tbz_processed: append-only to avoid rewriting entire file on every flush
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -32,12 +37,18 @@ DEFAULT_CONFIG = {
     'clickhouse_spots_table': 'spots',
     'clickhouse_noise_table': 'noise',
     'incoming_tbz_dirs': [],  # Must be specified via --incoming-dirs
-    'extraction_dir': '/var/lib/wsprdaemon/extraction',
+    'extraction_dir': '/tmp/wsprdaemon/extraction',
     'processed_tbz_file': '/var/lib/wsprdaemon/wsprdaemon/processed_tbz_list.txt',
     'max_processed_file_size': 1000000,
     'max_spots_per_insert': 50000,
     'max_noise_per_insert': 50000,
-    'loop_interval': 10
+    'loop_interval': 10,
+    'batch_flush_spots': 100000,   # flush accumulated spots when this many are pending
+    'batch_flush_noise': 50000,    # flush accumulated noise when this many are pending
+    'batch_flush_seconds': 10,     # flush if this many seconds have passed since last flush
+    'extraction_workers': 0,       # parallel extraction threads; 0 = auto (min(32, cpu_count))
+    'tmpfs_staging_dir': '/tmp/wsprdaemon/tbz_staging',  # copy tbz here before extraction
+    'tmpfs_staging_mb': 4096       # max MB to stage in RAM at once (default 4GB)
 }
 
 # Logging configuration
@@ -357,13 +368,28 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
         return False
 
 
-def find_tbz_files(dirs: List[str]) -> List[Path]:
-    """Find all .tbz files in the specified directories"""
+def find_tbz_files(dirs: List[str], chunk_size: int = 10000) -> List[Path]:
+    """Find up to chunk_size .tbz files across the specified directories.
+
+    Uses os.scandir() to stream directory entries rather than glob() which
+    collects all entries before returning.  Returns at most chunk_size files
+    sorted within the chunk so processing is roughly chronological.
+    With 2.4M files this avoids the multi-minute sort that blocked startup.
+    """
     tbz_files = []
     for directory in dirs:
         dir_path = Path(directory)
-        if dir_path.exists() and dir_path.is_dir():
-            tbz_files.extend(dir_path.glob('*.tbz'))
+        if not dir_path.exists() or not dir_path.is_dir():
+            continue
+        try:
+            with os.scandir(dir_path) as it:
+                for entry in it:
+                    if entry.name.endswith('.tbz') and entry.is_file():
+                        tbz_files.append(Path(entry.path))
+                        if len(tbz_files) >= chunk_size:
+                            return sorted(tbz_files)
+        except Exception as e:
+            log(f"Error scanning {directory}: {e}", "WARNING")
     return sorted(tbz_files)
 
 
@@ -385,47 +411,55 @@ def is_tbz_processed(tbz_file: Path, processed_set: set) -> bool:
 
 
 def mark_tbz_processed(tbz_file: Path, processed_file: Path, max_size: int):
-    """Mark a .tbz file as processed, truncating list if it gets too large"""
+    """Append a tbz file path to the processed list.
+
+    Uses append mode to avoid rewriting the entire file on every call.
+    Truncation to newest 75% only happens when the file exceeds max_size.
+    """
     processed_file.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Read existing entries
-    entries = []
-    if processed_file.exists():
+
+    # Check size before appending — only truncate when needed
+    try:
+        current_size = processed_file.stat().st_size if processed_file.exists() else 0
+    except Exception:
+        current_size = 0
+
+    if current_size > max_size:
+        # Read, truncate to newest 75%, rewrite
         try:
             with open(processed_file, 'r') as f:
                 entries = [line.strip() for line in f if line.strip()]
+            keep_count = max(1, int(len(entries) * 0.75))
+            entries = entries[-keep_count:]
+            with open(processed_file, 'w') as f:
+                f.write('\n'.join(entries) + '\n')
+            log(f"Truncated processed file to {keep_count} entries", "INFO")
         except Exception as e:
-            log(f"Error reading processed file: {e}", "WARNING")
-    
-    # Add new entry
-    entries.append(str(tbz_file))
-    
-    # Truncate if too large (keep newest 75%)
-    current_size = sum(len(e.encode('utf-8')) + 1 for e in entries)  # +1 for newline
-    if current_size > max_size:
-        keep_count = int(len(entries) * 0.75)
-        if keep_count < 1:
-            keep_count = 1
-        entries = entries[-keep_count:]
-        log(f"Truncated processed file to {keep_count} entries", "INFO")
-    
-    # Write back
+            log(f"Error truncating processed file: {e}", "WARNING")
+
+    # Append new entry
     try:
-        with open(processed_file, 'w') as f:
-            for entry in entries:
-                f.write(f"{entry}\n")
+        with open(processed_file, 'a') as f:
+            f.write(f"{tbz_file}\n")
     except Exception as e:
         log(f"Error writing processed file: {e}", "ERROR")
 
 
-def extract_tbz(tbz_file: Path, extraction_dir: Path) -> bool:
-    """Extract a .tbz file to the extraction directory"""
+def extract_tbz(tbz_source, extraction_dir: Path) -> bool:
+    """Extract a .tbz file (or bytes) to the extraction directory.
+    tbz_source can be a Path or bytes/BytesIO object."""
     try:
-        with tarfile.open(tbz_file, 'r:bz2') as tar:
-            tar.extractall(path=extraction_dir)
+        if isinstance(tbz_source, (bytes, bytearray)):
+            tbz_source = io.BytesIO(tbz_source)
+        if isinstance(tbz_source, io.BytesIO):
+            with tarfile.open(fileobj=tbz_source, mode='r:bz2') as tar:
+                tar.extractall(path=extraction_dir)
+        else:
+            with tarfile.open(tbz_source, 'r:bz2') as tar:
+                tar.extractall(path=extraction_dir)
         return True
     except Exception as e:
-        log(f"Failed to extract {tbz_file.name}: {e}", "ERROR")
+        log(f"Failed to extract tbz: {e}", "ERROR")
         return False
 
 
@@ -892,6 +926,106 @@ def insert_noise(client, noise_records: List[Dict], database: str, table: str,
         return False
 
 
+def stage_tbz_files_to_ram(tbz_files: List[Path], staging_dir: Path,
+                           max_mb: int = 4096) -> List[Path]:
+    """Copy tbz files from spinning disk to tmpfs staging directory.
+
+    Returns list of staged Path objects (in staging_dir).  Files that don't
+    fit within max_mb are left on disk and returned as-is.  Sequential reads
+    from spinning disk are ~200MB/s vs ~450ms random seeks — this converts
+    thousands of random seeks into a sequential read pass.
+    """
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clear any leftover files from a previous interrupted run
+    for f in staging_dir.glob('*.tbz'):
+        try:
+            f.unlink()
+        except Exception:
+            pass
+
+    max_bytes = max_mb * 1024 * 1024
+    staged = []
+    total_bytes = 0
+    skipped = 0
+
+    t0 = time.time()
+    for tbz_file in tbz_files:
+        try:
+            size = tbz_file.stat().st_size
+        except Exception:
+            staged.append(tbz_file)  # can't stat, use as-is
+            continue
+
+        if total_bytes + size > max_bytes:
+            staged.append(tbz_file)  # use original path, don't stage
+            skipped += 1
+            continue
+
+        dest = staging_dir / tbz_file.name
+        try:
+            shutil.copy2(tbz_file, dest)
+            staged.append(dest)
+            total_bytes += size
+        except Exception as e:
+            log(f"Failed to stage {tbz_file.name}: {e}", "WARNING")
+            staged.append(tbz_file)  # fall back to original
+
+    elapsed = time.time() - t0
+    staged_count = len(tbz_files) - skipped
+    log(f"Staged {staged_count}/{len(tbz_files)} tbz files to RAM "
+        f"({total_bytes/1024/1024:.1f} MB in {elapsed:.1f}s = "
+        f"{total_bytes/1024/1024/max(elapsed,0.001):.0f} MB/s)", "INFO")
+
+    return staged
+
+
+def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path,
+                          client, database: str, spots_table: str) -> Optional[Tuple]:
+    """Read tbz file into RAM then extract and parse in a private temp directory.
+
+    Reading the file content in one shot minimises disk seeks — one sequential
+    read per file instead of multiple random seeks during tarfile streaming.
+    Returns (tbz_file, spots, noise_records) on success, or None on failure.
+    """
+    worker_dir = base_extraction_dir / f"worker_{threading.get_ident()}_{tbz_file.stem}"
+    try:
+        # Read entire tbz into memory in one shot — minimises disk seek overhead
+        try:
+            tbz_bytes = tbz_file.read_bytes()
+        except Exception as e:
+            log(f"Failed to read {tbz_file.name}: {e}", "ERROR")
+            return None
+
+        worker_dir.mkdir(parents=True, exist_ok=True)
+
+        if not extract_tbz(io.BytesIO(tbz_bytes), worker_dir):
+            log(f"Failed to extract {tbz_file.name} (corrupt?), deleting", "ERROR")
+            try:
+                tbz_file.unlink()
+            except Exception as e:
+                log(f"Failed to delete corrupt file {tbz_file.name}: {e}", "ERROR")
+            return None
+
+        # Release raw bytes immediately — extracted files are on tmpfs
+        del tbz_bytes
+
+        client_version, running_jobs, receiver_descriptions = get_client_version(worker_dir)
+        spots = process_spot_files(worker_dir, client_version, client, database, spots_table)
+        noise_records = process_noise_files(worker_dir, running_jobs, receiver_descriptions)
+
+        return (tbz_file, spots, noise_records)
+
+    except Exception as e:
+        log(f"Error processing {tbz_file.name}: {e}", "ERROR")
+        return None
+    finally:
+        try:
+            shutil.rmtree(worker_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def main():
     parser = argparse.ArgumentParser(description='WSPRDAEMON Server - Process .tbz files')
     parser.add_argument('--clickhouse-user', required=True, help='ClickHouse username')
@@ -1041,98 +1175,148 @@ def main():
 
         log(f"Found {len(unprocessed)} unprocessed .tbz files", "INFO")
 
-        # Process each .tbz file
-        for tbz_file in unprocessed:
-            log(f"Processing {tbz_file.name}...", "INFO")
+        # Determine worker count
+        n_workers = config.get('extraction_workers', 0)
+        if not n_workers:
+            n_workers = min(32, os.cpu_count() or 4)
+        log(f"Using {n_workers} extraction workers", "DEBUG")
 
-            # Clean extraction directory
-            if extraction_dir.exists():
-                shutil.rmtree(extraction_dir)
-            extraction_dir.mkdir(parents=True, exist_ok=True)
+        # Producer/consumer pipeline:
+        #   - ThreadPoolExecutor: N workers extract+parse tbz files in parallel
+        #   - results_queue: workers push (tbz, spots, noise) tuples here
+        #   - flush thread: drains queue and inserts to ClickHouse independently
+        # Extraction never stalls waiting for ClickHouse inserts.
 
-            # Extract
-            if not extract_tbz(tbz_file, extraction_dir):
-                log(f"Failed to extract {tbz_file.name} (corrupt?), deleting", "ERROR")
-                try:
-                    tbz_file.unlink()
-                    log(f"Deleted corrupt file: {tbz_file.name}", "WARNING")
-                except Exception as e:
-                    log(f"Failed to delete corrupt file {tbz_file.name}: {e}", "ERROR")
-                continue
+        SENTINEL = object()
+        results_queue = queue.Queue(maxsize=n_workers * 4)  # bounded for backpressure
+        flush_errors  = []
 
-            # Get CLIENT_VERSION, RUNNING_JOBS, and RECEIVER_DESCRIPTIONS from uploads_config.txt
-            client_version, running_jobs, receiver_descriptions = get_client_version(extraction_dir)
-            if client_version:
-                log(f"Using CLIENT_VERSION: {client_version}", "DEBUG")
-            else:
-                log("No CLIENT_VERSION found in uploads_config.txt", "DEBUG")
+        def flush_thread_worker():
+            pending_spots = []
+            pending_noise = []
+            pending_tbz   = []
+            last_flush    = time.time()
 
-            # Process spots
-            spots = process_spot_files(extraction_dir, client_version,
-                                      client, config['clickhouse_database'],
-                                      config['clickhouse_spots_table'])
-            log(f"Parsed {len(spots)} spots from {tbz_file.name}", "INFO")
-            if spots and not config.get('dry_run'):
-                max_retries = 3
-                retry_delay = 2  # seconds
-                success = False
+            def do_flush():
+                nonlocal pending_spots, pending_noise, pending_tbz, last_flush
+                if not pending_spots and not pending_noise:
+                    pending_tbz = []
+                    last_flush = time.time()
+                    return
 
-                for attempt in range(max_retries):
-                    if insert_spots(client, spots, config['clickhouse_database'],
-                                  config['clickhouse_spots_table'], config['max_spots_per_insert']):
-                        log(f"Inserted {len(spots)} spots from {tbz_file.name}", "INFO")
-                        success = True
-                        break
-                    else:
+                if config.get('dry_run'):
+                    log(f"DRY RUN: would flush {len(pending_spots)} spots, "
+                        f"{len(pending_noise)} noise from {len(pending_tbz)} tbz files", "INFO")
+                    pending_spots, pending_noise, pending_tbz = [], [], []
+                    last_flush = time.time()
+                    return
+
+                success = True
+
+                if pending_spots:
+                    max_retries, retry_delay, ok = 3, 2, False
+                    for attempt in range(max_retries):
+                        if insert_spots(client, pending_spots,
+                                        config['clickhouse_database'],
+                                        config['clickhouse_spots_table'],
+                                        config['max_spots_per_insert']):
+                            log(f"Flushed {len(pending_spots)} spots from "
+                                f"{len(pending_tbz)} tbz files", "INFO")
+                            ok = True
+                            break
                         if attempt < max_retries - 1:
-                            log(f"Failed to insert spots from {tbz_file.name}, retrying in {retry_delay} seconds... (attempt {attempt+1}/{max_retries})", "WARNING")
+                            log(f"Spot flush failed, retrying in {retry_delay}s", "WARNING")
                             time.sleep(retry_delay)
                             retry_delay *= 2
-                        else:
-                            log(f"Failed to insert spots from {tbz_file.name} after {max_retries} attempts", "ERROR")
+                    if not ok:
+                        log(f"Spot flush failed after {max_retries} attempts", "ERROR")
+                        flush_errors.append("spots")
+                        success = False
 
-                if not success:
-                    log(f"Skipping {tbz_file.name} - will retry on next cycle", "WARNING")
-                    continue
-
-            # Process noise
-            noise_records = process_noise_files(extraction_dir, running_jobs, receiver_descriptions)
-            log(f"Parsed {len(noise_records)} noise records from {tbz_file.name}", "INFO")
-            if noise_records and not config.get('dry_run'):
-                max_retries = 3
-                retry_delay = 2  # seconds
-                success = False
-
-                for attempt in range(max_retries):
-                    if insert_noise(client, noise_records, config['clickhouse_database'],
-                                  config['clickhouse_noise_table'], config['max_noise_per_insert']):
-                        log(f"Inserted {len(noise_records)} noise records from {tbz_file.name}", "INFO")
-                        success = True
-                        break
-                    else:
+                if pending_noise and success:
+                    max_retries, retry_delay, ok = 3, 2, False
+                    for attempt in range(max_retries):
+                        if insert_noise(client, pending_noise,
+                                        config['clickhouse_database'],
+                                        config['clickhouse_noise_table'],
+                                        config['max_noise_per_insert']):
+                            log(f"Flushed {len(pending_noise)} noise records", "INFO")
+                            ok = True
+                            break
                         if attempt < max_retries - 1:
-                            log(f"Failed to insert noise from {tbz_file.name}, retrying in {retry_delay} seconds... (attempt {attempt+1}/{max_retries})", "WARNING")
+                            log(f"Noise flush failed, retrying in {retry_delay}s", "WARNING")
                             time.sleep(retry_delay)
                             retry_delay *= 2
-                        else:
-                            log(f"Failed to insert noise from {tbz_file.name} after {max_retries} attempts", "ERROR")
-                
-                if not success:
-                    log(f"Skipping {tbz_file.name} - will retry on next cycle", "WARNING")
+                    if not ok:
+                        log(f"Noise flush failed after {max_retries} attempts", "ERROR")
+                        flush_errors.append("noise")
+                        success = False
+
+                if success:
+                    for tbz_file in pending_tbz:
+                        mark_tbz_processed(tbz_file, processed_file,
+                                           config['max_processed_file_size'])
+                        try:
+                            tbz_file.unlink()
+                        except Exception as e:
+                            log(f"Failed to delete {tbz_file.name}: {e}", "WARNING")
+                    pending_spots, pending_noise, pending_tbz = [], [], []
+
+                last_flush = time.time()
+
+            while True:
+                try:
+                    item = results_queue.get(timeout=config['batch_flush_seconds'])
+                except queue.Empty:
+                    if pending_spots or pending_noise:
+                        log(f"Timeout flush: {len(pending_spots)} spots, "
+                            f"{len(pending_noise)} noise, {len(pending_tbz)} files", "INFO")
+                        do_flush()
                     continue
 
-            # Mark as processed and delete source (skip in dry-run)
-            if not config.get('dry_run'):
-                mark_tbz_processed(tbz_file, processed_file, config['max_processed_file_size'])
-                try:
-                    tbz_file.unlink()
-                    log(f"Deleted {tbz_file.name}", "INFO")
-                except Exception as e:
-                    log(f"Failed to delete {tbz_file.name}: {e}", "WARNING")
+                if item is SENTINEL:
+                    if pending_spots or pending_noise:
+                        log(f"Final flush: {len(pending_spots)} spots, "
+                            f"{len(pending_noise)} noise, {len(pending_tbz)} files", "INFO")
+                        do_flush()
+                    break
 
-        # Clean up extraction directory
-        if extraction_dir.exists():
-            shutil.rmtree(extraction_dir)
+                tbz_file, spots, noise_records = item
+                pending_spots.extend(spots)
+                pending_noise.extend(noise_records)
+                pending_tbz.append(tbz_file)
+
+                elapsed = time.time() - last_flush
+                if (len(pending_spots) >= config['batch_flush_spots'] or
+                        len(pending_noise) >= config['batch_flush_noise'] or
+                        elapsed >= config['batch_flush_seconds']):
+                    log(f"Flush trigger: {len(pending_spots)} spots, "
+                        f"{len(pending_noise)} noise, {elapsed:.1f}s elapsed", "INFO")
+                    do_flush()
+
+        flusher = threading.Thread(target=flush_thread_worker, daemon=True)
+        flusher.start()
+
+        def extract_and_enqueue(tbz_file):
+            result = extract_and_parse_tbz(
+                tbz_file, extraction_dir, client,
+                config['clickhouse_database'],
+                config['clickhouse_spots_table']
+            )
+            if result is not None:
+                results_queue.put(result)  # blocks if queue full — natural backpressure
+
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = [executor.submit(extract_and_enqueue, f) for f in unprocessed]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    log(f"Extraction worker error: {e}", "ERROR")
+
+        results_queue.put(SENTINEL)
+        flusher.join()
+
 
         if not args.loop:
             break
