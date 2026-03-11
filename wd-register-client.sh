@@ -5,6 +5,58 @@
 ### Script to register WSPRDAEMON client stations for SFTP uploads
 ### Creates user accounts on gateway servers and configures client access
 ###
+### v3.13.0 Changes:
+###   - FIX: wd-client-to-server-setup now applies the 'user' field from the
+###         SSR config (client_user_name) to override the default 'wsprdaemon'
+###         arg. RAC 161 (user=alan) and others with non-default logins now
+###         connect correctly for scp, ssh, and all subsequent operations.
+###   - NEW: Version number printed on every invocation for easy verification.
+###
+### v3.12.0 Changes:
+###   - FIX: setup-autologin-all now looks up the 'user' field from the SSR
+###         config for each RAC and uses that as the SSH login name instead
+###         of always using the global client_user default (wsprdaemon).
+###         RACs like RAC 161 with user=alan now connect correctly.
+###
+### v3.11.0 Changes:
+###   - FIX: install_autologin_key now installs keys manually via sshpass+ssh
+###         instead of ssh-copy-id, which was leaving behind ssh-copy-id.*
+###         temp directories in ~/.ssh on every failed connection attempt.
+###
+### v3.10.0 Changes:
+###   - IMPROVE: show-rac-last-login now derives RAC# from remotePort
+###         (port - 35800 = RAC# for SSH ports, port - 45800 = RAC# for
+###         WEB ports). Pairs SSH and WEB proxies for the same RAC into a
+###         single row. Non-RAC ports are shown in a separate section.
+###
+### v3.9.0 Changes:
+###   - REWRITE: show-rac-last-login now uses the frps REST API instead of
+###         log parsing. Queries http://localhost:7500/api/proxy/tcp with
+###         admin credentials to get live proxy name, remote port, status,
+###         lastStartTime, and lastCloseTime for every registered proxy.
+###         Much more reliable and doesn't require log file access.
+###   - REMOVED: frps log file parsing (replaced by API)
+###
+### v3.8.0 Changes:
+###   - NEW: show-rac-last-login command
+###         Parses the frps log file to report when each RAC client last
+###         connected its proxy tunnel. Correlates proxy name (e.g. "rac003")
+###         to RAC number and port. Accepts optional --log <file> and
+###         --since <days> arguments. Output is sorted by last-seen time.
+###
+### v3.7.0 Changes:
+###   - NEW: setup-autologin-all prompts once for a session-only fallback
+###         password at startup. When a RAC has no stored config password,
+###         OR when the stored password fails ssh-copy-id, the fallback is
+###         tried automatically. The fallback is never written to disk.
+###
+### v3.6.0 Changes:
+###   - NEW: setup-autologin-all command
+###         Scans all RAC ports 1-213; for each reachable port that lacks
+###         passwordless SSH access, looks up the RAC password from the
+###         encrypted SSR config and uses sshpass + ssh-copy-id to install
+###         the local public key, enabling future autologin.
+###
 ### v3.5.0 Changes:
 ###   - NEW: manual-setup mode for creating accounts without RAC access
 ###   - Usage: ./wd-register-client.sh manual-setup <USERNAME> <SSH_PUBKEY>
@@ -49,12 +101,14 @@
 ### Usage:
 ###   ./wd-register-client.sh <RAC_NUMBER> [client_user]
 ###   ./wd-register-client.sh clean-gw-keys <RAC_NUMBER> [client_user]
+###   ./wd-register-client.sh show-rac-last-login [--log FILE] [--since DAYS] [--connected] [--sort time|rac]
+###   ./wd-register-client.sh setup-autologin-all [client_user]
 ###   ./wd-register-client.sh scan-and-clean-all [client_user]
 ###   ./wd-register-client.sh -V|--version
 ###
 ###############################################################################
 
-declare VERSION="3.5.0"
+declare VERSION="3.13.0"
 
 if [[ -f ~/wsprdaemon/bash-aliases ]]; then
     source ~/wsprdaemon/bash-aliases
@@ -716,10 +770,20 @@ function wd-client-to-server-setup()
     local client_ip_port=$(( 35800 + client_rac ))
 
     local client_user_password
+    local client_user_name
     wd-ssr-client-lookup "client_user_name" "client_user_password" ${client_rac}
     rc=$? ; if (( rc )); then
         echo "ERROR: can't find user with RAC ${client_rac} in encrypted config"
         return 1
+    fi
+
+    ### Override client_user with the name from the SSR config (e.g. 'alan' for RAC 161)
+    ### The command-line arg is only a fallback when the config has no user field.
+    if [[ -n "${client_user_name}" ]]; then
+        if [[ "${client_user_name}" != "${client_user}" ]]; then
+            echo "Using SSR config login user '${client_user_name}' (not default '${client_user}')"
+        fi
+        client_user="${client_user_name}"
     fi
 
     ### Display the RAC credentials and get password (prompts if not in config)
@@ -1221,6 +1285,580 @@ manual_setup_user() {
 }
 
 ###############################################################################
+### setup-autologin-all: Walk all RAC ports; install SSH key where autologin
+### is not yet working, using the password from the encrypted SSR config.
+###############################################################################
+
+### Try to install our SSH public key on a single RAC client using sshpass.
+### Returns 0 on success, 1 on failure.
+### Sets WD_AUTOLOGIN_RESULT to a human-readable status string.
+declare WD_AUTOLOGIN_RESULT=""
+
+install_autologin_key() {
+    local client_ip_port="$1"
+    local client_user="$2"
+    local password="$3"
+
+    ### Find our local public key (prefer ed25519, fall back to ecdsa, rsa)
+    local local_pubkey_file=""
+    for f in ~/.ssh/id_ed25519.pub ~/.ssh/id_ecdsa.pub ~/.ssh/id_rsa.pub; do
+        if [[ -f "$f" ]]; then
+            local_pubkey_file="$f"
+            break
+        fi
+    done
+
+    if [[ -z "${local_pubkey_file}" ]]; then
+        WD_AUTOLOGIN_RESULT="No local public key found (~/.ssh/id_*.pub)"
+        return 1
+    fi
+
+    local pubkey
+    pubkey=$(<"${local_pubkey_file}")
+
+    ### Install key manually via a single sshpass+ssh command.
+    ### This avoids ssh-copy-id entirely — ssh-copy-id creates temp dirs in
+    ### ~/.ssh on every invocation and leaves them behind on failed connections.
+    ### We replicate its logic: mkdir .ssh, append key if not already present,
+    ### fix permissions.
+    if sshpass -p "${password}" \
+            ssh ${SSH_OPTS} \
+            -p "${client_ip_port}" \
+            "${client_user}@${WD_RAC_SERVER}" \
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+             grep -qxF '${pubkey}' ~/.ssh/authorized_keys 2>/dev/null || \
+             echo '${pubkey}' >> ~/.ssh/authorized_keys && \
+             chmod 600 ~/.ssh/authorized_keys" \
+            2>/dev/null; then
+        WD_AUTOLOGIN_RESULT="Key installed from ${local_pubkey_file}"
+        return 0
+    else
+        WD_AUTOLOGIN_RESULT="sshpass+ssh failed (wrong password or connection refused)"
+        return 1
+    fi
+}
+
+### Main command handler for setup-autologin-all
+cmd_setup_autologin_all() {
+    local client_user="${1:-wsprdaemon}"
+    local max_rac="${2:-213}"   # upper bound; can override as 3rd arg if needed
+
+    ### Ensure we can reach GW2 / RAC ports at all
+    if ! ensure_gw2_connection; then
+        return 1
+    fi
+    echo "Using connection: ${WD_RAC_CONNECTION_PATH}"
+    echo ""
+
+    ### Load encrypted RAC config once up-front so we have all passwords in memory.
+    ### load_rac_configs prompts for the SSR passphrase (never cached on disk).
+    if ! load_rac_configs; then
+        echo "ERROR: Cannot load RAC configs; aborting."
+        return 1
+    fi
+
+    ### Ensure sshpass is available
+    if ! check_sshpass; then
+        return 1
+    fi
+
+    ###########################################################################
+    ### Prompt once for a session-only fallback password.
+    ### This is tried when:
+    ###   (a) a RAC has no password stored in the SSR config, OR
+    ###   (b) a RAC has a stored password but ssh-copy-id fails with it.
+    ### The fallback is held only in this local variable — never written to
+    ### disk — so it is safe to use the well-known site default here without
+    ### embedding it in the script itself.
+    ###########################################################################
+    local fallback_password=""
+    echo "=== Fallback Password ===" >&2
+    echo "Enter a default password to try when a RAC has no stored password" >&2
+    echo "or when its stored password fails. This is held in memory only —" >&2
+    echo "never written to disk. Press Enter to skip fallback attempts." >&2
+    read -sp "Fallback password (blank = none): " fallback_password >&2
+    echo "" >&2
+    if [[ -z "${fallback_password}" ]]; then
+        echo "No fallback password set — will skip RACs with no/wrong stored password." >&2
+    else
+        echo "Fallback password set (session only)." >&2
+    fi
+    echo "" >&2
+
+    local log_file="wd-autologin-setup-$(date +%Y%m%d_%H%M%S).log"
+    echo "Scanning RACs 1-${max_rac} for autologin setup..."
+    echo "Log file: ${log_file}"
+    echo ""
+    echo "Started at $(date)" | tee "${log_file}"
+    echo "======================================" | tee -a "${log_file}"
+
+    declare -i already_count=0
+    declare -i installed_count=0
+    declare -i failed_count=0
+    declare -i no_port_count=0
+    declare -i no_password_count=0
+    declare -a installed_racs=()
+    declare -a failed_racs=()
+    declare -a no_password_racs=()
+
+    for (( rac=1; rac<=max_rac; rac++ )); do
+        local client_ip_port=$(( RAC_BASE_PORT + rac ))
+
+        printf "RAC #%-3d port %-5d  " "${rac}" "${client_ip_port}"
+
+        ### 1. Is the port reachable at all?
+        if ! nc -z -w 2 "${WD_RAC_SERVER}" "${client_ip_port}" >/dev/null 2>&1; then
+            printf "SKIP  (port closed)\n" | tee -a "${log_file}"
+            (( no_port_count++ ))
+            continue
+        fi
+
+        ### 2. Can we already autologin? Check with the RAC-specific user if known,
+        ###    but we don't have rac_user yet at this point — use client_user for the
+        ###    quick pre-check; if it fails we'll re-check with rac_user after lookup.
+        if ssh ${SSH_OPTS} -p "${client_ip_port}" -o BatchMode=yes \
+                "${client_user}@${WD_RAC_SERVER}" "exit 0" >/dev/null 2>&1; then
+            printf "OK    (autologin already works as %s)\n" "${client_user}" | tee -a "${log_file}"
+            (( already_count++ ))
+            continue
+        fi
+
+        ### 3. Autologin doesn't work — look up the user and password for this RAC.
+        local rac_index
+        rac_index=$(find_rac_by_id "${rac}")
+
+        local rac_password=""
+        local rac_site="unknown"
+        local rac_user="${client_user}"   # default, overridden if in SSR config
+
+        if [[ "${rac_index}" != "-1" ]]; then
+            rac_password="${WD_RAC_PASSWORDS[${rac_index}]}"
+            rac_site="${WD_RAC_SITES[${rac_index}]}"
+            ### Use the user field from SSR config if present
+            local config_user="${WD_RAC_USERS[${rac_index}]}"
+            [[ -z "${config_user}" ]] && config_user="${WD_RAC_ACCOUNTS[${rac_index}]}"
+            [[ -n "${config_user}" ]] && rac_user="${config_user}"
+        fi
+
+        printf "SETUP (autologin missing%s, user: %s)..." \
+            "${rac_site:+", site: ${rac_site}"}" "${rac_user}" | tee -a "${log_file}"
+        printf "\n" | tee -a "${log_file}"
+
+        ### 4. Build the ordered list of passwords to try:
+        ###      - stored config password (if any)
+        ###      - fallback password (if any, and different from stored)
+        local -a passwords_to_try=()
+        if [[ -n "${rac_password}" ]]; then
+            passwords_to_try+=("${rac_password}")
+        fi
+        if [[ -n "${fallback_password}" && "${fallback_password}" != "${rac_password}" ]]; then
+            passwords_to_try+=("${fallback_password}")
+        fi
+
+        if (( ${#passwords_to_try[@]} == 0 )); then
+            printf "      SKIP  (no password available)\n" | tee -a "${log_file}"
+            (( no_password_count++ ))
+            no_password_racs+=("${rac}")
+            continue
+        fi
+
+        ### 5. Try each password in order; stop on first success.
+        local key_installed=0
+        local attempt_label=""
+        for try_password in "${passwords_to_try[@]}"; do
+            if [[ "${try_password}" == "${rac_password}" && -n "${rac_password}" ]]; then
+                attempt_label="stored config password"
+            else
+                attempt_label="fallback password"
+            fi
+
+            if install_autologin_key "${client_ip_port}" "${rac_user}" "${try_password}"; then
+                key_installed=1
+                break
+            fi
+            printf "      ... %s failed, " "${attempt_label}" | tee -a "${log_file}"
+        done
+
+        if (( key_installed == 0 )); then
+            printf "      FAILED  — all passwords tried, none worked (%s)\n" \
+                "${WD_AUTOLOGIN_RESULT}" | tee -a "${log_file}"
+            (( failed_count++ ))
+            failed_racs+=("${rac}")
+            continue
+        fi
+
+        ### 6. Verify autologin actually works now
+        if ssh ${SSH_OPTS} -p "${client_ip_port}" -o BatchMode=yes \
+                "${rac_user}@${WD_RAC_SERVER}" "exit 0" >/dev/null 2>&1; then
+            printf "      SUCCESS — autologin verified via %s (%s)\n" \
+                "${attempt_label}" "${WD_AUTOLOGIN_RESULT}" | tee -a "${log_file}"
+            (( installed_count++ ))
+            installed_racs+=("${rac}")
+        else
+            printf "      WARNING — key installed but autologin verify still failed\n" \
+                | tee -a "${log_file}"
+            (( failed_count++ ))
+            failed_racs+=("${rac}")
+        fi
+    done
+
+    ### Clear fallback password from memory
+    fallback_password=""
+
+    echo "" | tee -a "${log_file}"
+    echo "======================================" | tee -a "${log_file}"
+    echo "Scan completed at $(date)" | tee -a "${log_file}"
+    echo "" | tee -a "${log_file}"
+    echo "Summary:" | tee -a "${log_file}"
+    echo "  Already working:   ${already_count}" | tee -a "${log_file}"
+    echo "  Newly installed:   ${installed_count}" | tee -a "${log_file}"
+    echo "  Failed:            ${failed_count}" | tee -a "${log_file}"
+    echo "  No port / offline: ${no_port_count}" | tee -a "${log_file}"
+    echo "  No password:       ${no_password_count}" | tee -a "${log_file}"
+    echo "  Total scanned:     ${max_rac}" | tee -a "${log_file}"
+    echo "" | tee -a "${log_file}"
+
+    if (( ${#installed_racs[@]} > 0 )); then
+        echo "Newly set up (${#installed_racs[@]}):" | tee -a "${log_file}"
+        for rac in "${installed_racs[@]}"; do
+            echo "  RAC #${rac}" | tee -a "${log_file}"
+        done
+        echo "" | tee -a "${log_file}"
+    fi
+
+    if (( ${#failed_racs[@]} > 0 )); then
+        echo "Failed (${#failed_racs[@]}) — may need manual attention:" | tee -a "${log_file}"
+        for rac in "${failed_racs[@]}"; do
+            echo "  RAC #${rac}" | tee -a "${log_file}"
+        done
+        echo "" | tee -a "${log_file}"
+    fi
+
+    if (( ${#no_password_racs[@]} > 0 )); then
+        echo "No password available (${#no_password_racs[@]}) — skipped:" | tee -a "${log_file}"
+        for rac in "${no_password_racs[@]}"; do
+            echo "  RAC #${rac}" | tee -a "${log_file}"
+        done
+        echo "" | tee -a "${log_file}"
+    fi
+
+    echo "Full log saved to: ${log_file}"
+    return 0
+}
+
+###############################################################################
+### show-rac-last-login: Query the frps REST API to show proxy status,
+### last connect time, and remote port for every registered frpc client.
+###
+### The frps dashboard API at http://localhost:7500/api/proxy/tcp returns
+### a JSON array of all proxies (online and offline) with fields:
+###   name           — proxy/callsign name (e.g. "W7WKR-K1", "KFS-SE")
+###   conf.remotePort — the TCP port assigned on the server
+###   status         — "online" or "offline"
+###   lastStartTime  — last time proxy came online  ("MM-DD HH:MM:SS")
+###   lastCloseTime  — last time proxy went offline ("MM-DD HH:MM:SS")
+###   todayTrafficIn / todayTrafficOut — bytes today
+###   curConns       — current active connections through this proxy
+###
+### Usage:
+###   ./wd-register-client.sh show-rac-last-login [OPTIONS]
+###
+### Options:
+###   --api-url  <url>   frps API base URL (default: http://localhost:7500)
+###   --api-user <user>  frps dashboard username (default: admin)
+###   --api-pass <pass>  frps dashboard password (default: admin)
+###   --online           only show proxies currently online
+###   --offline          only show proxies currently offline
+###   --filter  <str>    only show proxies whose name contains <str>
+###   --sort    name|port|time|close|status
+###                      sort column (default: time = lastStartTime desc)
+###   --portwarn <N>     warn if remotePort doesn't look like a RAC port
+###                      (i.e. not in range RAC_BASE_PORT .. RAC_BASE_PORT+999)
+###############################################################################
+
+### frps API defaults — override with --api-* options or environment vars
+declare FRPS_API_URL="${FRPS_API_URL:-http://localhost:7500}"
+declare FRPS_API_USER="${FRPS_API_USER:-admin}"
+declare FRPS_API_PASS="${FRPS_API_PASS:-admin}"
+
+### Check that jq and curl are available
+check_api_deps() {
+    local missing=()
+    command -v curl &>/dev/null || missing+=(curl)
+    command -v jq   &>/dev/null || missing+=(jq)
+    if (( ${#missing[@]} > 0 )); then
+        echo "ERROR: Required tools not found: ${missing[*]}"
+        echo "Install with:  sudo apt-get install ${missing[*]}"
+        return 1
+    fi
+    return 0
+}
+
+### Fetch proxy list from frps API, return raw JSON
+fetch_frps_proxies() {
+    local api_url="$1" api_user="$2" api_pass="$3"
+    local response http_code
+
+    response=$(curl -s -w "\n%{http_code}" \
+        -u "${api_user}:${api_pass}" \
+        "${api_url}/api/proxy/tcp" 2>/dev/null)
+
+    http_code=$(echo "${response}" | tail -1)
+    local body=$(echo "${response}" | head -n -1)
+
+    case "${http_code}" in
+        200) echo "${body}"; return 0 ;;
+        401) echo "ERROR: Authentication failed — check --api-user / --api-pass" >&2; return 1 ;;
+        000) echo "ERROR: Cannot connect to frps API at ${api_url}" >&2
+             echo "       Is frps running?  Is the dashboard enabled in frps.toml?" >&2
+             return 1 ;;
+        *)   echo "ERROR: frps API returned HTTP ${http_code}" >&2
+             echo "       Response: ${body}" >&2
+             return 1 ;;
+    esac
+}
+
+### Parse "MM-DD HH:MM:SS" frps timestamp — prepend current year
+### Returns epoch seconds, or 0 if empty/unparseable
+frps_api_ts_to_epoch() {
+    local ts="$1"
+    [[ -z "${ts}" || "${ts}" == "0001-01-01 00:00:00" ]] && echo 0 && return
+    local year
+    year=$(date +%Y)
+    # frps format: "02-26 20:15:35"  — month-day hour:min:sec
+    date -d "${year}/${ts//-//}" +%s 2>/dev/null || echo 0
+}
+
+### Human-readable duration from epoch to now
+epoch_to_ago() {
+    local epoch=$1
+    (( epoch == 0 )) && echo "never" && return
+    local now
+    now=$(date +%s)
+    local age=$(( now - epoch ))
+    if   (( age <   0 ));       then echo "future?"
+    elif (( age < 120 ));       then echo "just now"
+    elif (( age < 3600 ));      then echo "$(( age/60 ))m ago"
+    elif (( age < 86400 ));     then echo "$(( age/3600 ))h $(( (age%3600)/60 ))m ago"
+    elif (( age < 86400*7 ));   then echo "$(( age/86400 ))d $(( (age%86400)/3600 ))h ago"
+    elif (( age < 86400*365 )); then echo "$(( age/86400 ))d ago"
+    else                             echo "$(( age/86400/365 ))y+ ago"
+    fi
+}
+
+cmd_show_rac_last_login() {
+    local opt_api_url="${FRPS_API_URL}"
+    local opt_api_user="${FRPS_API_USER}"
+    local opt_api_pass="${FRPS_API_PASS}"
+    local opt_online_only=0
+    local opt_offline_only=0
+    local opt_filter=""
+    local opt_sort="rac"
+
+    ### Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --api-url)   opt_api_url="$2";   shift 2 ;;
+            --api-user)  opt_api_user="$2";  shift 2 ;;
+            --api-pass)  opt_api_pass="$2";  shift 2 ;;
+            --online)    opt_online_only=1;  shift ;;
+            --offline)   opt_offline_only=1; shift ;;
+            --filter)    opt_filter="$2";    shift 2 ;;
+            --sort)      opt_sort="$2";      shift 2 ;;
+            *) echo "ERROR: Unknown option: $1" >&2
+               echo "Usage: $0 show-rac-last-login [--api-url URL] [--api-user U] [--api-pass P]" >&2
+               echo "       [--online] [--offline] [--filter STR] [--sort rac|name|time|close|status]" >&2
+               return 1 ;;
+        esac
+    done
+
+    if ! check_api_deps; then return 1; fi
+
+    echo "Querying frps API: ${opt_api_url}/api/proxy/tcp"
+    local json
+    if ! json=$(fetch_frps_proxies "${opt_api_url}" "${opt_api_user}" "${opt_api_pass}"); then
+        return 1
+    fi
+
+    local proxy_count
+    proxy_count=$(echo "${json}" | jq '.proxies | length' 2>/dev/null)
+    if [[ -z "${proxy_count}" || "${proxy_count}" == "null" ]]; then
+        echo "ERROR: Unexpected API response format."
+        echo "${json}" | head -10
+        return 1
+    fi
+    echo "Found ${proxy_count} registered proxies."
+    echo ""
+
+    ###########################################################################
+    ### Derive RAC# from remotePort:
+    ###   35800 + RAC# => SSH/data port  (proxy name = callsign, e.g. W7WKR-K1)
+    ###   45800 + RAC# => WEB port       (proxy name = callsign-WEB)
+    ### For each RAC# we collect both rows and display as one combined line.
+    ###########################################################################
+
+    ### Associative arrays keyed by RAC# (integer string)
+    declare -A rac_name=()          # callsign (from SSH proxy)
+    declare -A rac_ssh_status=()    # online/offline
+    declare -A rac_ssh_start=()     # lastStartTime string
+    declare -A rac_ssh_start_ep=()  # lastStartTime epoch
+    declare -A rac_ssh_close=()     # lastCloseTime string
+    declare -A rac_web_status=()
+    declare -A rac_conns=()         # curConns on SSH proxy
+    declare -A rac_traffic=()       # todayTrafficIn on SSH proxy
+    declare -a other_proxies=()     # proxies whose port doesn't fit either range
+
+    while IFS=$'\t' read -r name port status last_start last_close traffic_in conns; do
+        local rac_num=-1
+        local is_web=0
+
+        if (( port > 35800 && port <= 35800+999 )); then
+            rac_num=$(( port - 35800 ))
+            is_web=0
+        elif (( port > 45800 && port <= 45800+999 )); then
+            rac_num=$(( port - 45800 ))
+            is_web=1
+        fi
+
+        if (( rac_num < 1 )); then
+            other_proxies+=("${name}	${port}	${status}	${last_start}")
+            continue
+        fi
+
+        local start_ep
+        start_ep=$(frps_api_ts_to_epoch "${last_start}")
+
+        if (( is_web == 0 )); then
+            rac_name["${rac_num}"]="${name}"
+            rac_ssh_status["${rac_num}"]="${status}"
+            rac_ssh_start["${rac_num}"]="${last_start}"
+            rac_ssh_start_ep["${rac_num}"]="${start_ep}"
+            rac_ssh_close["${rac_num}"]="${last_close}"
+            rac_conns["${rac_num}"]="${conns}"
+            rac_traffic["${rac_num}"]="${traffic_in}"
+        else
+            rac_web_status["${rac_num}"]="${status}"
+            ### If we haven't seen the SSH proxy for this RAC yet, record name from WEB
+            [[ -z "${rac_name[${rac_num}]:-}" ]] && \
+                rac_name["${rac_num}"]="${name%-WEB}"
+        fi
+
+    done < <(echo "${json}" | jq -r '
+        .proxies[] |
+        [
+            .name,
+            (.conf.remotePort | tostring),
+            .status,
+            (.lastStartTime  // ""),
+            (.lastCloseTime  // ""),
+            (.todayTrafficIn // 0 | tostring),
+            (.curConns       // 0 | tostring)
+        ] | @tsv
+    ')
+
+    ###########################################################################
+    ### Build sortable row array: "sort_key\trac_num\t..."
+    ###########################################################################
+    local -a rows=()
+
+    for rac_num in "${!rac_name[@]}"; do
+        local name="${rac_name[${rac_num}]}"
+        local ssh_st="${rac_ssh_status[${rac_num}]:-?}"
+        local web_st="${rac_web_status[${rac_num}]:-?}"
+        local last_start="${rac_ssh_start[${rac_num}]:-}"
+        local start_ep="${rac_ssh_start_ep[${rac_num}]:-0}"
+        local last_close="${rac_ssh_close[${rac_num}]:-}"
+        local conns="${rac_conns[${rac_num}]:-0}"
+        local traffic_in="${rac_traffic[${rac_num}]:-0}"
+
+        ### Filters
+        [[ -n "${opt_filter}"    ]] && [[ "${name}" != *"${opt_filter}"* ]] && continue
+        (( opt_online_only  )) && [[ "${ssh_st}" != "online"  ]] && continue
+        (( opt_offline_only )) && [[ "${ssh_st}" != "offline" ]] && continue
+
+        local ago
+        ago=$(epoch_to_ago "${start_ep}")
+
+        ### Format traffic
+        local traffic_str="-"
+        if (( traffic_in > 0 )); then
+            if   (( traffic_in > 1048576 )); then traffic_str="$(( traffic_in/1048576 ))MB"
+            elif (( traffic_in > 1024 ));    then traffic_str="$(( traffic_in/1024 ))KB"
+            else                                  traffic_str="${traffic_in}B"
+            fi
+        fi
+
+        ### Combined status: SSH/WEB
+        local ssh_disp="${ssh_st}"
+        [[ "${ssh_st}" == "online"  ]] && ssh_disp="UP"
+        [[ "${ssh_st}" == "offline" ]] && ssh_disp="down"
+        local web_disp="${web_st}"
+        [[ "${web_st}" == "online"  ]] && web_disp="UP"
+        [[ "${web_st}" == "offline" ]] && web_disp="down"
+        local combined_status="${ssh_disp}/${web_disp}"
+
+        ### Sort key
+        local sort_key
+        case "${opt_sort}" in
+            name)   sort_key="${name}" ;;
+            time)   sort_key=$(printf "%020d" "${start_ep}") ;;
+            close)  sort_key="${last_close:-0000-00-00 00:00:00}" ;;
+            status) sort_key="${ssh_st}" ;;
+            rac|*)  sort_key=$(printf "%05d" "${rac_num}") ;;
+        esac
+
+        rows+=("${sort_key}	${rac_num}	${name}	${combined_status}	${last_start}	${ago}	${last_close}	${traffic_str}	${conns}")
+    done
+
+    if (( ${#rows[@]} == 0 )); then
+        echo "No RAC proxies match the current filters."
+    else
+        ### Sort — close and time are descending (most recent first), others ascending
+        local -a sorted_rows=()
+        if [[ "${opt_sort}" == "time" || "${opt_sort}" == "close" ]]; then
+            mapfile -t sorted_rows < <(printf '%s\n' "${rows[@]}" | sort -t$'\t' -k1 -r)
+        else
+            mapfile -t sorted_rows < <(printf '%s\n' "${rows[@]}" | sort -t$'\t' -k1)
+        fi
+
+        local online_count=0 offline_count=0
+
+        printf "%-5s  %-5s  %-22s  %-9s  %-16s  %-16s  %-16s  %s\n" \
+            "RAC#" "PORT" "PROXY NAME" "SSH/WEB" "LAST CONNECT" "AGO" "LAST CLOSE" "TODAY"
+        printf "%s\n" \
+            "-----  -----  ----------------------  ---------  ----------------  ----------------  ----------------  -------"
+
+        for row in "${sorted_rows[@]}"; do
+            IFS=$'\t' read -r _key rac_num name status last_start ago last_close traffic conns <<< "${row}"
+            local ssh_port=$(( 35800 + rac_num ))
+            printf "%-5s  %-5s  %-22s  %-9s  %-16s  %-16s  %-16s  %s\n" \
+                "${rac_num}" "${ssh_port}" "${name}" "${status}" \
+                "${last_start:--}" "${ago}" "${last_close:--}" "${traffic}"
+            [[ "${status}" == UP/* ]] && (( online_count++ )) || (( offline_count++ ))
+        done
+
+        echo ""
+        echo "RAC proxies: ${#sorted_rows[@]} total  |  SSH online: ${online_count}  |  SSH offline: ${offline_count}"
+    fi
+
+    ###########################################################################
+    ### Show non-RAC proxies separately (ports outside 35800/45800 ranges)
+    ###########################################################################
+    if (( ${#other_proxies[@]} > 0 && !opt_online_only && !opt_offline_only )); then
+        echo ""
+        echo "--- Non-RAC proxies (${#other_proxies[@]}) ---"
+        printf "%-25s  %-7s  %-8s  %s\n" "NAME" "PORT" "STATUS" "LAST CONNECT"
+        for row in "${other_proxies[@]}"; do
+            IFS=$'\t' read -r name port status last_start <<< "${row}"
+            printf "%-25s  %-7s  %-8s  %s\n" "${name}" "${port}" "${status}" "${last_start:--}"
+        done
+    fi
+
+    echo ""
+    return 0
+}
+
+###############################################################################
 ### Command Line Handling
 ###############################################################################
 
@@ -1229,9 +1867,12 @@ show_version() {
     echo "Project: ${WD_RAC_PROJECT_DIR}"
 }
 
-# Handle -V/--version flag first
+### Always print version
+echo "wd-register-client.sh v${VERSION}"
+
+# Handle -V/--version flag — short version already printed above; show project path and exit
 if [[ "${1-}" == "-V" || "${1-}" == "--version" ]]; then
-    show_version
+    echo "Project: ${WD_RAC_PROJECT_DIR}"
     exit 0
 fi
 
@@ -1261,6 +1902,8 @@ if [[ $# -lt 1 ]]; then
     echo "Usage: $0 <RAC_NUMBER> [client_user]"
     echo "   or: $0 manual-setup <USERNAME> <SSH_PUBKEY_FILE_OR_STRING>"
     echo "   or: $0 clean-gw-keys <RAC_NUMBER> [client_user]"
+    echo "   or: $0 show-rac-last-login [--api-url URL] [--api-user U] [--api-pass P] [--online] [--offline] [--filter STR] [--sort name|port|time|status]"
+    echo "   or: $0 setup-autologin-all [client_user]"
     echo "   or: $0 scan-and-clean-all [client_user]"
     echo "   or: $0 -V|--version"
     echo ""
@@ -1274,6 +1917,8 @@ if [[ $# -lt 1 ]]; then
     echo "  $0 <RAC_NUMBER>                         - Full client registration via RAC"
     echo "  $0 manual-setup <USER> <PUBKEY>         - Create user without RAC access"
     echo "  $0 clean-gw-keys <RAC_NUMBER>           - Only remove GW1/GW2 keys from one client"
+    echo "  $0 show-rac-last-login               - Query frps API for proxy status, port, and last connect time"
+    echo "  $0 setup-autologin-all [user]            - Install SSH keys on all reachable RACs lacking autologin"
     echo "  $0 scan-and-clean-all                   - Scan all RACs 1-213 and clean where possible"
     echo "  $0 -V|--version                         - Show version"
     echo ""
@@ -1326,6 +1971,20 @@ if [[ "$1" == "clean-gw-keys" ]]; then
     
     wd-remove-gw-keys-from-client "${client_ip_port}" "${client_user}"
     exit 0
+fi
+
+# Check for show-rac-last-login command
+if [[ "$1" == "show-rac-last-login" ]]; then
+    shift
+    cmd_show_rac_last_login "$@"
+    exit $?
+fi
+
+# Check for setup-autologin-all command
+if [[ "$1" == "setup-autologin-all" ]]; then
+    client_user="${2:-wsprdaemon}"
+    cmd_setup_autologin_all "${client_user}"
+    exit $?
 fi
 
 # Check for scan-and-clean-all command
