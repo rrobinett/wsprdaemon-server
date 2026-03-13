@@ -1,9 +1,80 @@
 #!/bin/bash
 ###############################################################################
-### wd-register-client.sh v3.5.0
+### wd-register-client.sh v3.25.0
 ###
 ### Script to register WSPRDAEMON client stations for SFTP uploads
 ### Creates user accounts on gateway servers and configures client access
+###
+### v3.32.0 Changes:
+###   - CHANGE: wd-versions now sorts by version (oldest first) by default.
+###         Use --sort rac to get RAC number order instead.
+###
+### v3.31.0 Changes:
+###   - FIX: wd-versions no longer prints duplicates when --sort version used.
+###         All results are now collected silently then printed in a single pass.
+###   - FIX: wd-versions-sort now uses awk+tab-delimited sort so version strings
+###         containing spaces (e.g. "3.2.3 (live)") sort correctly as one field.
+###   - FIX: wd-versions-login and wd-login use same awk column parsing fix.
+###
+### v3.30.0 Changes:
+###   - NEW: wd-versions-sort [LOGFILE]
+###         Re-sorts an existing wd-versions log by version number without
+###         rescanning. Uses most recent wd-versions-*.log if no file given.
+###   - NEW: wd-versions-login [LOGFILE]
+###         Walks RACs sorted oldest-version-first from a log file, SSHing
+###         in one at a time. After each session: Enter=next, s=skip, q=quit.
+###   - NEW: wd-login <RAC_NUMBER> [LOGFILE]
+###         SSH directly into a single RAC by number. Looks up the login
+###         user from the versions log; falls back to 'wsprdaemon'.
+###
+### v3.29.0 Changes:
+###   - FIX: wd-versions method 3 (git branch+count) now rejects branch names
+###         that don't look like version strings (e.g. 'master', 'main').
+###         These now fall through to method 4 (wsprdaemon.sh -V) which
+###         correctly returns the real version number.
+###   - CLEAN: Active port list no longer printed (just the count).
+###
+### v3.28.0 Changes:
+###   - FIX: wd-versions now validates version strings before accepting them.
+###         wd_version.txt files containing a literal $(cd ...) shell expression
+###         (RAC 14, 34 etc) are now rejected and fall through to next method.
+###   - NEW: Method 3 added — git symbolic-ref --short HEAD + git rev-list
+###         --count HEAD (the 'wdvv' alias pattern). Catches sites like RAC 14
+###         where wd_version.txt is corrupted but git history is intact.
+###   - FIX: wsprdaemon.sh -V timeout increased from 15 to 30 seconds to
+###         handle slow clients (RAC status log lines can add 5+ seconds).
+###   - Version detection order: wd_version.txt → grep VERSION= →
+###         git branch+count → wsprdaemon.sh -V
+###
+### v3.27.0 Changes:
+###   - FIX: wd-versions now tries three version detection methods in order:
+###       1. ~/wsprdaemon/wd_version.txt + git rev-list --count HEAD (newest)
+###       2. grep 'declare -r VERSION=' ~/wsprdaemon/wsprdaemon.sh (older)
+###       3. ~/wsprdaemon/wsprdaemon.sh -V => parse "Version = X.X.X" (oldest)
+###         Method 3 uses timeout 15 to avoid hanging on slow clients.
+###
+### v3.26.0 Changes:
+###   - FIX: wd-versions now does a parallel port scan first (batches of 40
+###         nc probes at once) so the active RAC list is built in seconds.
+###         Passphrase prompt comes AFTER the scan, only when we know there
+###         is work to do. Results stream live to terminal as each RAC is
+###         queried rather than waiting for all results before printing.
+###   - NEW: wd-versions --parallel N to tune batch size (default: 40)
+###
+### v3.25.0 Changes:
+###   - NEW: wd-versions command
+###         SSHes into every active RAC (autologin required) and reports
+###         the installed WD version. Tries new-style wd_version.txt +
+###         git rev-list first, falls back to grep in wsprdaemon.sh.
+###         Supports --timeout N and --sort rac|version|site options.
+###         Writes a timestamped log file of results.
+###
+### v3.14.0 Changes:
+###   - FIX: scan-and-clean-all now includes RAC# and port in every log line
+###         (was only printing to terminal, not to log file)
+###   - FIX: SSH autologin failures now report specific reason: host key
+###         mismatch, no pubkey, connection refused, or timeout
+###   - FIX: Summary now splits "skipped" into "no autologin" vs "port closed"
 ###
 ### v3.13.0 Changes:
 ###   - FIX: wd-client-to-server-setup now applies the 'user' field from the
@@ -13,7 +84,7 @@
 ###   - NEW: Version number printed on every invocation for easy verification.
 ###
 ### v3.12.0 Changes:
-###   - FIX: setup-autologin-all now looks up the 'user' field from the SSR
+###   - FIX: setup-autologin now looks up the 'user' field from the SSR
 ###         config for each RAC and uses that as the SSH login name instead
 ###         of always using the global client_user default (wsprdaemon).
 ###         RACs like RAC 161 with user=alan now connect correctly.
@@ -45,13 +116,13 @@
 ###         --since <days> arguments. Output is sorted by last-seen time.
 ###
 ### v3.7.0 Changes:
-###   - NEW: setup-autologin-all prompts once for a session-only fallback
+###   - NEW: setup-autologin prompts once for a session-only fallback
 ###         password at startup. When a RAC has no stored config password,
 ###         OR when the stored password fails ssh-copy-id, the fallback is
 ###         tried automatically. The fallback is never written to disk.
 ###
 ### v3.6.0 Changes:
-###   - NEW: setup-autologin-all command
+###   - NEW: setup-autologin command
 ###         Scans all RAC ports 1-213; for each reachable port that lacks
 ###         passwordless SSH access, looks up the RAC password from the
 ###         encrypted SSR config and uses sshpass + ssh-copy-id to install
@@ -102,13 +173,14 @@
 ###   ./wd-register-client.sh <RAC_NUMBER> [client_user]
 ###   ./wd-register-client.sh clean-gw-keys <RAC_NUMBER> [client_user]
 ###   ./wd-register-client.sh show-rac-last-login [--log FILE] [--since DAYS] [--connected] [--sort time|rac]
-###   ./wd-register-client.sh setup-autologin-all [client_user]
+###   ./wd-register-client.sh setup-autologin [client_user]
 ###   ./wd-register-client.sh scan-and-clean-all [client_user]
+###   ./wd-register-client.sh wd-versions [--timeout N] [--sort rac|version|site]
 ###   ./wd-register-client.sh -V|--version
 ###
 ###############################################################################
 
-declare VERSION="3.13.0"
+declare VERSION="3.32.0"
 
 if [[ -f ~/wsprdaemon/bash-aliases ]]; then
     source ~/wsprdaemon/bash-aliases
@@ -1285,7 +1357,7 @@ manual_setup_user() {
 }
 
 ###############################################################################
-### setup-autologin-all: Walk all RAC ports; install SSH key where autologin
+### setup-autologin: Walk all RAC ports; install SSH key where autologin
 ### is not yet working, using the password from the encrypted SSR config.
 ###############################################################################
 
@@ -1316,21 +1388,55 @@ install_autologin_key() {
     local pubkey
     pubkey=$(<"${local_pubkey_file}")
 
-    ### Install key manually via a single sshpass+ssh command.
-    ### This avoids ssh-copy-id entirely — ssh-copy-id creates temp dirs in
-    ### ~/.ssh on every invocation and leaves them behind on failed connections.
-    ### We replicate its logic: mkdir .ssh, append key if not already present,
-    ### fix permissions.
+    local install_cmd="mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+         grep -qxF '${pubkey}' ~/.ssh/authorized_keys 2>/dev/null || \
+         echo '${pubkey}' >> ~/.ssh/authorized_keys && \
+         chmod 600 ~/.ssh/authorized_keys"
+
+    ### Helper: run ssh with our existing key, no password
+    _ssh_keyonly() {
+        ssh ${SSH_OPTS} -o BatchMode=yes \
+            -o PasswordAuthentication=no \
+            -p "${client_ip_port}" \
+            "${client_user}@${WD_RAC_SERVER}" \
+            "${install_cmd}" 2>&1
+    }
+
+    ### First try: use our existing SSH key (no password needed).
+    local ssh_err
+    ssh_err=$(_ssh_keyonly)
+    local ssh_rc=$?
+
+    ### If host key mismatch, clear the stale entry and retry once
+    if [[ ${ssh_rc} -ne 0 ]] && echo "${ssh_err}" | grep -q "REMOTE HOST IDENTIFICATION\|Host key verification failed"; then
+        ssh-keygen -f "${HOME}/.ssh/known_hosts" -R "[${WD_RAC_SERVER}]:${client_ip_port}" >/dev/null 2>&1
+        ssh_err=$(_ssh_keyonly)
+        ssh_rc=$?
+    fi
+
+    if [[ ${ssh_rc} -eq 0 ]]; then
+        WD_AUTOLOGIN_RESULT="Key installed via existing SSH key (${local_pubkey_file})"
+        return 0
+    fi
+
+    ### Classify the failure reason
+    local key_fail_reason="unknown"
+    if echo "${ssh_err}" | grep -q "Permission denied\|publickey"; then
+        key_fail_reason="pubkey auth rejected"
+    elif echo "${ssh_err}" | grep -q "Connection refused\|connect to host"; then
+        key_fail_reason="connection refused"
+    elif echo "${ssh_err}" | grep -q "timed out\|Operation timed out"; then
+        key_fail_reason="timeout"
+    fi
+    WD_AUTOLOGIN_RESULT="existing-key failed: ${key_fail_reason}"
+
     if sshpass -p "${password}" \
             ssh ${SSH_OPTS} \
             -p "${client_ip_port}" \
             "${client_user}@${WD_RAC_SERVER}" \
-            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
-             grep -qxF '${pubkey}' ~/.ssh/authorized_keys 2>/dev/null || \
-             echo '${pubkey}' >> ~/.ssh/authorized_keys && \
-             chmod 600 ~/.ssh/authorized_keys" \
+            "${install_cmd}" \
             2>/dev/null; then
-        WD_AUTOLOGIN_RESULT="Key installed from ${local_pubkey_file}"
+        WD_AUTOLOGIN_RESULT="Key installed via password from ${local_pubkey_file}"
         return 0
     else
         WD_AUTOLOGIN_RESULT="sshpass+ssh failed (wrong password or connection refused)"
@@ -1338,10 +1444,81 @@ install_autologin_key() {
     fi
 }
 
-### Main command handler for setup-autologin-all
-cmd_setup_autologin_all() {
-    local client_user="${1:-wsprdaemon}"
-    local max_rac="${2:-213}"   # upper bound; can override as 3rd arg if needed
+### Main command handler for setup-autologin
+cmd_setup_autologin() {
+    ### Usage:
+    ###   setup-autologin all              — scan all RACs 1..213
+    ###   setup-autologin <NUM>            — test a single RAC
+    ###   setup-autologin <N1,N2,N3>       — test a comma-separated list
+    ###   setup-autologin --retry-failed   — retry RACs from last log
+    local client_user="wsprdaemon"
+    local max_rac="213"
+    local retry_failed=0
+    local -a rac_list=()
+
+    ### Shift through args
+    local -a args=("$@")
+    local i=0
+    while (( i < ${#args[@]} )); do
+        local arg="${args[$i]}"
+        case "${arg}" in
+            --retry-failed)
+                retry_failed=1
+                ;;
+            all)
+                rac_list=()   # explicit all — clear any prior list
+                ;;
+            [0-9]*)
+                ### Accept "8" or "8,41,44" 
+                IFS=',' read -ra nums <<< "${arg}"
+                for n in "${nums[@]}"; do
+                    [[ "${n}" =~ ^[0-9]+$ ]] && rac_list+=("${n}")
+                done
+                ;;
+            *)
+                client_user="${arg}"
+                ;;
+        esac
+        (( i++ ))
+    done
+
+    ### If --retry-failed, find the most recent log and extract failed RAC numbers
+    if (( retry_failed )); then
+        local latest_log
+        latest_log=$(ls -t wd-autologin-setup-*.log 2>/dev/null | head -1)
+        if [[ -z "${latest_log}" ]]; then
+            echo "ERROR: No wd-autologin-setup-*.log files found in current directory"
+            return 1
+        fi
+        echo "Retrying failed RACs from: ${latest_log}"
+        ### Parse the summary section at the end of the log.
+        ### Lines look like:  "  RAC #41"  or "  RAC #8"
+        ### We grab everything under "Failed (N) —" and "WARNING" sections.
+        local in_failed_section=0
+        while IFS= read -r line; do
+            if [[ "${line}" =~ ^Failed.*manual\ attention ]]; then
+                in_failed_section=1
+                continue
+            fi
+            ### Stop at the next section header or blank summary line
+            if (( in_failed_section )); then
+                if [[ "${line}" =~ ^No\ password|^=|^Scan|^Summary ]]; then
+                    in_failed_section=0
+                    continue
+                fi
+                if [[ "${line}" =~ RAC\ #([0-9]+) ]]; then
+                    rac_list+=("${BASH_REMATCH[1]}")
+                fi
+            fi
+        done < "${latest_log}"
+
+        if [[ ${#rac_list[@]} -eq 0 ]]; then
+            echo "No FAILED or WARNING RACs found in ${latest_log}"
+            return 0
+        fi
+        echo "Found ${#rac_list[@]} RACs to retry: ${rac_list[*]}"
+        echo ""
+    fi
 
     ### Ensure we can reach GW2 / RAC ports at all
     if ! ensure_gw2_connection; then
@@ -1386,7 +1563,15 @@ cmd_setup_autologin_all() {
     echo "" >&2
 
     local log_file="wd-autologin-setup-$(date +%Y%m%d_%H%M%S).log"
-    echo "Scanning RACs 1-${max_rac} for autologin setup..."
+    if (( retry_failed )) && [[ ${#rac_list[@]} -gt 0 ]]; then
+        echo "Retrying ${#rac_list[@]} failed RACs: ${rac_list[*]}"
+    elif [[ ${#rac_list[@]} -eq 1 ]]; then
+        echo "Testing single RAC #${rac_list[0]}..."
+    elif [[ ${#rac_list[@]} -gt 1 ]]; then
+        echo "Testing ${#rac_list[@]} specified RACs: ${rac_list[*]}"
+    else
+        echo "Scanning all RACs 1-${max_rac}..."
+    fi
     echo "Log file: ${log_file}"
     echo ""
     echo "Started at $(date)" | tee "${log_file}"
@@ -1401,7 +1586,15 @@ cmd_setup_autologin_all() {
     declare -a failed_racs=()
     declare -a no_password_racs=()
 
-    for (( rac=1; rac<=max_rac; rac++ )); do
+    ### Build the list of RACs to scan
+    local -a scan_racs=()
+    if [[ ${#rac_list[@]} -gt 0 ]]; then
+        scan_racs=("${rac_list[@]}")
+    else
+        for (( i=1; i<=max_rac; i++ )); do scan_racs+=("$i"); done
+    fi
+
+    for rac in "${scan_racs[@]}"; do
         local client_ip_port=$(( RAC_BASE_PORT + rac ))
 
         printf "RAC #%-3d port %-5d  " "${rac}" "${client_ip_port}"
@@ -1413,17 +1606,8 @@ cmd_setup_autologin_all() {
             continue
         fi
 
-        ### 2. Can we already autologin? Check with the RAC-specific user if known,
-        ###    but we don't have rac_user yet at this point — use client_user for the
-        ###    quick pre-check; if it fails we'll re-check with rac_user after lookup.
-        if ssh ${SSH_OPTS} -p "${client_ip_port}" -o BatchMode=yes \
-                "${client_user}@${WD_RAC_SERVER}" "exit 0" >/dev/null 2>&1; then
-            printf "OK    (autologin already works as %s)\n" "${client_user}" | tee -a "${log_file}"
-            (( already_count++ ))
-            continue
-        fi
-
-        ### 3. Autologin doesn't work — look up the user and password for this RAC.
+        ### 2. Look up SSR config for this RAC (user, password, site) — do this
+        ###    BEFORE the autologin check so we test with the correct username.
         local rac_index
         rac_index=$(find_rac_by_id "${rac}")
 
@@ -1434,50 +1618,66 @@ cmd_setup_autologin_all() {
         if [[ "${rac_index}" != "-1" ]]; then
             rac_password="${WD_RAC_PASSWORDS[${rac_index}]}"
             rac_site="${WD_RAC_SITES[${rac_index}]}"
-            ### Use the user field from SSR config if present
             local config_user="${WD_RAC_USERS[${rac_index}]}"
             [[ -z "${config_user}" ]] && config_user="${WD_RAC_ACCOUNTS[${rac_index}]}"
             [[ -n "${config_user}" ]] && rac_user="${config_user}"
         fi
 
-        printf "SETUP (autologin missing%s, user: %s)..." \
-            "${rac_site:+", site: ${rac_site}"}" "${rac_user}" | tee -a "${log_file}"
-        printf "\n" | tee -a "${log_file}"
-
-        ### 4. Build the ordered list of passwords to try:
-        ###      - stored config password (if any)
-        ###      - fallback password (if any, and different from stored)
-        local -a passwords_to_try=()
-        if [[ -n "${rac_password}" ]]; then
-            passwords_to_try+=("${rac_password}")
-        fi
-        if [[ -n "${fallback_password}" && "${fallback_password}" != "${rac_password}" ]]; then
-            passwords_to_try+=("${fallback_password}")
-        fi
-
-        if (( ${#passwords_to_try[@]} == 0 )); then
-            printf "      SKIP  (no password available)\n" | tee -a "${log_file}"
-            (( no_password_count++ ))
-            no_password_racs+=("${rac}")
+        ### 3. Can we already autologin as the correct user?
+        ###    If host key mismatch, clear stale entry and retry.
+        local _check_err
+        _check_err=$(ssh ${SSH_OPTS} -p "${client_ip_port}" -o BatchMode=yes \
+                "${rac_user}@${WD_RAC_SERVER}" "exit 0" 2>&1)
+        if [[ $? -eq 0 ]]; then
+            printf "OK    (autologin already works as %s)\n" "${rac_user}" | tee -a "${log_file}"
+            (( already_count++ ))
             continue
         fi
+        if echo "${_check_err}" | grep -q "REMOTE HOST IDENTIFICATION\|Host key verification failed"; then
+            ssh-keygen -f "${HOME}/.ssh/known_hosts" -R "[${WD_RAC_SERVER}]:${client_ip_port}" >/dev/null 2>&1
+        fi
 
-        ### 5. Try each password in order; stop on first success.
+        printf "SETUP (autologin missing%s, user: %s)...\n" \
+            "${rac_site:+", site: ${rac_site}"}" "${rac_user}" | tee -a "${log_file}"
+
+        ### 4. Try installing our pubkey via existing SSH trust (no password).
+        ###    This works when gw2 already has a key on the RAC even if we don't.
         local key_installed=0
-        local attempt_label=""
-        for try_password in "${passwords_to_try[@]}"; do
-            if [[ "${try_password}" == "${rac_password}" && -n "${rac_password}" ]]; then
-                attempt_label="stored config password"
-            else
-                attempt_label="fallback password"
+        local attempt_label="existing SSH key"
+        if install_autologin_key "${client_ip_port}" "${rac_user}" ""; then
+            key_installed=1
+        else
+            printf "      ... existing-key install failed (%s), " "${WD_AUTOLOGIN_RESULT}" | tee -a "${log_file}"
+
+            ### 5. Fall back to passwords: stored config first, then fallback
+            local -a passwords_to_try=()
+            if [[ -n "${rac_password}" ]]; then
+                passwords_to_try+=("${rac_password}")
+            fi
+            if [[ -n "${fallback_password}" && "${fallback_password}" != "${rac_password}" ]]; then
+                passwords_to_try+=("${fallback_password}")
             fi
 
-            if install_autologin_key "${client_ip_port}" "${rac_user}" "${try_password}"; then
-                key_installed=1
-                break
+            if (( ${#passwords_to_try[@]} == 0 )); then
+                printf "\n      SKIP  (no password available and existing-key install failed)\n" | tee -a "${log_file}"
+                (( no_password_count++ ))
+                no_password_racs+=("${rac}")
+                continue
             fi
-            printf "      ... %s failed, " "${attempt_label}" | tee -a "${log_file}"
-        done
+
+            for try_password in "${passwords_to_try[@]}"; do
+                if [[ "${try_password}" == "${rac_password}" && -n "${rac_password}" ]]; then
+                    attempt_label="stored config password"
+                else
+                    attempt_label="fallback password"
+                fi
+                if install_autologin_key "${client_ip_port}" "${rac_user}" "${try_password}"; then
+                    key_installed=1
+                    break
+                fi
+                printf "      ... %s failed, " "${attempt_label}" | tee -a "${log_file}"
+            done
+        fi
 
         if (( key_installed == 0 )); then
             printf "      FAILED  — all passwords tried, none worked (%s)\n" \
@@ -1575,6 +1775,407 @@ cmd_setup_autologin_all() {
 ###   --portwarn <N>     warn if remotePort doesn't look like a RAC port
 ###                      (i.e. not in range RAC_BASE_PORT .. RAC_BASE_PORT+999)
 ###############################################################################
+
+###############################################################################
+### cmd_wd_versions — SSH into every active RAC and report the WD version
+###
+### Version detection (tried in order):
+###   1. NEW: ~/wsprdaemon/wd_version.txt + git rev-list --count HEAD
+###   2. OLD: grep 'declare -r VERSION=' ~/wsprdaemon/wsprdaemon.sh
+###
+### The SSH login user is taken from the encrypted SSR config for each RAC,
+### exactly as setup-autologin does.  Only RACs with open ports and working
+### autologin are queried — no password prompts during the scan.
+###
+### Usage:
+###   ./wd-register-client.sh wd-versions [--timeout N] [--sort rac|version|site]
+###
+### Options:
+###   --timeout N   SSH ConnectTimeout in seconds (default: 8)
+###   --sort        Sort output by rac (default), version, or site
+###############################################################################
+
+cmd_wd_versions() {
+    local opt_timeout=8
+    local opt_sort="version"   ### default: oldest version first
+    local opt_nc_timeout=1      # nc timeout per port during parallel scan
+    local opt_parallel=40       # max simultaneous nc probes
+    local max_rac=213
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --timeout)  opt_timeout="$2";  shift 2 ;;
+            --sort)     opt_sort="$2";     shift 2 ;;
+            --parallel) opt_parallel="$2"; shift 2 ;;
+            *) echo "ERROR: Unknown option: $1" >&2
+               echo "Usage: $0 wd-versions [--timeout N] [--sort rac|version|site] [--parallel N]" >&2
+               return 1 ;;
+        esac
+    done
+
+    if ! ensure_gw2_connection; then
+        return 1
+    fi
+    echo "Using connection: ${WD_RAC_CONNECTION_PATH}"
+    echo ""
+
+    ###########################################################################
+    ### STEP 1: Parallel port scan — fast, no passphrase needed yet
+    ### Fire up to opt_parallel nc probes at once, collect open port list
+    ###########################################################################
+    echo "Step 1: Scanning ports 1-${max_rac} in parallel (batch size ${opt_parallel})..."
+    local -a open_racs=()
+    local -a pids=()
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    trap "rm -rf '${tmp_dir}'" RETURN
+
+    local rac
+    for (( rac=1; rac<=max_rac; rac++ )); do
+        local port=$(( RAC_BASE_PORT + rac ))
+        ### Launch nc probe in background; write rac number to tmp file if open
+        ( nc -z -w ${opt_nc_timeout} "${WD_RAC_SERVER}" "${port}" >/dev/null 2>&1 \
+            && echo "${rac}" > "${tmp_dir}/${rac}" ) &
+        pids+=($!)
+
+        ### Throttle: wait for a batch to finish before launching more
+        if (( ${#pids[@]} >= opt_parallel )); then
+            wait "${pids[@]}" 2>/dev/null
+            pids=()
+        fi
+    done
+    ### Wait for any remaining probes
+    wait "${pids[@]}" 2>/dev/null
+
+    ### Collect results in order
+    for (( rac=1; rac<=max_rac; rac++ )); do
+        [[ -f "${tmp_dir}/${rac}" ]] && open_racs+=("${rac}")
+    done
+
+    echo "Found ${#open_racs[@]} active RAC ports."
+    echo ""
+
+    if [[ ${#open_racs[@]} -eq 0 ]]; then
+        echo "No active RAC ports found. Check GW2 connection."
+        return 1
+    fi
+
+    ###########################################################################
+    ### STEP 2: Load RAC config (prompts for passphrase) — now that we know
+    ###         which RACs are alive, we know we have work to do
+    ###########################################################################
+    if ! load_rac_configs; then
+        echo "ERROR: Cannot load RAC configs; aborting."
+        return 1
+    fi
+    echo ""
+
+    ###########################################################################
+    ### STEP 3: SSH into each active RAC and get version — one at a time,
+    ###         streaming results live to terminal and log file
+    ###########################################################################
+    local log_file="wd-versions-$(date +%Y%m%d_%H%M%S).log"
+    echo "Step 2: Querying WD version on ${#open_racs[@]} active RACs..."
+    echo "Log file: ${log_file}"
+    echo ""
+
+    ### Header
+    printf "%-6s %-14s %-20s %s\n" "RAC" "SITE" "USER" "WD VERSION" | tee "${log_file}"
+    printf '%0.s-' {1..72} | tee -a "${log_file}"; echo "" | tee -a "${log_file}"
+
+    ### SSH options: BatchMode=yes so we never block waiting for a password
+    local ver_ssh_opts="-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=${opt_timeout}"
+
+    ### Remote command: four methods tried in order, stopping at first valid result.
+    ### "Valid" means the result matches a version pattern (digits/dots/dashes),
+    ### NOT a shell expression like $(cd ...) stored literally in wd_version.txt.
+    ###
+    ###   1. wd_version.txt content (validated) + git rev-list --count HEAD
+    ###   2. grep 'declare -r VERSION=' wsprdaemon.sh
+    ###   3. git symbolic-ref --short HEAD + git rev-list --count HEAD (wdvv alias)
+    ###   4. wsprdaemon.sh -V => parse "Version = X.X.X" (timeout 30)
+    local remote_cmd='
+        wd_root=~/wsprdaemon
+        ver_file="${wd_root}/wd_version.txt"
+        wd_sh="${wd_root}/wsprdaemon.sh"
+
+        ### Helper: does a string look like a real version (not a shell expression)?
+        is_ver() { [[ "$1" =~ ^[0-9]+\.[0-9] ]]; }
+
+        ### Method 1: wd_version.txt + git commit count
+        if [[ -f "${ver_file}" ]]; then
+            ver=$(< "${ver_file}")
+            ver="${ver%%[[:space:]]*}"
+            if is_ver "${ver}"; then
+                if cd "${wd_root}" 2>/dev/null && git rev-parse --git-dir >/dev/null 2>&1; then
+                    cnt=$(git rev-list --count HEAD 2>/dev/null)
+                    echo "${ver}-${cnt}"
+                else
+                    echo "${ver}"
+                fi
+                exit 0
+            fi
+        fi
+
+        ### Method 2: grep declare -r VERSION= from wsprdaemon.sh
+        if [[ -f "${wd_sh}" ]]; then
+            line=$(grep -m1 "declare -r VERSION=" "${wd_sh}" 2>/dev/null)
+            ver=$(echo "${line}" | sed "s/.*VERSION=[\"'"'"']\{0,1\}\([^\"'"'"' ]*\).*/\1/")
+            if is_ver "${ver}"; then
+                echo "${ver}"
+                exit 0
+            fi
+        fi
+
+        ### Method 3: git branch + commit count (wdvv pattern)
+        ### Only use the branch name if it looks like a version (starts with digits).
+        ### Branches named 'master', 'main', etc. are not version strings — skip to method 4.
+        if cd "${wd_root}" 2>/dev/null && git rev-parse --git-dir >/dev/null 2>&1; then
+            branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+            cnt=$(git rev-list --count HEAD 2>/dev/null)
+            if is_ver "${branch}" && [[ -n "${cnt}" ]]; then
+                echo "${branch}-${cnt}"
+                exit 0
+            fi
+        fi
+
+        ### Method 4: wsprdaemon.sh -V => parse "Version = X.X.X"
+        if [[ -x "${wd_sh}" ]]; then
+            ver=$(timeout 30 "${wd_sh}" -V 2>/dev/null | grep -m1 "^Version" | sed "s/Version *= *//")
+            if is_ver "${ver}"; then
+                echo "${ver} (live)"
+                exit 0
+            fi
+        fi
+
+        echo "unknown"
+    '
+
+    ### Collect all results, then sort and print in single pass
+    local -a results=()
+    local -i queried=0 failed=0
+
+    for rac in "${open_racs[@]}"; do
+        local client_ip_port=$(( RAC_BASE_PORT + rac ))
+
+        ### Look up user and site from config
+        local rac_index
+        rac_index=$(find_rac_by_id "${rac}")
+        local rac_user="wsprdaemon"
+        local rac_site="?"
+        if [[ "${rac_index}" != "-1" ]]; then
+            rac_site="${WD_RAC_SITES[${rac_index}]:-?}"
+            local cfg_user="${WD_RAC_USERS[${rac_index}]:-}"
+            [[ -z "${cfg_user}" ]] && cfg_user="${WD_RAC_ACCOUNTS[${rac_index}]:-}"
+            [[ -n "${cfg_user}" ]] && rac_user="${cfg_user}"
+        fi
+
+        ### Query version via SSH
+        local version
+        version=$(ssh ${ver_ssh_opts} -p "${client_ip_port}" \
+            "${rac_user}@${WD_RAC_SERVER}" "${remote_cmd}" 2>/dev/null)
+
+        if [[ -z "${version}" ]]; then
+            version="no autologin / SSH failed"
+            (( failed++ ))
+        else
+            (( queried++ ))
+        fi
+
+        results+=("$(printf '%05d\t%s\t%s\t%s' "${rac}" "${rac_site}" "${rac_user}" "${version}")")
+    done
+
+    ### Sort results array
+    local -a sorted=()
+    case "${opt_sort}" in
+        version) mapfile -t sorted < <(printf '%s\n' "${results[@]}" | sort -t$'\t' -k4,4 -k1,1n) ;;
+        site)    mapfile -t sorted < <(printf '%s\n' "${results[@]}" | sort -t$'\t' -k2,2 -k1,1n) ;;
+        rac|*)   mapfile -t sorted < <(printf '%s\n' "${results[@]}" | sort -t$'\t' -k1,1n) ;;
+    esac
+
+    ### Print results (single pass — no duplicates)
+    for row in "${sorted[@]}"; do
+        IFS=$'\t' read -r rac_padded site user version <<< "${row}"
+        printf "%-6d %-14s %-20s %s\n" "$(( 10#${rac_padded} ))" "${site}" "${user}" "${version}" | tee -a "${log_file}"
+    done
+
+    echo "" | tee -a "${log_file}"
+    printf '%0.s-' {1..72} | tee -a "${log_file}"; echo "" | tee -a "${log_file}"
+    printf "Queried: %d   No autologin/failed: %d   Port closed (skipped): %d\n" \
+        "${queried}" "${failed}" "$(( max_rac - ${#open_racs[@]} ))" | tee -a "${log_file}"
+    echo "Full log: ${log_file}"
+    return 0
+}
+
+###############################################################################
+### find_latest_versions_log — find most recent wd-versions-*.log or use arg
+###############################################################################
+find_versions_log() {
+    local __result_var=$1
+    local candidate="${2:-}"
+
+    if [[ -n "${candidate}" ]]; then
+        if [[ ! -f "${candidate}" ]]; then
+            echo "ERROR: Log file not found: ${candidate}" >&2
+            return 1
+        fi
+        printf -v "${__result_var}" '%s' "${candidate}"
+        return 0
+    fi
+
+    local latest
+    latest=$(ls -t wd-versions-*.log 2>/dev/null | head -1)
+    if [[ -z "${latest}" ]]; then
+        echo "ERROR: No wd-versions-*.log found in current directory." >&2
+        echo "       Run 'wd-versions' first, or supply a log file path." >&2
+        return 1
+    fi
+    printf -v "${__result_var}" '%s' "${latest}"
+    return 0
+}
+
+###############################################################################
+### cmd_wd_versions_sort — re-sort an existing wd-versions log by version
+###
+### Usage: ./wd-register-client.sh wd-versions-sort [LOGFILE]
+###############################################################################
+cmd_wd_versions_sort() {
+    local log_file=""
+    if ! find_versions_log log_file "${1:-}"; then
+        return 1
+    fi
+    echo "Sorting by version: ${log_file}"
+    echo ""
+
+    ### Print header
+    head -2 "${log_file}"
+
+    ### Extract data rows (lines starting with digit), convert to tab-delimited,
+    ### sort on the 4th tab field (WD VERSION), then reformat for display.
+    ### awk converts the fixed-width columns to tab-delimited for reliable sort.
+    grep -E '^[0-9]' "${log_file}" \
+        | awk '{printf "%s\t%s\t%s\t",$1,$2,$3; for(i=4;i<=NF;i++) printf "%s%s",$i,(i<NF?" ":""); print ""}' \
+        | sort -t$'\t' -k4,4 -k1,1n \
+        | awk -F$'\t' '{printf "%-6s %-14s %-20s %s\n",$1,$2,$3,$4}'
+
+    echo ""
+    printf '%0.s-' {1..72}; echo ""
+    grep -E '^(Queried|Full log)' "${log_file}" || true
+}
+
+###############################################################################
+### cmd_wd_versions_login — walk RACs oldest-version-first, SSH in one at a time
+###
+### Usage: ./wd-register-client.sh wd-versions-login [LOGFILE]
+###
+### Reads the log, sorts by version (oldest first), SSHes into each RAC
+### interactively. After you exit the SSH session, prompts: [Enter]=next,
+### s=skip, q=quit.
+###############################################################################
+cmd_wd_versions_login() {
+    local log_file=""
+    if ! find_versions_log log_file "${1:-}"; then
+        return 1
+    fi
+
+    if ! ensure_gw2_connection; then
+        return 1
+    fi
+
+    ### Build sorted list oldest-version-first, skip no-autologin/unknown rows
+    local -a rows=()
+    while IFS=$'\t' read -r rac site user version; do
+        [[ "${version}" =~ "no autologin" ]] && continue
+        [[ "${version}" =~ "unknown" ]] && continue
+        rows+=("${rac}	${site}	${user}	${version}")
+    done < <(
+        grep -E '^[0-9]' "${log_file}" \
+            | awk '{printf "%s\t%s\t%s\t",$1,$2,$3; for(i=4;i<=NF;i++) printf "%s%s",$i,(i<NF?" ":""); print ""}' \
+            | sort -t$'\t' -k4,4 -k1,1n
+    )
+
+    local total=${#rows[@]}
+    echo "Found ${total} RACs with known versions in: ${log_file}"
+    echo "Sorted oldest-first. You will be SSHed in one at a time."
+    echo "After each session: Enter=next  s=skip  q=quit"
+    echo ""
+
+    local -i idx=0
+    for line in "${rows[@]}"; do
+        (( idx++ ))
+        local rac site user version
+        IFS=$'\t' read -r rac site user version <<< "${line}"
+
+        echo "──────────────────────────────────────────────────────────────────────"
+        printf "  [%d/%d]  RAC %-4d  site=%-14s  user=%-12s  version=%s\n" \
+            "${idx}" "${total}" "${rac}" "${site}" "${user}" "${version}"
+        echo "──────────────────────────────────────────────────────────────────────"
+
+        local client_ip_port=$(( RAC_BASE_PORT + rac ))
+
+        ### Prompt before connecting
+        local choice
+        read -rp "  Press Enter to SSH in, 's' to skip, 'q' to quit: " choice
+        case "${choice,,}" in
+            q|quit) echo "Quitting."; return 0 ;;
+            s|skip) echo "  Skipped RAC ${rac}."; echo ""; continue ;;
+        esac
+
+        echo "  Connecting to RAC ${rac} as ${user}@${WD_RAC_SERVER}:${client_ip_port}..."
+        ssh ${SSH_OPTS} -p "${client_ip_port}" "${user}@${WD_RAC_SERVER}"
+        local rc=$?
+        echo ""
+        (( rc != 0 )) && echo "  (SSH exited with code ${rc})"
+    done
+
+    echo "All ${total} RACs visited."
+}
+
+###############################################################################
+### cmd_wd_login — SSH directly into a single RAC by number
+###
+### Usage: ./wd-register-client.sh wd-login <RAC_NUMBER> [LOGFILE]
+###
+### Looks up the user from the most recent wd-versions log (or supplied log).
+### Falls back to 'wsprdaemon' if RAC not found in log.
+###############################################################################
+cmd_wd_login() {
+    local rac="${1:-}"
+    local log_file=""
+
+    if [[ -z "${rac}" ]] || ! is_uint "${rac}"; then
+        echo "ERROR: wd-login requires a RAC number"
+        echo "Usage: $0 wd-login <RAC_NUMBER> [LOGFILE]"
+        return 1
+    fi
+
+    if ! ensure_gw2_connection; then
+        return 1
+    fi
+
+    ### Try to find user from log file
+    find_versions_log log_file "${2:-}" 2>/dev/null || true
+
+    local rac_user="wsprdaemon"
+    local rac_site="?"
+    local rac_version="?"
+
+    if [[ -n "${log_file}" && -f "${log_file}" ]]; then
+        local match
+        match=$(grep -E "^${rac}[[:space:]]" "${log_file}" | head -1)
+        if [[ -n "${match}" ]]; then
+            local tab_row
+            tab_row=$(echo "${match}" | awk '{printf "%s\t%s\t%s\t",$1,$2,$3; for(i=4;i<=NF;i++) printf "%s%s",$i,(i<NF?" ":""); print ""}')
+            IFS=$'\t' read -r _ rac_site rac_user rac_version <<< "${tab_row}"
+        fi
+    fi
+
+    local client_ip_port=$(( RAC_BASE_PORT + rac ))
+
+    echo "RAC ${rac}  site=${rac_site}  user=${rac_user}  version=${rac_version}"
+    echo "Connecting to ${rac_user}@${WD_RAC_SERVER}:${client_ip_port}..."
+    ssh ${SSH_OPTS} -p "${client_ip_port}" "${rac_user}@${WD_RAC_SERVER}"
+}
 
 ### frps API defaults — override with --api-* options or environment vars
 declare FRPS_API_URL="${FRPS_API_URL:-http://localhost:7500}"
@@ -1903,7 +2504,7 @@ if [[ $# -lt 1 ]]; then
     echo "   or: $0 manual-setup <USERNAME> <SSH_PUBKEY_FILE_OR_STRING>"
     echo "   or: $0 clean-gw-keys <RAC_NUMBER> [client_user]"
     echo "   or: $0 show-rac-last-login [--api-url URL] [--api-user U] [--api-pass P] [--online] [--offline] [--filter STR] [--sort name|port|time|status]"
-    echo "   or: $0 setup-autologin-all [client_user]"
+    echo "   or: $0 setup-autologin <all|NUM|N1,N2,...|--retry-failed>"
     echo "   or: $0 scan-and-clean-all [client_user]"
     echo "   or: $0 -V|--version"
     echo ""
@@ -1918,8 +2519,17 @@ if [[ $# -lt 1 ]]; then
     echo "  $0 manual-setup <USER> <PUBKEY>         - Create user without RAC access"
     echo "  $0 clean-gw-keys <RAC_NUMBER>           - Only remove GW1/GW2 keys from one client"
     echo "  $0 show-rac-last-login               - Query frps API for proxy status, port, and last connect time"
-    echo "  $0 setup-autologin-all [user]            - Install SSH keys on all reachable RACs lacking autologin"
+    echo "  $0 setup-autologin all             - Install SSH pubkey on all RACs lacking autologin"
+    echo "  $0 setup-autologin 8               - Test/install on single RAC"
+    echo "  $0 setup-autologin 8,41,44         - Test/install on specific RACs"
+    echo "  $0 setup-autologin --retry-failed  - Retry RACs that failed in last log"
     echo "  $0 scan-and-clean-all                   - Scan all RACs 1-213 and clean where possible"
+    echo "  $0 wd-versions                          - Report WD version on all active RACs"
+    echo "  $0 wd-versions --sort version           - Sort results by version string"
+    echo "  $0 wd-versions --timeout 15             - Use longer SSH timeout (default: 8s)"
+    echo "  $0 wd-versions-sort [LOGFILE]           - Re-sort existing log by version (no rescan)"
+    echo "  $0 wd-versions-login [LOGFILE]          - SSH into RACs oldest-first, one at a time"
+    echo "  $0 wd-login <RAC>                       - SSH directly into a specific RAC"
     echo "  $0 -V|--version                         - Show version"
     echo ""
     echo "Prerequisites:"
@@ -1980,10 +2590,38 @@ if [[ "$1" == "show-rac-last-login" ]]; then
     exit $?
 fi
 
-# Check for setup-autologin-all command
-if [[ "$1" == "setup-autologin-all" ]]; then
-    client_user="${2:-wsprdaemon}"
-    cmd_setup_autologin_all "${client_user}"
+# Check for wd-versions command
+if [[ "$1" == "wd-versions" ]]; then
+    shift
+    cmd_wd_versions "$@"
+    exit $?
+fi
+
+# Check for wd-versions-sort command
+if [[ "$1" == "wd-versions-sort" ]]; then
+    shift
+    cmd_wd_versions_sort "$@"
+    exit $?
+fi
+
+# Check for wd-versions-login command
+if [[ "$1" == "wd-versions-login" ]]; then
+    shift
+    cmd_wd_versions_login "$@"
+    exit $?
+fi
+
+# Check for wd-login command
+if [[ "$1" == "wd-login" ]]; then
+    shift
+    cmd_wd_login "$@"
+    exit $?
+fi
+
+# Check for setup-autologin command
+if [[ "$1" == "setup-autologin" ]]; then
+    shift
+    cmd_setup_autologin "$@"
     exit $?
 fi
 
@@ -2012,33 +2650,48 @@ if [[ "$1" == "scan-and-clean-all" ]]; then
     declare -a cleaned_racs=()
     declare -a failed_racs=()
     
+    declare -i no_port_count=0
+
     for client_rac in {1..213}; do
         client_ip_port=$(( 35800 + client_rac ))
-        
-        # Show progress
-        printf "RAC #%-3d [%3d/213] " "${client_rac}" "${client_rac}"
-        
+
+        # All output goes through tee so RAC# appears in both terminal and log
+        printf "RAC #%-3d port %-5d  " "${client_rac}" "${client_ip_port}" | tee -a "${log_file}"
+
         # Test if port is open
         if ! nc -z -w 2 ${WD_RAC_SERVER} ${client_ip_port} >/dev/null 2>&1; then
-            echo "SKIP - No connection" | tee -a "${log_file}"
-            ((skipped_count++))
+            echo "SKIP  - port closed" | tee -a "${log_file}"
+            ((no_port_count++))
             continue
         fi
-        
+
         # Test if we can SSH in (only tests autologin, doesn't use password)
-        if ! ssh ${SSH_OPTS} -p "${client_ip_port}" -o BatchMode=yes "${client_user}@${WD_RAC_SERVER}" "exit 0" >/dev/null 2>&1; then
-            echo "SKIP - Can't autologin" | tee -a "${log_file}"
+        ssh_err=$(ssh ${SSH_OPTS} -p "${client_ip_port}" -o BatchMode=yes \
+            "${client_user}@${WD_RAC_SERVER}" "exit 0" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            # Classify the SSH failure reason
+            reason="unknown SSH error"
+            if echo "${ssh_err}" | grep -qi "host key\|REMOTE HOST IDENTIFICATION"; then
+                reason="host key mismatch (run clean-gw-keys first)"
+            elif echo "${ssh_err}" | grep -qi "Permission denied\|publickey"; then
+                reason="no autologin key (run setup-autologin)"
+            elif echo "${ssh_err}" | grep -qi "Connection refused"; then
+                reason="connection refused (SSH not listening)"
+            elif echo "${ssh_err}" | grep -qi "timed out\|No route"; then
+                reason="connection timed out"
+            fi
+            echo "SKIP  - autologin failed: ${reason}" | tee -a "${log_file}"
             ((skipped_count++))
             continue
         fi
-        
+
         # We can autologin, so clean the GW keys
         if wd-remove-gw-keys-from-client "${client_ip_port}" "${client_user}" >/dev/null 2>&1; then
             echo "CLEANED" | tee -a "${log_file}"
             ((cleaned_count++))
             cleaned_racs+=("${client_rac}")
         else
-            echo "FAILED - Error cleaning keys" | tee -a "${log_file}"
+            echo "FAILED - error cleaning keys" | tee -a "${log_file}"
             ((failed_count++))
             failed_racs+=("${client_rac}")
         fi
@@ -2049,10 +2702,11 @@ if [[ "$1" == "scan-and-clean-all" ]]; then
     echo "Scan completed at $(date)" | tee -a "${log_file}"
     echo "" | tee -a "${log_file}"
     echo "Summary:" | tee -a "${log_file}"
-    echo "  Cleaned: ${cleaned_count}" | tee -a "${log_file}"
-    echo "  Failed:  ${failed_count}" | tee -a "${log_file}"
-    echo "  Skipped: ${skipped_count}" | tee -a "${log_file}"
-    echo "  Total:   213" | tee -a "${log_file}"
+    echo "  Cleaned:      ${cleaned_count}" | tee -a "${log_file}"
+    echo "  Failed:       ${failed_count}" | tee -a "${log_file}"
+    echo "  No autologin: ${skipped_count}" | tee -a "${log_file}"
+    echo "  Port closed:  ${no_port_count}" | tee -a "${log_file}"
+    echo "  Total:        213" | tee -a "${log_file}"
     echo "" | tee -a "${log_file}"
     
     if (( ${#cleaned_racs[@]} > 0 )); then
