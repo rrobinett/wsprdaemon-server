@@ -5,6 +5,15 @@
 ### Script to register WSPRDAEMON client stations for SFTP uploads
 ### Creates user accounts on gateway servers and configures client access
 ###
+### v3.33.0 Changes:
+###   - NEW: RACs 200-299 (HamSCI VPN range) now route through HS0 server
+###         instead of GW2. All SSH/SCP/nc operations for RAC 200-299 use
+###         hs0 as the tunnel server. Port formula is unchanged (35800+rac),
+###         so RAC 211 => hs0:36011. A new helper rac_get_server() returns
+###         the correct server for any RAC number. All commands (register,
+###         setup-autologin, wd-versions, wd-login, scan-and-clean-all,
+###         clean-gw-keys) are updated to use rac_get_server().
+###
 ### v3.32.0 Changes:
 ###   - CHANGE: wd-versions now sorts by version (oldest first) by default.
 ###         Use --sort rac to get RAC number order instead.
@@ -180,7 +189,7 @@
 ###
 ###############################################################################
 
-declare VERSION="3.32.0"
+declare VERSION="3.33.0"
 
 if [[ -f ~/wsprdaemon/bash-aliases ]]; then
     source ~/wsprdaemon/bash-aliases
@@ -685,6 +694,25 @@ declare WD_RAC_VPN_IP="10.111.220.1"
 declare RAC_TEST_ID=61              # RAC ID used for connectivity testing
 declare RAC_BASE_PORT=35800
 
+### HamSCI VPN RAC server — handles RACs 200-299
+### These clients connect via HamSCI VPN and their FRP tunnels land on hs0,
+### not on GW2. The port formula is the same: 35800 + rac_number.
+declare HS0_SERVER="hs0"
+declare HS0_RAC_MIN=200
+declare HS0_RAC_MAX=299
+
+### Return the tunnel server hostname for a given RAC number.
+### RACs 200-299 go to hs0; all others go to WD_RAC_SERVER (GW2).
+### Usage: local srv; srv=$(rac_get_server <rac_number>)
+rac_get_server() {
+    local rac=$1
+    if (( rac >= HS0_RAC_MIN && rac <= HS0_RAC_MAX )); then
+        echo "${HS0_SERVER}"
+    else
+        echo "${WD_RAC_SERVER}"
+    fi
+}
+
 ### SSH options for connecting to RAC clients
 ### - StrictHostKeyChecking=accept-new: auto-accept new hosts, reject changed keys
 ### - ConnectTimeout=10: don't hang forever on unreachable hosts
@@ -794,6 +822,7 @@ declare -a GW_SERVERS=("gw1" "gw2" "gw1.wsprdaemon.org" "gw2.wsprdaemon.org")
 function wd-remove-gw-keys-from-client() {
     local client_ip_port=$1
     local client_user=$2
+    local tunnel_server="${3:-${WD_RAC_SERVER}}"
     
     (( ${verbosity-0} )) && echo "Removing stale GW1/GW2 host keys from client's known_hosts file"
     
@@ -808,7 +837,7 @@ function wd-remove-gw-keys-from-client() {
     keygen_cmds="cp ~/.ssh/known_hosts ~/.ssh/known_hosts.backup.\$(date +%Y%m%d_%H%M%S) 2>/dev/null || true; ${keygen_cmds}"
     
     # Execute on the client
-    if ssh_with_pass -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "${keygen_cmds} exit 0"; then
+    if ssh_with_pass -p "${client_ip_port}" "${client_user}@${tunnel_server}" "${keygen_cmds} exit 0"; then
         (( ${verbosity-0} )) && echo "Successfully removed GW1/GW2 keys from client's known_hosts"
     else
         echo "Warning: Could not remove GW keys from client (this is usually okay if they weren't present)"
@@ -840,6 +869,9 @@ function wd-client-to-server-setup()
 
     set -u
     local client_ip_port=$(( 35800 + client_rac ))
+    local rac_tunnel_server
+    rac_tunnel_server=$(rac_get_server "${client_rac}")
+    echo "RAC tunnel server: ${rac_tunnel_server} (port ${client_ip_port})"
 
     local client_user_password
     local client_user_name
@@ -868,26 +900,26 @@ function wd-client-to-server-setup()
 
     (( ${verbosity-0} > 1 )) && echo "Testing to see if RAC client has already been setup so we can autologin"
 
-    nc -z ${WD_RAC_SERVER} ${client_ip_port} >/dev/null 2>&1
+    nc -z ${rac_tunnel_server} ${client_ip_port} >/dev/null 2>&1
     rc=$? ; if (( rc )); then
-        echo "ERROR: Can't open a connection to ${WD_RAC_SERVER}:${client_ip_port} for RAC ${client_rac}, so we can't get this client's upload info"
+        echo "ERROR: Can't open a connection to ${rac_tunnel_server}:${client_ip_port} for RAC ${client_rac}, so we can't get this client's upload info"
         return 1
     fi
 
-    (( ${verbosity-0} )) && echo "netcat opened a connection to ${WD_RAC_SERVER}:${client_ip_port} for RAC ${client_rac}"
+    (( ${verbosity-0} )) && echo "netcat opened a connection to ${rac_tunnel_server}:${client_ip_port} for RAC ${client_rac}"
 
     (( ${verbosity-0} )) && echo "Get a copy of that server's public key so it can login here on this server"
-    if ! scp_with_pass -P ${client_ip_port} ${client_user}@${WD_RAC_SERVER}:~/.ssh/id_*.pub  /tmp/rac_${client_rac}_key.pub > /dev/null 2>&1 ; then
+    if ! scp_with_pass -P ${client_ip_port} ${client_user}@${rac_tunnel_server}:~/.ssh/id_*.pub  /tmp/rac_${client_rac}_key.pub > /dev/null 2>&1 ; then
         echo "ERROR: Can't scp a copy of that RAC's public key file, so we can't copy it to this server"
         return 1
     fi
     (( ${verbosity-0} )) && echo "A copy of RAC#${client_rac} pub file has been saved in /tmp/rac_${client_rac}_key.pub"
 
     # Remove any stale GW1/GW2 host keys from the client's known_hosts
-    wd-remove-gw-keys-from-client "${client_ip_port}" "${client_user}"
+    wd-remove-gw-keys-from-client "${client_ip_port}" "${client_user}" "${rac_tunnel_server}"
 
     (( ${verbosity-0} )) && echo "Learn that server's most recent wsprnet.org REPORTER_ID so we can use it as the linux account name on this server"
-    local newest_log_file_path=$(ssh_with_pass -p ${client_ip_port} ${client_user}@${WD_RAC_SERVER} 'find ${PWD} -type f -name "upload_to_wsprnet_daemon.log" -printf "%T@ %p\n" | sort -n | tail -1 | cut -d" " -f2-')    
+    local newest_log_file_path=$(ssh_with_pass -p ${client_ip_port} ${client_user}@${rac_tunnel_server} 'find ${PWD} -type f -name "upload_to_wsprnet_daemon.log" -printf "%T@ %p\n" | sort -n | tail -1 | cut -d" " -f2-')    
     if [[ -z "${newest_log_file_path}" ]]; then
         echo "ERROR: couldn't find 'upload_to_wsprnet_daemon.log' on RAC#${client_rac}"
         return 1
@@ -895,7 +927,7 @@ function wd-client-to-server-setup()
     (( ${verbosity-0} )) && echo "Found the wsprnet.org log file path on that server is ${newest_log_file_path}"
 
     local ssh_cmd=$(printf "awk '/Uploading/ {line = \$0} END { split(line, f); print f[9] }' %s" "${newest_log_file_path}")
-    local client_reporter_id=$(ssh_with_pass -p ${client_ip_port} ${client_user}@${WD_RAC_SERVER} "${ssh_cmd}")
+    local client_reporter_id=$(ssh_with_pass -p ${client_ip_port} ${client_user}@${rac_tunnel_server} "${ssh_cmd}")
 
     if [[ -z "${client_reporter_id}" ]]; then
         echo "Can't find a  REPORTER_ID from that RAC's ${newest_log_file_path}"
@@ -919,13 +951,13 @@ function wd-client-to-server-setup()
     local config_file="\${HOME}/wsprdaemon/wsprdaemon.conf"
     # Remove old WD_SERVER_USER scalar if present, and old WD_SERVER_USER_LIST
     # Then add the new WD_SERVER_USER_LIST array
-    ssh_with_pass -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" \
+    ssh_with_pass -p "${client_ip_port}" "${client_user}@${rac_tunnel_server}" \
         "sed -i '/^[[:space:]]*WD_SERVER_USER=/d' \"${config_file}\"; \
          sed -i '/^[[:space:]]*WD_SERVER_USER_LIST=/d' \"${config_file}\"; \
          echo '${wd_server_user_list}  # Added by the WD server. Do not modify or delete' >> \"${config_file}\""
     
     # Verify it was added
-    ssh_with_pass -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "grep -q '^WD_SERVER_USER_LIST=' \"${config_file}\""
+    ssh_with_pass -p "${client_ip_port}" "${client_user}@${rac_tunnel_server}" "grep -q '^WD_SERVER_USER_LIST=' \"${config_file}\""
     rc=$?; if (( rc )); then
         echo "ERROR: failed to add WD_SERVER_USER_LIST to ${config_file} on RAC #${client_rac}"
         return 1
@@ -983,7 +1015,7 @@ function wd-client-to-server-setup()
 
     # Get the client's public key and add it to authorized_keys - USE SANITIZED USERNAME
     local -a client_key_list
-    mapfile -t client_key_list < <(ssh_with_pass -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" "cat ~/.ssh/*.pub")
+    mapfile -t client_key_list < <(ssh_with_pass -p "${client_ip_port}" "${client_user}@${rac_tunnel_server}" "cat ~/.ssh/*.pub")
     if (( ${#client_key_list[@]} == 0 )); then
         echo "ERROR: can't find a public key on client"
         return 1
@@ -1098,7 +1130,7 @@ function wd-client-to-server-setup()
             local peer_test_file="sftp_peer_test_$(date +%s).txt"
             local peer_test_content="SFTP peer test at $(date)"
             
-            if ssh_with_pass -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" \
+            if ssh_with_pass -p "${client_ip_port}" "${client_user}@${rac_tunnel_server}" \
                 "echo '${peer_test_content}' > /tmp/${peer_test_file} && \
                  sftp -o StrictHostKeyChecking=accept-new -P ${SFTP_PORT:-22} ${sanitized_reporter_id}@${peer_fqdn} <<< 'put /tmp/${peer_test_file} uploads/${peer_test_file}' && \
                  rm -f /tmp/${peer_test_file}"; then
@@ -1125,12 +1157,12 @@ function wd-client-to-server-setup()
     ### Test SFTP upload capability
     ###########################################################################
     local test_file="sftp_test_$(date +%s).txt"
-    local test_content="SFTP test from ${WD_RAC_SERVER} at $(date)"
+    local test_content="SFTP test from ${rac_tunnel_server} at $(date)"
 
     # Create a test file on the remote server and attempt upload
     echo ""
     echo "Testing SFTP upload: RAC client -> ${WD_SERVER_FQDN} as ${sanitized_reporter_id}"
-    if ! ssh_with_pass -p "${client_ip_port}" "${client_user}@${WD_RAC_SERVER}" \
+    if ! ssh_with_pass -p "${client_ip_port}" "${client_user}@${rac_tunnel_server}" \
         "echo '${test_content}' > /tmp/${test_file} && \
          sftp -o StrictHostKeyChecking=accept-new -P ${SFTP_PORT:-22} ${sanitized_reporter_id}@${WD_SERVER_FQDN} <<< 'put /tmp/${test_file} uploads/${test_file}' && \
          rm -f /tmp/${test_file}"; then
@@ -1370,6 +1402,7 @@ install_autologin_key() {
     local client_ip_port="$1"
     local client_user="$2"
     local password="$3"
+    local tunnel_server="${4:-${WD_RAC_SERVER}}"
 
     ### Find our local public key (prefer ed25519, fall back to ecdsa, rsa)
     local local_pubkey_file=""
@@ -1398,7 +1431,7 @@ install_autologin_key() {
         ssh ${SSH_OPTS} -o BatchMode=yes \
             -o PasswordAuthentication=no \
             -p "${client_ip_port}" \
-            "${client_user}@${WD_RAC_SERVER}" \
+            "${client_user}@${tunnel_server}" \
             "${install_cmd}" 2>&1
     }
 
@@ -1409,7 +1442,7 @@ install_autologin_key() {
 
     ### If host key mismatch, clear the stale entry and retry once
     if [[ ${ssh_rc} -ne 0 ]] && echo "${ssh_err}" | grep -q "REMOTE HOST IDENTIFICATION\|Host key verification failed"; then
-        ssh-keygen -f "${HOME}/.ssh/known_hosts" -R "[${WD_RAC_SERVER}]:${client_ip_port}" >/dev/null 2>&1
+        ssh-keygen -f "${HOME}/.ssh/known_hosts" -R "[${tunnel_server}]:${client_ip_port}" >/dev/null 2>&1
         ssh_err=$(_ssh_keyonly)
         ssh_rc=$?
     fi
@@ -1433,7 +1466,7 @@ install_autologin_key() {
     if sshpass -p "${password}" \
             ssh ${SSH_OPTS} \
             -p "${client_ip_port}" \
-            "${client_user}@${WD_RAC_SERVER}" \
+            "${client_user}@${tunnel_server}" \
             "${install_cmd}" \
             2>/dev/null; then
         WD_AUTOLOGIN_RESULT="Key installed via password from ${local_pubkey_file}"
@@ -1596,11 +1629,13 @@ cmd_setup_autologin() {
 
     for rac in "${scan_racs[@]}"; do
         local client_ip_port=$(( RAC_BASE_PORT + rac ))
+        local rac_server
+        rac_server=$(rac_get_server "${rac}")
 
-        printf "RAC #%-3d port %-5d  " "${rac}" "${client_ip_port}"
+        printf "RAC #%-3d port %-5d [%s]  " "${rac}" "${client_ip_port}" "${rac_server}"
 
         ### 1. Is the port reachable at all?
-        if ! nc -z -w 2 "${WD_RAC_SERVER}" "${client_ip_port}" >/dev/null 2>&1; then
+        if ! nc -z -w 2 "${rac_server}" "${client_ip_port}" >/dev/null 2>&1; then
             printf "SKIP  (port closed)\n" | tee -a "${log_file}"
             (( no_port_count++ ))
             continue
@@ -1627,14 +1662,14 @@ cmd_setup_autologin() {
         ###    If host key mismatch, clear stale entry and retry.
         local _check_err
         _check_err=$(ssh ${SSH_OPTS} -p "${client_ip_port}" -o BatchMode=yes \
-                "${rac_user}@${WD_RAC_SERVER}" "exit 0" 2>&1)
+                "${rac_user}@${rac_server}" "exit 0" 2>&1)
         if [[ $? -eq 0 ]]; then
             printf "OK    (autologin already works as %s)\n" "${rac_user}" | tee -a "${log_file}"
             (( already_count++ ))
             continue
         fi
         if echo "${_check_err}" | grep -q "REMOTE HOST IDENTIFICATION\|Host key verification failed"; then
-            ssh-keygen -f "${HOME}/.ssh/known_hosts" -R "[${WD_RAC_SERVER}]:${client_ip_port}" >/dev/null 2>&1
+            ssh-keygen -f "${HOME}/.ssh/known_hosts" -R "[${rac_server}]:${client_ip_port}" >/dev/null 2>&1
         fi
 
         printf "SETUP (autologin missing%s, user: %s)...\n" \
@@ -1644,7 +1679,7 @@ cmd_setup_autologin() {
         ###    This works when gw2 already has a key on the RAC even if we don't.
         local key_installed=0
         local attempt_label="existing SSH key"
-        if install_autologin_key "${client_ip_port}" "${rac_user}" ""; then
+        if install_autologin_key "${client_ip_port}" "${rac_user}" "" "${rac_server}"; then
             key_installed=1
         else
             printf "      ... existing-key install failed (%s), " "${WD_AUTOLOGIN_RESULT}" | tee -a "${log_file}"
@@ -1671,7 +1706,7 @@ cmd_setup_autologin() {
                 else
                     attempt_label="fallback password"
                 fi
-                if install_autologin_key "${client_ip_port}" "${rac_user}" "${try_password}"; then
+                if install_autologin_key "${client_ip_port}" "${rac_user}" "${try_password}" "${rac_server}"; then
                     key_installed=1
                     break
                 fi
@@ -1689,7 +1724,7 @@ cmd_setup_autologin() {
 
         ### 6. Verify autologin actually works now
         if ssh ${SSH_OPTS} -p "${client_ip_port}" -o BatchMode=yes \
-                "${rac_user}@${WD_RAC_SERVER}" "exit 0" >/dev/null 2>&1; then
+                "${rac_user}@${rac_server}" "exit 0" >/dev/null 2>&1; then
             printf "      SUCCESS — autologin verified via %s (%s)\n" \
                 "${attempt_label}" "${WD_AUTOLOGIN_RESULT}" | tee -a "${log_file}"
             (( installed_count++ ))
@@ -1822,6 +1857,7 @@ cmd_wd_versions() {
     ###########################################################################
     ### STEP 1: Parallel port scan — fast, no passphrase needed yet
     ### Fire up to opt_parallel nc probes at once, collect open port list
+    ### RACs 200-299 are probed against HS0; all others against WD_RAC_SERVER.
     ###########################################################################
     echo "Step 1: Scanning ports 1-${max_rac} in parallel (batch size ${opt_parallel})..."
     local -a open_racs=()
@@ -1833,8 +1869,10 @@ cmd_wd_versions() {
     local rac
     for (( rac=1; rac<=max_rac; rac++ )); do
         local port=$(( RAC_BASE_PORT + rac ))
+        local probe_server
+        probe_server=$(rac_get_server "${rac}")
         ### Launch nc probe in background; write rac number to tmp file if open
-        ( nc -z -w ${opt_nc_timeout} "${WD_RAC_SERVER}" "${port}" >/dev/null 2>&1 \
+        ( nc -z -w ${opt_nc_timeout} "${probe_server}" "${port}" >/dev/null 2>&1 \
             && echo "${rac}" > "${tmp_dir}/${rac}" ) &
         pids+=($!)
 
@@ -1856,7 +1894,7 @@ cmd_wd_versions() {
     echo ""
 
     if [[ ${#open_racs[@]} -eq 0 ]]; then
-        echo "No active RAC ports found. Check GW2 connection."
+        echo "No active RAC ports found. Check GW2/HS0 connection."
         return 1
     fi
 
@@ -1957,6 +1995,8 @@ cmd_wd_versions() {
 
     for rac in "${open_racs[@]}"; do
         local client_ip_port=$(( RAC_BASE_PORT + rac ))
+        local rac_server
+        rac_server=$(rac_get_server "${rac}")
 
         ### Look up user and site from config
         local rac_index
@@ -1973,7 +2013,7 @@ cmd_wd_versions() {
         ### Query version via SSH
         local version
         version=$(ssh ${ver_ssh_opts} -p "${client_ip_port}" \
-            "${rac_user}@${WD_RAC_SERVER}" "${remote_cmd}" 2>/dev/null)
+            "${rac_user}@${rac_server}" "${remote_cmd}" 2>/dev/null)
 
         if [[ -z "${version}" ]]; then
             version="no autologin / SSH failed"
@@ -2112,6 +2152,8 @@ cmd_wd_versions_login() {
         echo "──────────────────────────────────────────────────────────────────────"
 
         local client_ip_port=$(( RAC_BASE_PORT + rac ))
+        local rac_server
+        rac_server=$(rac_get_server "${rac}")
 
         ### Prompt before connecting
         local choice
@@ -2121,8 +2163,8 @@ cmd_wd_versions_login() {
             s|skip) echo "  Skipped RAC ${rac}."; echo ""; continue ;;
         esac
 
-        echo "  Connecting to RAC ${rac} as ${user}@${WD_RAC_SERVER}:${client_ip_port}..."
-        ssh ${SSH_OPTS} -p "${client_ip_port}" "${user}@${WD_RAC_SERVER}"
+        echo "  Connecting to RAC ${rac} as ${user}@${rac_server}:${client_ip_port}..."
+        ssh ${SSH_OPTS} -p "${client_ip_port}" "${user}@${rac_server}"
         local rc=$?
         echo ""
         (( rc != 0 )) && echo "  (SSH exited with code ${rc})"
@@ -2171,10 +2213,12 @@ cmd_wd_login() {
     fi
 
     local client_ip_port=$(( RAC_BASE_PORT + rac ))
+    local rac_server
+    rac_server=$(rac_get_server "${rac}")
 
     echo "RAC ${rac}  site=${rac_site}  user=${rac_user}  version=${rac_version}"
-    echo "Connecting to ${rac_user}@${WD_RAC_SERVER}:${client_ip_port}..."
-    ssh ${SSH_OPTS} -p "${client_ip_port}" "${rac_user}@${WD_RAC_SERVER}"
+    echo "Connecting to ${rac_user}@${rac_server}:${client_ip_port}..."
+    ssh ${SSH_OPTS} -p "${client_ip_port}" "${rac_user}@${rac_server}"
 }
 
 ### frps API defaults — override with --api-* options or environment vars
@@ -2563,23 +2607,24 @@ if [[ "$1" == "clean-gw-keys" ]]; then
         exit 1
     fi
     
-    # Ensure we have a valid connection to GW2
+    # Ensure we have a valid connection to GW2 (needed even for HS0 RACs, for config)
     if ! ensure_gw2_connection; then
         exit 1
     fi
     
     set -u
     client_ip_port=$(( 35800 + client_rac ))
+    rac_tunnel_server=$(rac_get_server "${client_rac}")
     
-    echo "Cleaning GW1/GW2 keys from RAC #${client_rac} via ${WD_RAC_CONNECTION_PATH}"
+    echo "Cleaning GW1/GW2 keys from RAC #${client_rac} via ${rac_tunnel_server}:${client_ip_port}"
     
     # Test connection first
-    if ! nc -z ${WD_RAC_SERVER} ${client_ip_port} >/dev/null 2>&1; then
-        echo "ERROR: Can't connect to ${WD_RAC_SERVER}:${client_ip_port}"
+    if ! nc -z ${rac_tunnel_server} ${client_ip_port} >/dev/null 2>&1; then
+        echo "ERROR: Can't connect to ${rac_tunnel_server}:${client_ip_port}"
         exit 1
     fi
     
-    wd-remove-gw-keys-from-client "${client_ip_port}" "${client_user}"
+    wd-remove-gw-keys-from-client "${client_ip_port}" "${client_user}" "${rac_tunnel_server}"
     exit 0
 fi
 
@@ -2654,12 +2699,13 @@ if [[ "$1" == "scan-and-clean-all" ]]; then
 
     for client_rac in {1..213}; do
         client_ip_port=$(( 35800 + client_rac ))
+        rac_tunnel_server=$(rac_get_server "${client_rac}")
 
         # All output goes through tee so RAC# appears in both terminal and log
-        printf "RAC #%-3d port %-5d  " "${client_rac}" "${client_ip_port}" | tee -a "${log_file}"
+        printf "RAC #%-3d port %-5d [%s]  " "${client_rac}" "${client_ip_port}" "${rac_tunnel_server}" | tee -a "${log_file}"
 
         # Test if port is open
-        if ! nc -z -w 2 ${WD_RAC_SERVER} ${client_ip_port} >/dev/null 2>&1; then
+        if ! nc -z -w 2 ${rac_tunnel_server} ${client_ip_port} >/dev/null 2>&1; then
             echo "SKIP  - port closed" | tee -a "${log_file}"
             ((no_port_count++))
             continue
@@ -2667,7 +2713,7 @@ if [[ "$1" == "scan-and-clean-all" ]]; then
 
         # Test if we can SSH in (only tests autologin, doesn't use password)
         ssh_err=$(ssh ${SSH_OPTS} -p "${client_ip_port}" -o BatchMode=yes \
-            "${client_user}@${WD_RAC_SERVER}" "exit 0" 2>&1)
+            "${client_user}@${rac_tunnel_server}" "exit 0" 2>&1)
         if [[ $? -ne 0 ]]; then
             # Classify the SSH failure reason
             reason="unknown SSH error"
@@ -2686,7 +2732,7 @@ if [[ "$1" == "scan-and-clean-all" ]]; then
         fi
 
         # We can autologin, so clean the GW keys
-        if wd-remove-gw-keys-from-client "${client_ip_port}" "${client_user}" >/dev/null 2>&1; then
+        if wd-remove-gw-keys-from-client "${client_ip_port}" "${client_user}" "${rac_tunnel_server}" >/dev/null 2>&1; then
             echo "CLEANED" | tee -a "${log_file}"
             ((cleaned_count++))
             cleaned_racs+=("${client_rac}")
