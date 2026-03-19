@@ -25,7 +25,7 @@ import clickhouse_connect
 import logging
 
 # Version
-VERSION = "2.24.1"  # Fix mark_tbz_processed: append-only to avoid rewriting entire file on every flush
+VERSION = "2.24.2"  # Quarantine spots with invalid dates (bad month) instead of retrying forever
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -769,18 +769,44 @@ def convert_spot_to_clickhouse(spot: Dict) -> Dict:
 
 def insert_spots(client, spots: List[Dict], database: str, table: str,
                 max_per_insert: int = 50000) -> bool:
-    """Insert spots into ClickHouse in batches"""
+    """Insert spots into ClickHouse in batches.
+
+    Each spot is converted individually so that a single record with a bad
+    date/time field (e.g. month=0 from a corrupt tbz) is quarantined rather
+    than poisoning the entire batch and triggering infinite retries.
+    """
     if not spots:
         return True
 
+    # Convert per-record, catching bad dates immediately
+    good_records = []
+    bad_count = 0
+    for spot in spots:
+        try:
+            good_records.append(convert_spot_to_clickhouse(spot))
+        except Exception as e:
+            bad_count += 1
+            log(f"REJECT spot with invalid date "
+                f"(date={spot.get('date','?')} time={spot.get('time','?')} "
+                f"rx={spot.get('rx_sign','?')} tx={spot.get('tx_sign','?')}): {e}",
+                "WARNING")
+
+    if bad_count:
+        log(f"Quarantined {bad_count} bad spot(s) out of {len(spots)} in this batch", "ERROR")
+
+    if not good_records:
+        # All records were invalid — nothing to insert, but this is a data
+        # problem not a DB error, so return True to avoid pointless retries.
+        log("No valid spots remaining after quarantine — skipping insert", "WARNING")
+        return True
+
     try:
-        ch_records = [convert_spot_to_clickhouse(spot) for spot in spots]
         # Use column order from first record so clickhouse_connect receives
         # a list-of-lists with explicit column_names rather than keying by int
-        column_names = list(ch_records[0].keys())
-        total = len(ch_records)
+        column_names = list(good_records[0].keys())
+        total = len(good_records)
         for i in range(0, total, max_per_insert):
-            batch = ch_records[i:i+max_per_insert]
+            batch = good_records[i:i+max_per_insert]
             data = [[row[col] for col in column_names] for row in batch]
             client.insert(f'{database}.{table}', data, column_names=column_names)
             log(f"Inserted batch {i//max_per_insert + 1} ({len(batch)} spots)", "DEBUG")
