@@ -1,0 +1,13 @@
+[Unit]
+Description=FRP Server (Secure TLS+Token on 35736)
+After=network.target
+
+[Service]
+Type=simple
+User=frp
+ExecStart=/home/frp/bin/frps -c /home/frp/frps-secure.toml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,32 @@
+# frps-secure.toml — frps v0.64 secure gateway config
+# Generated/managed by install-reflector.sh --install-frp
+# Token is auto-generated on first install; print with:
+#   grep '^token' /home/frp/frps-secure.toml
+
+bindPort = 35736
+
+[auth]
+method = "token"
+token  = "REPLACE_WITH_TOKEN"
+
+[transport.tls]
+force    = true
+certFile = "/home/frp/tls/server.crt"
+keyFile  = "/home/frp/tls/server.key"
+
+[log]
+to      = "/home/frp/frps-secure.log"
+level   = "info"
+maxDays = 30
+
+[webServer]
+addr     = "0.0.0.0"
+port     = 7501
+user     = "admin"
+password = "admin"
+
+[[httpPlugins]]
+name = "ssh-key-auth"
+addr = "127.0.0.1:9001"
+path = "/handler"
+ops  = ["Login"]

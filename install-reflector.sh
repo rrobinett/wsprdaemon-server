@@ -9,7 +9,7 @@
 
 set -e
 
-VERSION="2.0.4"
+VERSION="2.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_USER="wsprdaemon"
 SERVICE_NAME="wsprdaemon_reflector@reflector"
@@ -279,12 +279,140 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo "Usage: $0 [option]"
     echo ""
     echo "Options:"
-    echo "  (no args)    Full installation"
-    echo "  --check      Verify symlinks point to this repo"
-    echo "  --sync       Repair broken/missing symlinks (requires sudo)"
-    echo "  --validate   Full health check: symlinks, config, SSH, service"
-    echo "  --version    Show version"
-    echo "  --help       Show this help"
+    echo "  (no args)       Full installation (reflector)"
+    echo "  --install-frp   Install/update frps-secure + auth plugin (gateway servers)"
+    echo "  --check         Verify symlinks point to this repo"
+    echo "  --sync          Repair broken/missing symlinks (requires sudo)"
+    echo "  --validate      Full health check: symlinks, config, SSH, service"
+    echo "  --version       Show version"
+    echo "  --help          Show this help"
+    exit 0
+fi
+
+# ============================================================================
+# --install-frp  (idempotent frps-secure + auth plugin setup for gateway hosts)
+# ============================================================================
+if [[ "${1:-}" == "--install-frp" ]]; then
+    if [[ $EUID -ne 0 ]]; then echo "Requires root (use sudo)"; exit 1; fi
+
+    FRP_VERSION="0.64.0"
+    FRP_USER="frp"
+    FRP_HOME="/home/frp"
+    FRP_BIN="$FRP_HOME/bin/frps"
+    FRP_CONF="$FRP_HOME/frps-secure.toml"
+    FRP_PLUGIN="$FRP_HOME/frps-auth-plugin.py"
+    FRP_TLS_DIR="$FRP_HOME/tls"
+
+    echo "=== Installing frps-secure v$FRP_VERSION on $(hostname -f) ==="
+
+    # --- frp user ---
+    if ! id -u "$FRP_USER" >/dev/null 2>&1; then
+        useradd -r -s /sbin/nologin -d "$FRP_HOME" -m "$FRP_USER"
+        echo "  Created user: $FRP_USER"
+    else
+        echo "  User $FRP_USER: already exists"
+    fi
+    mkdir -p "$FRP_HOME/bin" "$FRP_TLS_DIR"
+    chown -R "$FRP_USER:$FRP_USER" "$FRP_HOME"
+
+    # --- frps binary ---
+    if [[ -f "$FRP_BIN" ]] && "$FRP_BIN" --version 2>/dev/null | grep -q "$FRP_VERSION"; then
+        echo "  frps binary: already v$FRP_VERSION"
+    else
+        ARCH=$(uname -m)
+        [[ "$ARCH" == "aarch64" ]] && ARCH="arm64" || ARCH="amd64"
+        TARBALL="frp_${FRP_VERSION}_linux_${ARCH}.tar.gz"
+        URL="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/${TARBALL}"
+        echo "  Downloading frps $FRP_VERSION ($ARCH)..."
+        TMP=$(mktemp -d)
+        curl -fsSL "$URL" -o "$TMP/$TARBALL"
+        tar -xzf "$TMP/$TARBALL" -C "$TMP"
+        cp "$TMP/frp_${FRP_VERSION}_linux_${ARCH}/frps" "$FRP_BIN"
+        chmod 755 "$FRP_BIN"
+        chown "$FRP_USER:$FRP_USER" "$FRP_BIN"
+        rm -rf "$TMP"
+        echo "  frps installed: $FRP_BIN"
+    fi
+
+    # --- TLS certificate (self-signed, 10 years) ---
+    if [[ -f "$FRP_TLS_DIR/server.crt" && -f "$FRP_TLS_DIR/server.key" ]]; then
+        echo "  TLS cert: already exists ($FRP_TLS_DIR/server.crt)"
+    else
+        FQDN=$(hostname -f)
+        openssl req -x509 -newkey rsa:4096 \
+            -keyout "$FRP_TLS_DIR/server.key" \
+            -out "$FRP_TLS_DIR/server.crt" \
+            -days 3650 -nodes \
+            -subj "/CN=$FQDN" \
+            -addext "subjectAltName=DNS:$FQDN" 2>/dev/null
+        chown "$FRP_USER:$FRP_USER" "$FRP_TLS_DIR/server.crt" "$FRP_TLS_DIR/server.key"
+        chmod 600 "$FRP_TLS_DIR/server.key"
+        echo "  TLS cert: generated for $FQDN"
+    fi
+
+    # --- Auth token (generate once, never overwrite) ---
+    if [[ -f "$FRP_CONF" ]] && grep -q '^token' "$FRP_CONF" 2>/dev/null; then
+        EXISTING_TOKEN=$(grep '^token' "$FRP_CONF" | sed 's/.*= *"\(.*\)"/\1/')
+        echo "  Token: already set ($EXISTING_TOKEN)"
+        FRP_TOKEN="$EXISTING_TOKEN"
+    else
+        FRP_TOKEN=$(openssl rand -hex 16)
+        echo "  Token: generated ($FRP_TOKEN)"
+    fi
+
+    # --- frps-secure.toml (write only if missing or token changed) ---
+    NEED_WRITE=true
+    if [[ -f "$FRP_CONF" ]]; then
+        if grep -q "\"$FRP_TOKEN\"" "$FRP_CONF" 2>/dev/null; then
+            NEED_WRITE=false
+            echo "  Config $FRP_CONF: already up to date"
+        fi
+    fi
+    if [[ "$NEED_WRITE" == "true" ]]; then
+        sed "s/REPLACE_WITH_TOKEN/$FRP_TOKEN/" \
+            "$SCRIPT_DIR/frp/frps-secure.toml.template" > "$FRP_CONF"
+        chown "$FRP_USER:$FRP_USER" "$FRP_CONF"
+        echo "  Config: wrote $FRP_CONF"
+    fi
+
+    # --- Auth plugin ---
+    cp "$SCRIPT_DIR/frp/frps-auth-plugin.py" "$FRP_PLUGIN"
+    chmod 755 "$FRP_PLUGIN"
+    chown "$FRP_USER:$FRP_USER" "$FRP_PLUGIN"
+    touch "$FRP_HOME/frps-secure.log"
+    chown "$FRP_USER:$FRP_USER" "$FRP_HOME/frps-secure.log"
+    echo "  Auth plugin: $FRP_PLUGIN"
+
+    # --- Systemd services ---
+    for svc in frps-secure frps-auth-plugin; do
+        cp "$SCRIPT_DIR/frp/${svc}.service" "/etc/systemd/system/${svc}.service"
+        echo "  Service: /etc/systemd/system/${svc}.service"
+    done
+    systemctl daemon-reload
+    systemctl enable frps-auth-plugin frps-secure
+    systemctl restart frps-auth-plugin
+    sleep 1
+    systemctl restart frps-secure
+    sleep 2
+
+    echo ""
+    echo "=== frps-secure installation complete ==="
+    echo ""
+    echo "  Shared token (distribute to clients):  $FRP_TOKEN"
+    echo "  TLS cert for clients: $FRP_TLS_DIR/server.crt"
+    echo ""
+    echo "  Status:"
+    systemctl is-active frps-auth-plugin frps-secure | paste - - | \
+        awk '{print "  frps-auth-plugin: "$1"  frps-secure: "$2}'
+    echo ""
+    echo "  Dashboard: http://$(hostname -f):7501  (or via 10.x.x.x:7501)"
+    echo "  Logs: sudo tail -f $FRP_HOME/frps-secure.log"
+    echo ""
+    echo "  Client wsprdaemon.conf settings:"
+    echo "    rac_server         = $(hostname -f)"
+    echo "    rac_token          = $FRP_TOKEN"
+    echo "    rac_tls_ca         = /etc/wsprdaemon/$(hostname -s | tr '[:upper:]' '[:lower:]')-ca.crt"
+    echo "    rac_fallback_server = <other-gateway-hostname>"
     exit 0
 fi
 

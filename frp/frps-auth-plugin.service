@@ -1,0 +1,16 @@
+[Unit]
+Description=frps SSH-key auth plugin
+After=network.target
+Before=frps-secure.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /home/frp/frps-auth-plugin.py --port 9001
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
