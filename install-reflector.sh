@@ -280,7 +280,10 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo ""
     echo "Options:"
     echo "  (no args)       Full installation (reflector)"
-    echo "  --install-frp   Install/update frps-secure + auth plugin (gateway servers)"
+    echo "  --install-frp [--token=TOKEN] [--fqdn=FQDN]"
+    echo "                  Install/update frps-secure + auth plugin (gateway servers)"
+    echo "                  --token=  reuse a shared token (default: generate new)"
+    echo "                  --fqdn=   public DNS name for TLS cert (default: hostname -f)"
     echo "  --check         Verify symlinks point to this repo"
     echo "  --sync          Repair broken/missing symlinks (requires sudo)"
     echo "  --validate      Full health check: symlinks, config, SSH, service"
@@ -296,10 +299,14 @@ if [[ "${1:-}" == "--install-frp" ]]; then
     if [[ $EUID -ne 0 ]]; then echo "Requires root (use sudo)"; exit 1; fi
 
     # Optional: --token=<value> to reuse an existing shared token across gateways
+    # Optional: --fqdn=<value> to override hostname for TLS cert CN/SAN
     FORCED_TOKEN=""
+    FORCED_FQDN=""
     for arg in "${@:2}"; do
         if [[ "$arg" == --token=* ]]; then
             FORCED_TOKEN="${arg#--token=}"
+        elif [[ "$arg" == --fqdn=* ]]; then
+            FORCED_FQDN="${arg#--fqdn=}"
         fi
     done
 
@@ -311,7 +318,7 @@ if [[ "${1:-}" == "--install-frp" ]]; then
     FRP_PLUGIN="$FRP_HOME/frps-auth-plugin.py"
     FRP_TLS_DIR="$FRP_HOME/tls"
 
-    echo "=== Installing frps-secure v$FRP_VERSION on $(hostname -f) ==="
+    echo "=== Installing frps-secure v$FRP_VERSION on ${FORCED_FQDN:-$(hostname -f)} ==="
 
     # --- frp user ---
     if ! id -u "$FRP_USER" >/dev/null 2>&1; then
@@ -343,10 +350,20 @@ if [[ "${1:-}" == "--install-frp" ]]; then
     fi
 
     # --- TLS certificate (self-signed, 10 years) ---
-    if [[ -f "$FRP_TLS_DIR/server.crt" && -f "$FRP_TLS_DIR/server.key" ]]; then
-        echo "  TLS cert: already exists ($FRP_TLS_DIR/server.crt)"
-    else
-        FQDN=$(hostname -f)
+    FQDN="${FORCED_FQDN:-$(hostname -f)}"
+    # Regenerate if cert is missing OR if --fqdn= was supplied and CN doesn't match
+    NEED_CERT=false
+    if [[ ! -f "$FRP_TLS_DIR/server.crt" || ! -f "$FRP_TLS_DIR/server.key" ]]; then
+        NEED_CERT=true
+    elif [[ -n "$FORCED_FQDN" ]]; then
+        CERT_CN=$(openssl x509 -noout -subject -in "$FRP_TLS_DIR/server.crt" 2>/dev/null \
+                  | sed 's/.*CN *= *//')
+        if [[ "$CERT_CN" != "$FQDN" ]]; then
+            NEED_CERT=true
+            echo "  TLS cert: CN=$CERT_CN doesn't match --fqdn=$FQDN — regenerating"
+        fi
+    fi
+    if $NEED_CERT; then
         openssl req -x509 -newkey rsa:4096 \
             -keyout "$FRP_TLS_DIR/server.key" \
             -out "$FRP_TLS_DIR/server.crt" \
@@ -356,6 +373,8 @@ if [[ "${1:-}" == "--install-frp" ]]; then
         chown "$FRP_USER:$FRP_USER" "$FRP_TLS_DIR/server.crt" "$FRP_TLS_DIR/server.key"
         chmod 600 "$FRP_TLS_DIR/server.key"
         echo "  TLS cert: generated for $FQDN"
+    else
+        echo "  TLS cert: already exists ($FRP_TLS_DIR/server.crt)"
     fi
 
     # --- Auth token (forced > existing > generated) ---
@@ -416,13 +435,13 @@ if [[ "${1:-}" == "--install-frp" ]]; then
     systemctl is-active frps-auth-plugin frps-secure | paste - - | \
         awk '{print "  frps-auth-plugin: "$1"  frps-secure: "$2}'
     echo ""
-    echo "  Dashboard: http://$(hostname -f):7501  (or via 10.x.x.x:7501)"
+    echo "  Dashboard: http://$FQDN:7501  (or via 10.x.x.x:7501)"
     echo "  Logs: sudo tail -f $FRP_HOME/frps-secure.log"
     echo ""
     echo "  Client wsprdaemon.conf settings:"
-    echo "    rac_server         = $(hostname -f)"
+    echo "    rac_server         = $FQDN"
     echo "    rac_token          = $FRP_TOKEN"
-    echo "    rac_tls_ca         = /etc/wsprdaemon/$(hostname -s | tr '[:upper:]' '[:lower:]')-ca.crt"
+    echo "    rac_tls_ca         = /etc/wsprdaemon/$(echo "$FQDN" | cut -d. -f1 | tr '[:upper:]' '[:lower:]')-ca.crt"
     echo "    rac_fallback_server = <other-gateway-hostname>"
     exit 0
 fi
