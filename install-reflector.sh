@@ -295,6 +295,14 @@ fi
 if [[ "${1:-}" == "--install-frp" ]]; then
     if [[ $EUID -ne 0 ]]; then echo "Requires root (use sudo)"; exit 1; fi
 
+    # Optional: --token=<value> to reuse an existing shared token across gateways
+    FORCED_TOKEN=""
+    for arg in "${@:2}"; do
+        if [[ "$arg" == --token=* ]]; then
+            FORCED_TOKEN="${arg#--token=}"
+        fi
+    done
+
     FRP_VERSION="0.64.0"
     FRP_USER="frp"
     FRP_HOME="/home/frp"
@@ -350,8 +358,11 @@ if [[ "${1:-}" == "--install-frp" ]]; then
         echo "  TLS cert: generated for $FQDN"
     fi
 
-    # --- Auth token (generate once, never overwrite) ---
-    if [[ -f "$FRP_CONF" ]] && grep -q '^token' "$FRP_CONF" 2>/dev/null; then
+    # --- Auth token (forced > existing > generated) ---
+    if [[ -n "$FORCED_TOKEN" ]]; then
+        FRP_TOKEN="$FORCED_TOKEN"
+        echo "  Token: using provided token ($FRP_TOKEN)"
+    elif [[ -f "$FRP_CONF" ]] && grep -q '^token' "$FRP_CONF" 2>/dev/null; then
         EXISTING_TOKEN=$(grep '^token' "$FRP_CONF" | sed 's/.*= *"\(.*\)"/\1/')
         echo "  Token: already set ($EXISTING_TOKEN)"
         FRP_TOKEN="$EXISTING_TOKEN"
