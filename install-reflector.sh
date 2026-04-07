@@ -405,6 +405,18 @@ if [[ "${1:-}" == "--install-frp" ]]; then
         echo "  Config: wrote $FRP_CONF"
     fi
 
+    # --- frps-open.toml (no auth, no TLS — legacy frpc clients on port 35735) ---
+    FRP_OPEN_CONF="$FRP_HOME/frps-open.toml"
+    if [[ ! -f "$FRP_OPEN_CONF" ]]; then
+        cp "$SCRIPT_DIR/frp/frps-open.toml.template" "$FRP_OPEN_CONF"
+        chown "$FRP_USER:$FRP_USER" "$FRP_OPEN_CONF"
+        echo "  Config: wrote $FRP_OPEN_CONF"
+    else
+        echo "  Config $FRP_OPEN_CONF: already exists"
+    fi
+    touch "$FRP_HOME/frps-open.log"
+    chown "$FRP_USER:$FRP_USER" "$FRP_HOME/frps-open.log"
+
     # --- Auth plugin ---
     cp "$SCRIPT_DIR/frp/frps-auth-plugin.py" "$FRP_PLUGIN"
     chmod 755 "$FRP_PLUGIN"
@@ -414,31 +426,40 @@ if [[ "${1:-}" == "--install-frp" ]]; then
     echo "  Auth plugin: $FRP_PLUGIN"
 
     # --- Systemd services ---
-    for svc in frps-secure frps-auth-plugin; do
+    for svc in frps-open frps-secure frps-auth-plugin; do
         cp "$SCRIPT_DIR/frp/${svc}.service" "/etc/systemd/system/${svc}.service"
         echo "  Service: /etc/systemd/system/${svc}.service"
     done
     systemctl daemon-reload
-    systemctl enable frps-auth-plugin frps-secure
+    systemctl enable frps-auth-plugin frps-open frps-secure
     systemctl restart frps-auth-plugin
     sleep 1
+    systemctl restart frps-open
     systemctl restart frps-secure
     sleep 2
 
     echo ""
-    echo "=== frps-secure installation complete ==="
+    echo "=== frps installation complete ==="
     echo ""
-    echo "  Shared token (distribute to clients):  $FRP_TOKEN"
-    echo "  TLS cert for clients: $FRP_TLS_DIR/server.crt"
+    echo "  Open gateway   port 35735  (no auth, no TLS — legacy frpc clients)"
+    echo "  Secure gateway port 35736  (token + TLS + SSH-key auth)"
+    echo ""
+    echo "  Shared token (distribute to new clients):  $FRP_TOKEN"
+    echo "  TLS cert for new clients: $FRP_TLS_DIR/server.crt"
     echo ""
     echo "  Status:"
-    systemctl is-active frps-auth-plugin frps-secure | paste - - | \
-        awk '{print "  frps-auth-plugin: "$1"  frps-secure: "$2}'
+    systemctl is-active frps-auth-plugin frps-open frps-secure | paste - - - | \
+        awk '{print "  frps-auth-plugin: "$1"  frps-open: "$2"  frps-secure: "$3}'
     echo ""
-    echo "  Dashboard: http://$FQDN:7501  (or via 10.x.x.x:7501)"
-    echo "  Logs: sudo tail -f $FRP_HOME/frps-secure.log"
+    echo "  Dashboards:"
+    echo "    Open:   http://$FQDN:7500"
+    echo "    Secure: http://$FQDN:7501"
     echo ""
-    echo "  Client wsprdaemon.conf settings:"
+    echo "  Logs:"
+    echo "    sudo tail -f $FRP_HOME/frps-open.log"
+    echo "    sudo tail -f $FRP_HOME/frps-secure.log"
+    echo ""
+    echo "  New client wsprdaemon.conf settings:"
     echo "    rac_server         = $FQDN"
     echo "    rac_token          = $FRP_TOKEN"
     echo "    rac_tls_ca         = /etc/wsprdaemon/$(echo "$FQDN" | cut -d. -f1 | tr '[:upper:]' '[:lower:]')-ca.crt"
