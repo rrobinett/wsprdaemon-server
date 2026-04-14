@@ -34,7 +34,7 @@ import glob
 from datetime import timezone
 
 # Version
-VERSION = "2.7.0"  # Bad-dir cap + richer diagnostics + atomic cache writes (fix race condition)
+VERSION = "2.8.0"  # Fast startup: part-metadata max(id) + bad-dir trim at startup
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -305,15 +305,38 @@ def get_session_token(session_file: Path, username: str, password: str, login_ur
 
 
 def get_last_spotnum_from_db(client, database: str, table: str) -> int:
-    """Get highest spotnum from database"""
-    try:
-        result = client.query(f"SELECT max(id) FROM {database}.{table}")
-        if result.result_rows and result.result_rows[0][0] is not None:
-            return int(result.result_rows[0][0])
-        return 0
-    except Exception as e:
-        log(f"Failed to get last spotnum: {e}", "WARNING")
-        return 0
+    """Get highest spotnum from database.
+
+    Wsprnet spot IDs are monotonically increasing with time, so the max(id)
+    is always in the most recent data.  Bounding the query with a WHERE on
+    time lets ClickHouse prune to a single partition and use the leading sort
+    key, making this essentially instant even on multi-billion-row tables.
+
+    Strategy (each step falls through only if the previous returns 0):
+      1. Current month only (toStartOfMonth)
+      2. Last 2 months (in case we're right at a month boundary)
+      3. Full table scan — slow but always correct
+    """
+    table_ref = f"{database}.{table}"
+
+    for label, where in [
+        ("current month",   "time >= toStartOfMonth(now())"),
+        ("last 2 months",   "time >= toStartOfMonth(now() - INTERVAL 1 MONTH)"),
+        ("full table scan", "1=1"),
+    ]:
+        try:
+            result = client.query(
+                f"SELECT max(id) FROM {table_ref} WHERE {where}"
+            )
+            if result.result_rows and result.result_rows[0][0] not in (None, 0):
+                spotnum = int(result.result_rows[0][0])
+                if spotnum > 0:
+                    log(f"Got last spotnum via {label}: {spotnum}")
+                    return spotnum
+        except Exception as e:
+            log(f"Spotnum query ({label}) failed: {e}", "WARNING")
+
+    return 0
 
 
 def download_and_cache_spots(session_token: str, last_spotnum: int, config: Dict, cache_dir: str) -> Tuple[bool, bool, int]:
@@ -1091,8 +1114,15 @@ def main():
     if not ensure_cache_dir(config['cache_dir']):
         log("Cannot create cache directory!", "ERROR")
         sys.exit(1)
-    
+
     log(f"Cache directory: {config['cache_dir']}")
+
+    # Trim the bad/ quarantine dir at startup so it doesn't grow unbounded
+    # across restarts (trim_bad_dir is normally called per-quarantine, but
+    # that doesn't catch files that accumulated while the scraper was down).
+    bad_dir_startup = Path(config['cache_dir']) / 'bad'
+    if bad_dir_startup.exists():
+        trim_bad_dir(bad_dir_startup, config.get('bad_dir_max_files', 1000))
     
     config['clickhouse_user'] = args.clickhouse_user
     config['clickhouse_password'] = args.clickhouse_password
