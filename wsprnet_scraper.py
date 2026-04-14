@@ -34,7 +34,7 @@ import glob
 from datetime import timezone
 
 # Version
-VERSION = "2.6.1"  # Partial JSON recovery: extract valid spots from truncated/corrupted cache files
+VERSION = "2.7.0"  # Bad-dir cap + richer diagnostics + atomic cache writes (fix race condition)
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -53,7 +53,8 @@ DEFAULT_CONFIG = {
     'loop_interval': 20,
     'cache_dir': '/var/lib/wsprnet/cache',
     'batch_flush_rows': 100000,   # flush accumulated rows when this many are pending
-    'batch_flush_seconds': 10     # flush if this many seconds have passed since last flush
+    'batch_flush_seconds': 10,    # flush if this many seconds have passed since last flush
+    'bad_dir_max_files': 1000     # maximum JSON files to keep in the bad/ quarantine dir
 }
 
 # Logging configuration
@@ -138,6 +139,71 @@ def log(message: str, level: str = "INFO"):
         'CRITICAL': logging.CRITICAL
     }
     logger.log(level_map.get(level, logging.INFO), message)
+
+
+def diagnose_bad_json(cache_file: Path, je: Exception) -> None:
+    """Log detailed diagnostics about a JSON file that failed to parse."""
+    SNIPPET = 200  # bytes to show from head and tail
+
+    try:
+        size = cache_file.stat().st_size
+    except OSError:
+        size = -1
+
+    log(f"  Bad JSON diagnostics for {cache_file.name}:", "WARNING")
+    log(f"    file size  : {size} bytes", "WARNING")
+    log(f"    parse error: {je}", "WARNING")
+
+    try:
+        raw = cache_file.read_bytes()
+        head = raw[:SNIPPET]
+        tail = raw[-SNIPPET:] if size > SNIPPET else b''
+
+        # Try to detect format from the first non-whitespace bytes
+        stripped = raw.lstrip()
+        if stripped.startswith(b'{'):
+            # Try to read top-level keys even from broken JSON
+            try:
+                import re as _re
+                keys = _re.findall(rb'"([^"]{1,40})"\s*:', raw[:2048])
+                unique_keys = list(dict.fromkeys(k.decode('utf-8', errors='replace') for k in keys))
+                log(f"    top-level JSON keys (up to first 2048 bytes): {unique_keys}", "WARNING")
+            except Exception:
+                pass
+        elif stripped.startswith(b'['):
+            log(f"    file appears to be a JSON array (not an object)", "WARNING")
+        else:
+            log(f"    file does not start with '{{' or '['; may not be JSON at all", "WARNING")
+
+        log(f"    first {min(SNIPPET, size)} bytes: {head!r}", "WARNING")
+        if tail:
+            log(f"    last  {min(SNIPPET, size)} bytes: {tail!r}", "WARNING")
+    except Exception as read_err:
+        log(f"    (could not read file for diagnostics: {read_err})", "WARNING")
+
+
+def trim_bad_dir(bad_dir: Path, max_files: int) -> None:
+    """Remove the oldest files from bad_dir when the count exceeds max_files."""
+    if max_files <= 0:
+        return
+    try:
+        entries = [(e.stat().st_mtime, e.path) for e in os.scandir(bad_dir) if e.is_file()]
+    except OSError:
+        return
+
+    excess = len(entries) - max_files
+    if excess <= 0:
+        return
+
+    # Sort oldest-first and delete the excess
+    entries.sort()
+    for _, path in entries[:excess]:
+        try:
+            os.unlink(path)
+        except OSError as e:
+            log(f"trim_bad_dir: could not remove {path}: {e}", "WARNING")
+    log(f"trim_bad_dir: removed {excess} oldest file(s) from {bad_dir} "
+        f"(limit={max_files})", "INFO")
 
 
 def ensure_cache_dir(cache_dir: str) -> bool:
@@ -326,10 +392,12 @@ def download_and_cache_spots(session_token: str, last_spotnum: int, config: Dict
             if gaps_found > 0:
                 log(f"Total gaps in this download: {gaps_found}", "WARNING")
         
-        # Always save to cache
+        # Always save to cache — write to a .tmp file first, then rename
+        # atomically so the insert thread never sees a partially-written file.
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         cache_file = Path(cache_dir) / f'spots_{timestamp}.json'
-        
+        tmp_file   = cache_file.with_suffix('.tmp')
+
         cache_data = {
             'timestamp': timestamp,
             'download_time': time.time(),
@@ -338,10 +406,11 @@ def download_and_cache_spots(session_token: str, last_spotnum: int, config: Dict
             'last_spotnum': spots[-1].get('Spotnum', 0) if spots else 0,
             'spots': spots
         }
-        
-        with open(cache_file, 'w') as f:
+
+        with open(tmp_file, 'w') as f:
             json.dump(cache_data, f, indent=2)
-        
+        tmp_file.rename(cache_file)   # atomic on Linux (same filesystem)
+
         log(f"Downloaded and cached {len(spots)} spots to {cache_file.name}")
         return True, False, highest_spotnum
         
@@ -526,7 +595,8 @@ def process_spot(spot: Dict) -> Optional[tuple]:
         return None
 
 
-def insert_cached_file(client, cache_file: Path, database: str, table: str) -> bool:
+def insert_cached_file(client, cache_file: Path, database: str, table: str,
+                       bad_dir_max_files: int = 1000) -> bool:
     """Process and insert a cached file with retry tracking"""
     try:
         with open(cache_file, 'r') as f:
@@ -536,9 +606,10 @@ def insert_cached_file(client, cache_file: Path, database: str, table: str) -> b
                 # Corrupted/truncated download - quarantine, don't retry forever
                 bad_dir = cache_file.parent / 'bad'
                 bad_dir.mkdir(exist_ok=True)
-                bad_path = bad_dir / cache_file.name
-                cache_file.rename(bad_path)
-                log(f"Corrupted JSON in {cache_file.name} at char {je.pos}: {je.msg} - quarantined to bad/", "WARNING")
+                diagnose_bad_json(cache_file, je)
+                cache_file.rename(bad_dir / cache_file.name)
+                trim_bad_dir(bad_dir, bad_dir_max_files)
+                log(f"Corrupted JSON in {cache_file.name} — quarantined to bad/", "WARNING")
                 return True  # Don't trigger backoff for a parse error
         
         spots = cache_data.get('spots', [])
@@ -790,6 +861,7 @@ def insert_thread_worker(config: Dict, cache_dir: str, database: str, table: str
                             except json.JSONDecodeError as je:
                                 log(f"Corrupted JSON in {cache_file.name} at char {je.pos}: "
                                     f"{je.msg} — attempting partial recovery", "WARNING")
+                                diagnose_bad_json(cache_file, je)
                                 spots = recover_spots_from_corrupt_json(cache_file)
                                 if spots:
                                     log(f"Recovered {len(spots)} spots from corrupted {cache_file.name}", "INFO")
@@ -797,6 +869,7 @@ def insert_thread_worker(config: Dict, cache_dir: str, database: str, table: str
                                     bad_dir = cache_file.parent / 'bad'
                                     bad_dir.mkdir(exist_ok=True)
                                     cache_file.rename(bad_dir / cache_file.name)
+                                    trim_bad_dir(bad_dir, config.get('bad_dir_max_files', 1000))
                                     log(f"No spots recoverable from {cache_file.name} — quarantined", "WARNING")
                                     continue
                     except Exception as e:
