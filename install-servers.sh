@@ -457,6 +457,18 @@ for dir in /var/spool/wsprdaemon /var/spool/wsprdaemon/from-gw1 /var/spool/wsprd
 done
 echo "  Data directories ready"
 
+# Ensure /tmp/wsprdaemon survives reboots via systemd-tmpfiles
+TMPFILES_CONF=/etc/tmpfiles.d/wsprdaemon.conf
+TMPFILES_LINE="d /tmp/wsprdaemon 0755 ${INSTALL_USER} ${INSTALL_USER} -"
+if [[ ! -f "$TMPFILES_CONF" ]] || ! grep -qF "/tmp/wsprdaemon" "$TMPFILES_CONF"; then
+    echo "Installing tmpfiles.d entry for /tmp/wsprdaemon..."
+    echo "$TMPFILES_LINE" > "$TMPFILES_CONF"
+    systemd-tmpfiles --create "$TMPFILES_CONF"
+    echo "  Installed $TMPFILES_CONF"
+else
+    echo "  tmpfiles.d entry already present: $TMPFILES_CONF"
+fi
+
 # Create Python virtual environment if it doesn't exist
 if [[ ! -d $VENV_DIR ]]; then
     echo "Creating Python virtual environment at $VENV_DIR..."
