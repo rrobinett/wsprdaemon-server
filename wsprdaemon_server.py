@@ -1006,6 +1006,83 @@ def stage_tbz_files_to_ram(tbz_files: List[Path], staging_dir: Path,
     return staged
 
 
+
+
+# ---------------------------------------------------------------------------
+# SFTP auto-provisioning
+# ---------------------------------------------------------------------------
+
+GW_HOSTS = ['gw1', 'gw2']
+
+
+def _sftp_username(reporter_id: str) -> str:
+    """Derive Linux SFTP username from reporter ID: AC0G/B1 -> AC0G_B1."""
+    return re.sub(r'[^a-zA-Z0-9_]', '_', reporter_id)
+
+
+def _provision_sftp_user_on_gw(gw: str, username: str, pubkey: str) -> None:
+    """Create SFTP-only Linux user and install pubkey on a gateway — idempotent.
+
+    Uses useradd exit code 9 (user exists) as a safe no-op so multiple WD
+    servers racing on the same client_upload_info don't conflict.
+    """
+    script = (
+        "set -e\n"
+        f"USERNAME='{username}'\n"
+        f"PUBKEY='{pubkey}'\n"
+        "sudo useradd -m -s /bin/false -G sftponly \"$USERNAME\" 2>/dev/null || "
+        "{ RC=$?; [ $RC -eq 9 ] || exit $RC; }\n"
+        'SSH_DIR="/home/$USERNAME/.ssh"\n'
+        'sudo mkdir -p "$SSH_DIR"\n'
+        'sudo chmod 700 "$SSH_DIR"\n'
+        'if ! sudo grep -qxF "$PUBKEY" "$SSH_DIR/authorized_keys" 2>/dev/null; then\n'
+        '    echo "$PUBKEY" | sudo tee -a "$SSH_DIR/authorized_keys" > /dev/null\n'
+        'fi\n'
+        'sudo chmod 600 "$SSH_DIR/authorized_keys"\n'
+        'sudo chown root:root "/home/$USERNAME"\n'
+        'sudo chmod 755 "/home/$USERNAME"\n'
+        'sudo mkdir -p "/home/$USERNAME/uploads"\n'
+        'sudo chown "$USERNAME:$USERNAME" "/home/$USERNAME/uploads"\n'
+        'sudo chown -R "$USERNAME:$USERNAME" "$SSH_DIR"\n'
+        'echo ok\n'
+    )
+    result = subprocess.run(
+        ['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
+         gw, 'bash', '-s'],
+        input=script.encode(),
+        capture_output=True,
+        timeout=30,
+    )
+    if result.returncode == 0:
+        log(f"Provisioned SFTP user {username} on {gw}", "INFO")
+    else:
+        log(f"Failed to provision {username} on {gw}: "
+            f"{result.stderr.decode().strip()}", "WARNING")
+
+
+def maybe_provision_sftp(worker_dir) -> None:
+    """Check for client_upload_info.txt and provision SFTP access on all gateways."""
+    info_file = worker_dir / 'wsprdaemon' / 'client_upload_info.txt'
+    if not info_file.exists():
+        return
+    data = {}
+    for line in info_file.read_text().splitlines():
+        if '=' in line:
+            k, _, v = line.partition('=')
+            data[k.strip()] = v.strip()
+    reporter_id = data.get('reporter_id', '').strip()
+    pubkey = data.get('ssh_public_key', '').strip()
+    if not reporter_id or not pubkey:
+        log("client_upload_info.txt missing reporter_id or ssh_public_key — skipping", "WARNING")
+        return
+    username = _sftp_username(reporter_id)
+    log(f"client_upload_info found: reporter={reporter_id} user={username} — provisioning gateways", "INFO")
+    for gw in GW_HOSTS:
+        try:
+            _provision_sftp_user_on_gw(gw, username, pubkey)
+        except Exception as exc:
+            log(f"Error provisioning {username} on {gw}: {exc}", "WARNING")
+
 def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path,
                           client, database: str, spots_table: str) -> Optional[Tuple]:
     """Read tbz file into RAM then extract and parse in a private temp directory.
@@ -1035,6 +1112,8 @@ def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path,
 
         # Release raw bytes immediately — extracted files are on tmpfs
         del tbz_bytes
+
+        maybe_provision_sftp(worker_dir)
 
         client_version, running_jobs, receiver_descriptions = get_client_version(worker_dir)
         spots = process_spot_files(worker_dir, client_version, client, database, spots_table)
