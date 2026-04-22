@@ -25,7 +25,7 @@ import clickhouse_connect
 import logging
 
 # Version
-VERSION = "2.24.2"  # Quarantine spots with invalid dates (bad month) instead of retrying forever
+VERSION = "2.25.0"  # wspr.rocks compat: id ALIAS + azimuth/rx_azimuth Int16 (preserves -999 sentinel)
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -278,9 +278,10 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
             log(f"Database {config['clickhouse_database']} already exists", "INFO")
 
         # Create spots table
-        #   - azimuth/rx_azimuth are Float32 (not Int32 — fractional degrees matter)
-        #   - id column omitted (no upstream source in tbz data)
-        #   - ALIAS columns omitted (add manually if needed)
+        #   - azimuth/rx_azimuth are Int16: values are 0-360° but -999 is used
+        #     as a "no data" sentinel, so unsigned types would corrupt that value.
+        #   - id is an ALIAS (cityHash64) so wspr.rocks can use the same SELECT
+        #     query against both wspr.rx and wsprdaemon.spots.
         #   - ReplacingMergeTree so re-runs are idempotent
         create_spots_table_sql = f"""
         CREATE TABLE IF NOT EXISTS {config['clickhouse_database']}.{config['clickhouse_spots_table']}
@@ -296,8 +297,8 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
             tx_lon        Float32                           CODEC(Delta(4), ZSTD(3)),
             tx_loc        LowCardinality(String)            CODEC(LZ4),
             distance      Int32                             CODEC(T64, ZSTD(1)),
-            azimuth       Float32                           CODEC(Delta(4), ZSTD(3)),
-            rx_azimuth    Float32                           CODEC(Delta(4), ZSTD(3)),
+            azimuth       Int16                             CODEC(T64, ZSTD(1)),
+            rx_azimuth    Int16                             CODEC(T64, ZSTD(1)),
             frequency     UInt64                            CODEC(Delta(8), ZSTD(3)),
             power         Int8                              CODEC(T64, ZSTD(1)),
             snr           Int8                              CODEC(Delta(4), ZSTD(3)),
@@ -322,12 +323,13 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
             proxy_upload  UInt8                             CODEC(T64, ZSTD(1)),
             ov_count      UInt32                            CODEC(T64, ZSTD(1)),
             rx_status     LowCardinality(String) DEFAULT 'No Info' CODEC(LZ4),
-            band_m        Int16                             CODEC(T64, ZSTD(1))
+            band_m        Int16                             CODEC(T64, ZSTD(1)),
+            id            UInt64 ALIAS cityHash64(rx_sign, tx_sign, band, rx_id, time, frequency)
         )
         ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMM(time)
-        ORDER BY (time, rx_sign, tx_sign, frequency)
-        SETTINGS index_granularity = 8192
+        ORDER BY (rx_sign, tx_sign, band, rx_id, time)
+        SETTINGS index_granularity = 32768, min_age_to_force_merge_seconds = 120
         """
         admin_client.command(create_spots_table_sql)
         log(f"Table {config['clickhouse_database']}.{config['clickhouse_spots_table']} ready", "INFO")
@@ -735,8 +737,8 @@ def convert_spot_to_clickhouse(spot: Dict) -> Dict:
         'tx_lat':        spot.get('tx_lat', 0.0),
         'tx_lon':        spot.get('tx_lon', 0.0),
         'distance':      spot.get('distance', 0),
-        'azimuth':       spot.get('azimuth', 0.0),
-        'rx_azimuth':    spot.get('rx_azimuth', 0.0),
+        'azimuth':       int(spot.get('azimuth', -999)),
+        'rx_azimuth':    int(spot.get('rx_azimuth', -999)),
         'frequency':     int(freq_hz),
         'frequency_mhz': freq_mhz,
         'power':         spot['power_dbm'],
