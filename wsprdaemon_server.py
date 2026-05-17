@@ -17,7 +17,7 @@ import subprocess
 import queue
 import threading
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
@@ -46,7 +46,8 @@ DEFAULT_CONFIG = {
     'batch_flush_spots': 100000,   # flush accumulated spots when this many are pending
     'batch_flush_noise': 50000,    # flush accumulated noise when this many are pending
     'batch_flush_seconds': 10,     # flush if this many seconds have passed since last flush
-    'extraction_workers': 0,       # parallel extraction threads; 0 = auto (min(32, cpu_count))
+    'extraction_workers': 0,       # parallel extraction workers; 0 = auto. With processes uses all cores up to 64; with threads, min(32, cpu_count).
+    'extraction_use_processes': True,  # True = ProcessPoolExecutor (bypasses GIL); False = ThreadPoolExecutor
     'tmpfs_staging_dir': '/tmp/wsprdaemon/tbz_staging',  # copy tbz here before extraction
     'tmpfs_staging_mb': 4096       # max MB to stage in RAM at once (default 4GB)
 }
@@ -654,8 +655,7 @@ def decode_rx_site_dir(rx_site_dir: str) -> Tuple[str, str]:
     return rx_site_dir.replace('=', '/'), ''
 
 
-def process_spot_files(extraction_dir: Path, client_version: Optional[str],
-                       client, database: str, table: str) -> List[Dict]:
+def process_spot_files(extraction_dir: Path, client_version: Optional[str]) -> List[Dict]:
     """Process all spot files inside an extracted tbz and return spot records.
 
     Expected directory structure inside the tbz:
@@ -1104,8 +1104,7 @@ def maybe_provision_sftp(worker_dir) -> None:
         except Exception as exc:
             log(f"Error provisioning {username} on {gw}: {exc}", "WARNING")
 
-def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path,
-                          client, database: str, spots_table: str) -> Optional[Tuple]:
+def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path) -> Optional[Tuple]:
     """Read tbz file into RAM then extract and parse in a private temp directory.
 
     Reading the file content in one shot minimises disk seeks — one sequential
@@ -1137,7 +1136,7 @@ def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path,
         maybe_provision_sftp(worker_dir)
 
         client_version, running_jobs, receiver_descriptions = get_client_version(worker_dir)
-        spots = process_spot_files(worker_dir, client_version, client, database, spots_table)
+        spots = process_spot_files(worker_dir, client_version)
         noise_records = process_noise_files(worker_dir, running_jobs, receiver_descriptions)
 
         return (tbz_file, spots, noise_records)
@@ -1301,11 +1300,16 @@ def main():
 
         log(f"Found {len(unprocessed)} unprocessed .tbz files", "INFO")
 
-        # Determine worker count
+        # Determine worker count and pool type
+        use_processes = config.get('extraction_use_processes', True)
         n_workers = config.get('extraction_workers', 0)
         if not n_workers:
-            n_workers = min(32, os.cpu_count() or 4)
-        log(f"Using {n_workers} extraction workers", "DEBUG")
+            cpu = os.cpu_count() or 4
+            # With processes we bypass the GIL, so we can use all cores up to 64.
+            # With threads, GIL caps useful parallelism around 32.
+            n_workers = min(64, cpu) if use_processes else min(32, cpu)
+        log(f"Using {n_workers} extraction "
+            f"{'processes' if use_processes else 'threads'}", "INFO")
 
         # Producer/consumer pipeline:
         #   - ThreadPoolExecutor: N workers extract+parse tbz files in parallel
@@ -1423,22 +1427,22 @@ def main():
         flusher = threading.Thread(target=flush_thread_worker, daemon=True)
         flusher.start()
 
-        def extract_and_enqueue(tbz_file):
-            result = extract_and_parse_tbz(
-                tbz_file, extraction_dir, client,
-                config['clickhouse_database'],
-                config['clickhouse_spots_table']
-            )
-            if result is not None:
-                results_queue.put(result)  # blocks if queue full — natural backpressure
-
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = [executor.submit(extract_and_enqueue, f) for f in unprocessed]
+        # Submit extraction work to either a process pool (GIL-free) or a thread pool.
+        # Workers RETURN their result; the main thread puts it on results_queue so the
+        # flusher can consume.  We can't reference results_queue from a subprocess —
+        # queue.Queue is not picklable.
+        Pool = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+        with Pool(max_workers=n_workers) as executor:
+            futures = {executor.submit(extract_and_parse_tbz, f, extraction_dir): f
+                       for f in unprocessed}
             for future in as_completed(futures):
                 try:
-                    future.result()
+                    result = future.result()
+                    if result is not None:
+                        results_queue.put(result)  # blocks if queue full — backpressure
                 except Exception as e:
-                    log(f"Extraction worker error: {e}", "ERROR")
+                    tbz = futures[future]
+                    log(f"Extraction worker error on {tbz.name}: {e}", "ERROR")
 
         results_queue.put(SENTINEL)
         flusher.join()
