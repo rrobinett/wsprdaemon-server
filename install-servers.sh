@@ -722,6 +722,30 @@ systemctl daemon-reload
 systemctl enable --now ch-backup-weekly.timer
 echo "  Timer enabled: weekly Sunday 03:00 America/Los_Angeles"
 
+# ClickHouse rejects BACKUP TO File() unless the destination is in
+# <backups><allowed_path>.  Default config.xml only allows the relative
+# path "backups", so without this every backup would fail with
+# "Path ... is not allowed for backups".  /srv/wd_data/wd_archive is
+# also allowed so single-disk hosts can symlink /srv/wd_archive there
+# without changing this config.
+# NOTE: <backups> settings are NOT picked up by SYSTEM RELOAD CONFIG —
+# a ClickHouse restart is required when this file is first created.
+if [[ ! -f /etc/clickhouse-server/config.d/backup-allowed-paths.xml ]]; then
+    cat > /etc/clickhouse-server/config.d/backup-allowed-paths.xml << 'XMLEOF'
+<clickhouse>
+    <backups>
+        <allowed_path>/srv/wd_archive</allowed_path>
+        <allowed_path>/srv/wd_data/wd_archive</allowed_path>
+    </backups>
+</clickhouse>
+XMLEOF
+    chmod 644 /etc/clickhouse-server/config.d/backup-allowed-paths.xml
+    echo "  Created backup-allowed-paths.xml — RESTART clickhouse-server before first backup:"
+    echo "    sudo systemctl restart clickhouse-server"
+else
+    echo "  backup-allowed-paths.xml already present (leaving as-is)"
+fi
+
 # ============================================================================
 # Create/update configuration files
 # ============================================================================
