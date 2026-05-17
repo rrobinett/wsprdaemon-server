@@ -1,0 +1,10 @@
+[Unit]
+Description=Run ch-backup-weekly every Sunday at 03:00 California time
+
+[Timer]
+OnCalendar=Sun *-*-* 03:00:00 America/Los_Angeles
+Persistent=true
+Unit=ch-backup-weekly.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Weekly ClickHouse backup of all user tables
+Documentation=file:/home/wsprdaemon/wsprdaemon-server/ch-backup-all.sh
+After=clickhouse-server.service
+Requires=clickhouse-server.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/wsprdaemon/wsprdaemon-server
+ExecStart=/home/wsprdaemon/wsprdaemon-server/ch-backup-all.sh --local
+StandardOutput=append:/var/log/wsprdaemon/ch-backup-weekly.log
+StandardError=append:/var/log/wsprdaemon/ch-backup-weekly.log
+TimeoutStartSec=6h
