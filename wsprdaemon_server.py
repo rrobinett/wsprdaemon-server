@@ -568,7 +568,7 @@ def parse_wsprd_output(file_path: Path, client_version: Optional[str]) -> List[D
                         # Timing / identity
                         'date':          parts[0],            # YYMMDD
                         'time':          parts[1],            # HHMM
-                        'sync_quality':  float(parts[2]),
+                        'sync_quality':  int(float(parts[2])),  # CH column is UInt16; native protocol requires exact int
                         'snr':           int(float(parts[3])),
                         'dt':            float(parts[4]),
                         'freq_hz':       float(parts[5]) * 1_000_000.0,  # MHz -> Hz
@@ -754,7 +754,7 @@ def convert_spot_to_clickhouse(spot: Dict) -> Dict:
         'drift':         spot.get('drift', 0),
         'rx_id':         spot['rx_id'],
         'dt':            spot['dt'],
-        'sync_quality':  spot.get('sync_quality', 0.0),
+        'sync_quality':  int(spot.get('sync_quality', 0)),
         'decode_cycles': spot.get('decode_cycles', 0),
         'jitter':        spot.get('jitter', 0),
         'blocksize':     spot.get('blocksize', 0),
