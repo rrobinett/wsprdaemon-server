@@ -264,7 +264,8 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
             host=config['clickhouse_host'],
             port=config['clickhouse_port'],
             username=admin_user,
-            password=admin_password
+            password=admin_password,
+            send_receive_timeout=600,
         )
 
         # Create database if not exists
@@ -816,7 +817,10 @@ def insert_spots(client, spots: List[Dict], database: str, table: str,
         for i in range(0, total, max_per_insert):
             batch = good_records[i:i+max_per_insert]
             data = [[row[col] for col in column_names] for row in batch]
-            client.insert(f'{database}.{table}', data, column_names=column_names)
+            client.insert(
+                f'{database}.{table}', data, column_names=column_names,
+                settings={'async_insert': 1, 'wait_for_async_insert': 1},
+            )
             log(f"Inserted batch {i//max_per_insert + 1} ({len(batch)} spots)", "DEBUG")
 
         return True
@@ -961,7 +965,10 @@ def insert_noise(client, noise_records: List[Dict], database: str, table: str,
         for i in range(0, total, max_per_insert):
             batch = noise_records[i:i+max_per_insert]
             data = [[row[col] for col in column_names] for row in batch]
-            client.insert(f'{database}.{table}', data, column_names=column_names)
+            client.insert(
+                f'{database}.{table}', data, column_names=column_names,
+                settings={'async_insert': 1, 'wait_for_async_insert': 1},
+            )
             log(f"Inserted noise batch {i//max_per_insert + 1} ({len(batch)} records)", "DEBUG")
 
         return True
@@ -1240,7 +1247,8 @@ def main():
             host=config['clickhouse_host'],
             port=config['clickhouse_port'],
             username=config['clickhouse_user'],
-            password=config['clickhouse_password']
+            password=config['clickhouse_password'],
+            send_receive_timeout=600,
         )
         log("Connected to ClickHouse", "INFO")
     except Exception as e:
