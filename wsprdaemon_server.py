@@ -25,7 +25,7 @@ import clickhouse_connect
 import logging
 
 # Version
-VERSION = "2.25.0"  # wspr.rocks compat: id ALIAS + azimuth/rx_azimuth Int16 (preserves -999 sentinel); metric widened to Int32 to accommodate client's spreading*1000 overload
+VERSION = "2.25.1"  # accept AC0G/Bn noise filename format (<rx>_<recv>_<band>_YYYYMMDD_HHMMSS_noise.txt) alongside legacy YYMMDD_HHMM_noise.txt
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -833,7 +833,13 @@ def process_noise_files(extraction_dir: Path, running_jobs: Optional[str],
     """Process noise files inside an extracted tbz and return noise records.
 
     Expected directory structure inside the tbz:
-        wsprdaemon/noise/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_noise.txt
+        wsprdaemon/noise/RX_SITE/RECEIVER/BAND/<noise_file>
+
+    Noise filenames come in two formats:
+        legacy:  YYMMDD_HHMM_noise.txt
+        AC0G/Bn: <rx_sign>_<receiver>_<band>_YYYYMMDD_HHMMSS_noise.txt
+                 (KA9Q-radio Bnn receivers; rx/recv/band in the filename are
+                  ignored — directory path is authoritative)
 
     File content (from noise-graphing.sh queue_noise_signal_levels_to_wsprdaemon):
         A single line of exactly 15 space-separated values:
@@ -881,21 +887,28 @@ def process_noise_files(extraction_dir: Path, running_jobs: Optional[str],
 
         rx_sign_dir, rx_grid_dir = decode_rx_site_dir(rx_site_dir)
 
-        # Parse timestamp from filename: YYMMDD_HHMM_noise.txt
-        m = re.match(r'(\d{6})_(\d{4})_noise\.txt', noise_file.name)
-        if not m:
-            log(f"Skipping noise file with unexpected name: {noise_file.name}", "WARNING")
-            continue
+        # Parse timestamp from filename. Two formats are accepted:
+        #   legacy:  YYMMDD_HHMM_noise.txt
+        #   AC0G/Bn: <rx>_<recv>_<band>_YYYYMMDD_HHMMSS_noise.txt
+        # The new format embeds rx/receiver/band in the filename, but those
+        # are still derived from the directory path (rel_parts above) — the
+        # only thing we need out of the filename is the timestamp.
+        m = re.match(r'^(\d{6})_(\d{4})_noise\.txt$', noise_file.name)
+        if m:
+            d, t = m.group(1), m.group(2)
+            year, month, day = 2000 + int(d[0:2]), int(d[2:4]), int(d[4:6])
+            hour, minute, second = int(t[0:2]), int(t[2:4]), 0
+        else:
+            m = re.match(r'^.*_(\d{8})_(\d{6})_noise\.txt$', noise_file.name)
+            if not m:
+                log(f"Skipping noise file with unexpected name: {noise_file.name}", "WARNING")
+                continue
+            d, t = m.group(1), m.group(2)
+            year, month, day = int(d[0:4]), int(d[4:6]), int(d[6:8])
+            hour, minute, second = int(t[0:2]), int(t[2:4]), int(t[4:6])
 
-        date_str = m.group(1)   # YYMMDD
-        time_str = m.group(2)   # HHMM
         try:
-            year   = 2000 + int(date_str[0:2])
-            month  = int(date_str[2:4])
-            day    = int(date_str[4:6])
-            hour   = int(time_str[0:2])
-            minute = int(time_str[2:4])
-            timestamp = datetime(year, month, day, hour, minute)
+            timestamp = datetime(year, month, day, hour, minute, second)
         except ValueError as e:
             log(f"Skipping noise file with bad timestamp {noise_file.name}: {e}", "WARNING")
             continue
