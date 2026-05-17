@@ -21,16 +21,18 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
-import clickhouse_connect
+import clickhouse_connect       # HTTP client — used only for the admin setup queries
+import clickhouse_driver        # native TCP client — used for the hot insert path (port 9000)
 import logging
 
 # Version
-VERSION = "2.25.1"  # accept AC0G/Bn noise filename format (<rx>_<recv>_<band>_YYYYMMDD_HHMMSS_noise.txt) alongside legacy YYMMDD_HHMM_noise.txt
+VERSION = "2.26.0"  # native TCP inserts via clickhouse-driver (HTTP via clickhouse-connect was hanging on lost responses during catch-up bursts)
 
 # Default configuration
 DEFAULT_CONFIG = {
     'clickhouse_host': 'localhost',
-    'clickhouse_port': 8123,
+    'clickhouse_port': 8123,         # HTTP port — used only by the admin client
+    'clickhouse_native_port': 9000,  # native TCP port — used by the data-path insert client
     'clickhouse_user': '',
     'clickhouse_password': '',
     'clickhouse_database': 'wsprdaemon',
@@ -43,7 +45,7 @@ DEFAULT_CONFIG = {
     'max_spots_per_insert': 50000,
     'max_noise_per_insert': 50000,
     'loop_interval': 10,
-    'batch_flush_spots': 25000,    # flush accumulated spots when this many are pending; 100k caused HTTP timeouts on WD20 during backlog drain (post-ProcessPool, batches built faster than CH could ingest)
+    'batch_flush_spots': 100000,   # flush accumulated spots when this many are pending. Native TCP inserts (clickhouse-driver, port 9000) handle 100k in ~0.2s reliably; the 25k value was a workaround for the HTTP timeout that bit us during the catch-up burst
     'batch_flush_noise': 50000,    # flush accumulated noise when this many are pending
     'batch_flush_seconds': 10,     # flush if this many seconds have passed since last flush
     'extraction_workers': 0,       # parallel extraction workers; 0 = auto. With processes uses all cores up to 64; with threads, min(32, cpu_count).
@@ -809,14 +811,15 @@ def insert_spots(client, spots: List[Dict], database: str, table: str,
         return True
 
     try:
-        # Use column order from first record so clickhouse_connect receives
-        # a list-of-lists with explicit column_names rather than keying by int
+        # clickhouse-driver wants `INSERT INTO ... (cols) VALUES` + list-of-tuples
         column_names = list(good_records[0].keys())
+        cols_sql = ','.join(column_names)
+        sql = f"INSERT INTO {database}.{table} ({cols_sql}) VALUES"
         total = len(good_records)
         for i in range(0, total, max_per_insert):
             batch = good_records[i:i+max_per_insert]
-            data = [[row[col] for col in column_names] for row in batch]
-            client.insert(f'{database}.{table}', data, column_names=column_names)
+            data = [tuple(row[col] for col in column_names) for row in batch]
+            client.execute(sql, data)
             log(f"Inserted batch {i//max_per_insert + 1} ({len(batch)} spots)", "DEBUG")
 
         return True
@@ -957,11 +960,13 @@ def insert_noise(client, noise_records: List[Dict], database: str, table: str,
 
     try:
         column_names = list(noise_records[0].keys())
+        cols_sql = ','.join(column_names)
+        sql = f"INSERT INTO {database}.{table} ({cols_sql}) VALUES"
         total = len(noise_records)
         for i in range(0, total, max_per_insert):
             batch = noise_records[i:i+max_per_insert]
-            data = [[row[col] for col in column_names] for row in batch]
-            client.insert(f'{database}.{table}', data, column_names=column_names)
+            data = [tuple(row[col] for col in column_names) for row in batch]
+            client.execute(sql, data)
             log(f"Inserted noise batch {i//max_per_insert + 1} ({len(batch)} records)", "DEBUG")
 
         return True
@@ -1234,15 +1239,21 @@ def main():
             log("Setup failed - cannot continue", "ERROR")
             sys.exit(1)
 
-    # Connect to ClickHouse
+    # Connect to ClickHouse via the native TCP protocol (port 9000, clickhouse-driver).
+    # HTTP (port 8123, clickhouse-connect) caused intermittent multi-minute hangs on WD20
+    # where CH did the insert but the response never reached the urllib3 client.
+    # Native TCP is also ~25x faster per insert (0.2s vs 6s for 100k rows).
     try:
-        client = clickhouse_connect.get_client(
+        client = clickhouse_driver.Client(
             host=config['clickhouse_host'],
-            port=config['clickhouse_port'],
-            username=config['clickhouse_user'],
-            password=config['clickhouse_password']
+            port=config.get('clickhouse_native_port', 9000),
+            user=config['clickhouse_user'],
+            password=config['clickhouse_password'],
+            database=config['clickhouse_database'],
+            send_receive_timeout=600,
         )
-        log("Connected to ClickHouse", "INFO")
+        client.execute('SELECT 1')  # eager-validate the connection
+        log("Connected to ClickHouse (native TCP)", "INFO")
     except Exception as e:
         log(f"Failed to connect to ClickHouse: {e}", "ERROR")
         sys.exit(1)

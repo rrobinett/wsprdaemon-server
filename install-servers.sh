@@ -183,7 +183,7 @@ if [[ "${1:-}" == "--validate" ]]; then
     # --- Python packages ---
     echo ""
     echo "--- Python packages ---"
-    for pkg in clickhouse_connect requests numpy; do
+    for pkg in clickhouse_connect clickhouse_driver requests numpy; do
         if ver=$("$VENV_DIR/bin/python3" -c "
 import importlib, importlib.metadata
 try:
@@ -483,7 +483,7 @@ fi
 # Install Python dependencies
 echo "Installing Python dependencies..."
 $VENV_DIR/bin/pip install --upgrade pip --quiet
-$VENV_DIR/bin/pip install requests clickhouse-connect numpy --quiet
+$VENV_DIR/bin/pip install requests clickhouse-connect clickhouse-driver numpy --quiet
 echo "  Dependencies installed"
 
 # Install scripts as symlinks so git pull takes effect immediately
