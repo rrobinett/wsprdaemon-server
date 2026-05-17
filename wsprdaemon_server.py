@@ -25,7 +25,7 @@ import clickhouse_connect
 import logging
 
 # Version
-VERSION = "2.25.0"  # wspr.rocks compat: id ALIAS + azimuth/rx_azimuth Int16 (preserves -999 sentinel)
+VERSION = "2.25.0"  # wspr.rocks compat: id ALIAS + azimuth/rx_azimuth Int16 (preserves -999 sentinel); metric widened to Int32 to accommodate client's spreading*1000 overload
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -316,7 +316,7 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
             jitter        Int16                             CODEC(T64, ZSTD(1)),
             rms_noise     Float32                           CODEC(Delta(4), ZSTD(3)),
             blocksize     UInt16                            CODEC(T64, ZSTD(1)),
-            metric        Int16                             CODEC(T64, ZSTD(1)),
+            metric        Int32                             CODEC(T64, ZSTD(1)),
             osd_decode    UInt8                             CODEC(T64, ZSTD(1)),
             nhardmin      UInt16                            CODEC(T64, ZSTD(1)),
             ipass         UInt8                             CODEC(T64, ZSTD(1)),
@@ -538,6 +538,12 @@ def parse_wsprd_output(file_path: Path, client_version: Optional[str]) -> List[D
      31  v_lon                      float
      32  wspr_cycle_kiwi_overloads_count (ov_count) int
      33  proxy_upload_this_spot     int  (0 or 1)
+
+    Note on the `metric` field (parts[13]): the wsprdaemon client deliberately
+    overwrites the wsprd decoder's small-integer metric with `spreading * 1000`
+    (decoding.sh ~line 1497) so wsprnet.org uploads carry spreading data in a
+    field that exists there. Values can exceed Int16 range, which is why the
+    server stores `metric` as Int32.
     """
     spots = []
 
