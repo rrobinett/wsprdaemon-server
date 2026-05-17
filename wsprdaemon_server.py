@@ -43,7 +43,7 @@ DEFAULT_CONFIG = {
     'max_spots_per_insert': 50000,
     'max_noise_per_insert': 50000,
     'loop_interval': 10,
-    'batch_flush_spots': 100000,   # flush accumulated spots when this many are pending
+    'batch_flush_spots': 25000,    # flush accumulated spots when this many are pending; 100k caused HTTP timeouts on WD20 during backlog drain (post-ProcessPool, batches built faster than CH could ingest)
     'batch_flush_noise': 50000,    # flush accumulated noise when this many are pending
     'batch_flush_seconds': 10,     # flush if this many seconds have passed since last flush
     'extraction_workers': 0,       # parallel extraction workers; 0 = auto. With processes uses all cores up to 64; with threads, min(32, cpu_count).
