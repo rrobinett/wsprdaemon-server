@@ -24,7 +24,8 @@ if '--version' in sys.argv:
 import requests
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-import clickhouse_connect
+import clickhouse_connect       # HTTP client — used only for the admin setup queries (query/command)
+import clickhouse_driver        # native TCP client — used for the hot insert path (port 9000)
 import numpy as np
 import logging
 import os
@@ -34,7 +35,7 @@ import glob
 from datetime import timezone
 
 # Version
-VERSION = "2.8.0"  # Fast startup: part-metadata max(id) + bad-dir trim at startup
+VERSION = "2.9.0"  # native TCP inserts via clickhouse-driver (parity with wsprdaemon_server v2.26.0); admin path still HTTP
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -655,14 +656,15 @@ def insert_cached_file(client, cache_file: Path, database: str, table: str,
             cache_file.unlink()
             return True
         
-        # Insert to ClickHouse
+        # Insert to ClickHouse (native TCP — see [[clickhouse-insert-path]])
         column_names = [
             'id', 'time', 'band', 'rx_sign', 'rx_lat', 'rx_lon', 'rx_loc',
             'tx_sign', 'tx_lat', 'tx_lon', 'tx_loc', 'distance', 'azimuth',
             'rx_azimuth', 'frequency', 'power', 'snr', 'drift', 'version', 'code'
         ]
-        
-        client.insert(f"{database}.{table}", rows, column_names=column_names)
+
+        sql = f"INSERT INTO {database}.{table} ({','.join(column_names)}) VALUES"
+        client.execute(sql, [tuple(r) for r in rows])
         
         # Get highest spotnum from inserted rows
         highest_spotnum = max(row[0] for row in rows)
@@ -802,15 +804,18 @@ def insert_thread_worker(config: Dict, cache_dir: str, database: str, table: str
     batch_flush_rows    = config.get('batch_flush_rows', 100000)
     batch_flush_seconds = config.get('batch_flush_seconds', 10)
 
-    # Create separate ClickHouse client for this thread
+    # Create separate ClickHouse client for this thread (native TCP — see [[clickhouse-insert-path]])
     try:
-        client = clickhouse_connect.get_client(
+        client = clickhouse_driver.Client(
             host=config['clickhouse_host'],
-            port=config['clickhouse_port'],
-            username=config['clickhouse_user'],
-            password=config['clickhouse_password']
+            port=config.get('clickhouse_native_port', 9000),
+            user=config['clickhouse_user'],
+            password=config['clickhouse_password'],
+            database=config['clickhouse_database'],
+            send_receive_timeout=600,
         )
-        log("Insert thread: Connected to ClickHouse")
+        client.execute('SELECT 1')  # eager-validate the connection
+        log("Insert thread: Connected to ClickHouse (native TCP)")
     except Exception as e:
         log(f"Insert thread: Failed to connect to ClickHouse: {e}", "ERROR")
         return
@@ -828,7 +833,8 @@ def insert_thread_worker(config: Dict, cache_dir: str, database: str, table: str
             last_flush = time.time()
             return True
         try:
-            client.insert(f"{database}.{table}", pending_rows, column_names=column_names)
+            sql = f"INSERT INTO {database}.{table} ({','.join(column_names)}) VALUES"
+            client.execute(sql, [tuple(r) for r in pending_rows])
             highest = max(r[0] for r in pending_rows)
             log(f"Flushed {len(pending_rows)} rows from {len(pending_files)} cache files "
                 f"(highest id: {highest})")
@@ -1155,15 +1161,18 @@ def main():
         log("Failed to get session", "ERROR")
         sys.exit(1)
     
-    # Connect to ClickHouse
+    # Connect to ClickHouse via native TCP (see [[clickhouse-insert-path]])
     try:
-        client = clickhouse_connect.get_client(
+        client = clickhouse_driver.Client(
             host=config['clickhouse_host'],
-            port=config['clickhouse_port'],
-            username=config['clickhouse_user'],
-            password=config['clickhouse_password']
+            port=config.get('clickhouse_native_port', 9000),
+            user=config['clickhouse_user'],
+            password=config['clickhouse_password'],
+            database=config['clickhouse_database'],
+            send_receive_timeout=600,
         )
-        log("Connected to ClickHouse")
+        client.execute('SELECT 1')  # eager-validate the connection
+        log("Connected to ClickHouse (native TCP)")
     except Exception as e:
         log(f"Failed to connect: {e}", "ERROR")
         sys.exit(1)
