@@ -697,6 +697,32 @@ chmod 644 /etc/systemd/system/wsprdaemon_server@.service
 echo "  Service files created"
 
 # ============================================================================
+# Install ch-backup-all + weekly timer
+# ============================================================================
+# Backups are a systems-admin command, so it lives in /usr/local/sbin (not
+# /usr/local/bin like the user-facing service wrappers).  Symlink target keeps
+# the canonical script in the repo so edits don't need a re-install.
+echo ""
+echo "Installing ch-backup-all and weekly backup timer..."
+chmod +x "$SCRIPT_DIR/ch-backup-all.sh"
+ln -sf "$SCRIPT_DIR/ch-backup-all.sh" /usr/local/sbin/ch-backup-all
+echo "  Symlink: /usr/local/sbin/ch-backup-all -> $SCRIPT_DIR/ch-backup-all.sh"
+
+# The .service references /usr/local/sbin/ch-backup-all (set above) so the
+# unit is host-agnostic — same file works whether the repo lives in /home,
+# /root, /opt, etc.  Copy from repo rather than embedding a heredoc here so
+# the unit file has a single source of truth.
+install -m 644 "$SCRIPT_DIR/ch-backup-weekly.service" /etc/systemd/system/ch-backup-weekly.service
+install -m 644 "$SCRIPT_DIR/ch-backup-weekly.timer"   /etc/systemd/system/ch-backup-weekly.timer
+echo "  Installed: ch-backup-weekly.{service,timer}"
+
+# Enable the timer (don't start the service — that would trigger an
+# immediate backup of every table on install, which can take hours).
+systemctl daemon-reload
+systemctl enable --now ch-backup-weekly.timer
+echo "  Timer enabled: weekly Sunday 03:00 America/Los_Angeles"
+
+# ============================================================================
 # Create/update configuration files
 # ============================================================================
 
