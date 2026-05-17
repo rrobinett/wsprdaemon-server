@@ -672,9 +672,12 @@ ExecStart=/usr/local/bin/wsprdaemon_server.sh /etc/wsprdaemon/%i.conf
 Restart=on-failure
 RestartSec=60
 
-# Memory limits
-MemoryMax=2G
-MemoryHigh=1.5G
+# Memory limits — must accommodate the ProcessPoolExecutor extraction pool.
+# 36 worker subprocesses + main + clickhouse-driver insert buffers easily
+# exceed 3 GB at peak. The old 1.5G/2G limits caused mem_cgroup throttling
+# that pinned inserts at ~0 throughput during catch-up bursts.
+MemoryMax=8G
+MemoryHigh=6G
 
 # Security hardening
 NoNewPrivileges=true
