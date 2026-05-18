@@ -750,21 +750,67 @@ def extract_host_id(extraction_dir: Path) -> str:
     return ''
 
 
+# Magic bytes for the two supported compressors. bzip2 is the historical
+# format; zstd was added in Phase 2 PR 5 after a B4-100 benchmark showed
+# ~47× faster decompression with similar ratios. The producer (hs-uploader
+# WsprdaemonTarSftp) chooses; the server sniffs.
+_BZ2_MAGIC  = b"BZh"           # bzip2 file marker (3 bytes)
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"  # zstandard frame magic (4 bytes)
+
+
+def _sniff_compression(head: bytes) -> str:
+    """Return 'bz2', 'zstd', or 'unknown' from the first few bytes."""
+    if head.startswith(_ZSTD_MAGIC):
+        return "zstd"
+    if head.startswith(_BZ2_MAGIC):
+        return "bz2"
+    return "unknown"
+
+
 def extract_tbz(tbz_source, extraction_dir: Path) -> bool:
-    """Extract a .tbz file (or bytes) to the extraction directory.
-    tbz_source can be a Path or bytes/BytesIO object."""
+    """Extract a tar file (bzip2 or zstd) to the extraction directory.
+
+    `tbz_source` is a Path or bytes/BytesIO. Compression is sniffed
+    from the leading magic bytes so the producer can flip bz2↔zstd
+    without coordinating filename extensions with this server.
+
+    The filename suffix is historically `.tbz` for backward compat;
+    `.tar.zst` and `.tar.bz2` are accepted as additional aliases by
+    the discovery loop (not this function).
+    """
     try:
         if isinstance(tbz_source, (bytes, bytearray)):
-            tbz_source = io.BytesIO(tbz_source)
-        if isinstance(tbz_source, io.BytesIO):
-            with tarfile.open(fileobj=tbz_source, mode='r:bz2') as tar:
+            data = bytes(tbz_source)
+        elif isinstance(tbz_source, io.BytesIO):
+            data = tbz_source.getvalue()
+        else:
+            data = Path(tbz_source).read_bytes()
+    except OSError as e:
+        log(f"Failed to read tar source: {e}", "ERROR")
+        return False
+
+    fmt = _sniff_compression(data[:8])
+    try:
+        if fmt == "zstd":
+            try:
+                import zstandard
+            except ImportError:
+                log("Tar is zstd-compressed but `zstandard` is not installed. "
+                    "Run: pip install zstandard", "ERROR")
+                return False
+            dctx = zstandard.ZstdDecompressor()
+            raw = dctx.decompress(data, max_output_size=2 * 1024 * 1024 * 1024)
+            with tarfile.open(fileobj=io.BytesIO(raw), mode='r:') as tar:
+                tar.extractall(path=extraction_dir)
+        elif fmt == "bz2":
+            with tarfile.open(fileobj=io.BytesIO(data), mode='r:bz2') as tar:
                 tar.extractall(path=extraction_dir)
         else:
-            with tarfile.open(tbz_source, 'r:bz2') as tar:
-                tar.extractall(path=extraction_dir)
+            log(f"Unknown compression in tar source (head={data[:8]!r})", "ERROR")
+            return False
         return True
     except Exception as e:
-        log(f"Failed to extract tbz: {e}", "ERROR")
+        log(f"Failed to extract tar ({fmt}): {e}", "ERROR")
         return False
 
 

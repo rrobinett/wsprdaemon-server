@@ -236,6 +236,55 @@ def test_process_noise_files_accepts_new_wspr_root():
         assert recs[0]['ov'] == 7
 
 
+def test_extract_tbz_handles_bz2():
+    import io as _io, tarfile, tempfile, bz2
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        # Build a tiny bz2 tar in memory.
+        buf = _io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w:bz2') as tf:
+            data = b'hello bz2\n'
+            ti = tarfile.TarInfo(name='hello.txt'); ti.size = len(data)
+            tf.addfile(ti, _io.BytesIO(data))
+        out_dir = td / 'out'
+        out_dir.mkdir()
+        ok = ws.extract_tbz(buf.getvalue(), out_dir)
+        assert ok, "bz2 tar should extract"
+        assert (out_dir / 'hello.txt').read_bytes() == b'hello bz2\n'
+
+
+def test_extract_tbz_handles_zstd():
+    import io as _io, tarfile, tempfile
+    try:
+        import zstandard
+    except ImportError:
+        return  # zstandard not installed locally; skip silently
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        # Build an uncompressed tar in memory, then zstd-frame it.
+        raw_buf = _io.BytesIO()
+        with tarfile.open(fileobj=raw_buf, mode='w:') as tf:
+            data = b'hello zstd\n'
+            ti = tarfile.TarInfo(name='hello.txt'); ti.size = len(data)
+            tf.addfile(ti, _io.BytesIO(data))
+        cctx = zstandard.ZstdCompressor(level=9)
+        zst_bytes = cctx.compress(raw_buf.getvalue())
+        out_dir = td / 'out'
+        out_dir.mkdir()
+        ok = ws.extract_tbz(zst_bytes, out_dir)
+        assert ok, "zstd tar should extract"
+        assert (out_dir / 'hello.txt').read_bytes() == b'hello zstd\n'
+
+
+def test_extract_tbz_rejects_unknown_compression():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        out_dir = Path(td) / 'out'
+        out_dir.mkdir()
+        ok = ws.extract_tbz(b"\xff\xfe junk header", out_dir)
+        assert ok is False
+
+
 if __name__ == '__main__':
     # Lightweight runner so we don't require pytest just to smoke-test.
     import inspect
