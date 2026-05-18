@@ -1442,8 +1442,16 @@ def _provision_sftp_user_on_gw(gw: str, username: str, pubkey: str) -> None:
 
 
 def maybe_provision_sftp(worker_dir) -> None:
-    """Check for client_upload_info.txt and provision SFTP access on all gateways."""
-    info_file = worker_dir / 'wsprdaemon' / 'client_upload_info.txt'
+    """Check for client_upload_info.txt and provision SFTP access on all gateways.
+
+    Phase 2 PR 5 moves the file to the tar ROOT alongside uploads_config.txt
+    (matching how `get_client_version` already reads its config from root).
+    The legacy `wsprdaemon/client_upload_info.txt` path is still accepted
+    so wd-upload-style clients keep working during transition.
+    """
+    info_file = worker_dir / 'client_upload_info.txt'
+    if not info_file.exists():
+        info_file = worker_dir / 'wsprdaemon' / 'client_upload_info.txt'
     if not info_file.exists():
         return
     data = {}
