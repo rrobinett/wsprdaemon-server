@@ -144,3 +144,43 @@ Adding a new modulation = add a string to `config['psk_modes']` (default
 
 Tests: `python3 tests/test_psk_ingest.py` — exercises parsing + scanning
 helpers against synthetic extracted-tar trees. No ClickHouse required.
+
+## PSKReporter forwarder (Phase 2 PR 2)
+
+Two new daemons:
+
+* `pskreporter_forwarder.py` — runs on each wd{10,20,30}. Polls
+  `psk.spots WHERE forward_to_pskreporter=1 AND ingested_at > <watermark>`
+  every 30 s and ships rows via `ftlib-pskreporter`. Only the
+  gw1-elected leader actually forwards; the others idle but keep
+  their watermark fresh so failover is gap-free. systemd unit:
+  `pskreporter-forwarder.service`.
+
+* `pskreporter_forward_elector.py` — runs on gw1. TCP-probes the
+  ClickHouse port on each wd candidate (default order: wd10, wd20,
+  wd30) every 30 s and writes the first-healthy short hostname to
+  `/var/www/html/pskreporter-leader.txt`. nginx serves the file at
+  `http://gw1.wsprdaemon.org/pskreporter-leader.txt` — each forwarder
+  polls that URL. systemd unit: `pskreporter-forward-elector.service`.
+
+Why a static file via nginx: gw1 doesn't need SSH into the wd
+servers (and shouldn't), and the wd servers don't need to coordinate
+with each other. Failure mode: if gw1 is unreachable, each wd's
+forwarder falls back to its last-known leader state — losing
+contact with gw1 doesn't drop PSKReporter delivery.
+
+Operator override: pin a leader with `--pin wd20` on the elector,
+or by hand-editing the published file. Auto mode resumes on
+restart.
+
+Per-spot routing flag (set by psk-recorder Phase 2 PR 3):
+
+| `PSK_DELIVERY_MODE` (client) | `forward_to_pskreporter` (row) | Forwarder action |
+|---|---|---|
+| `server` (default)           | 1     | POST to PSKReporter |
+| `both`                       | 0     | skip (client posts direct) |
+| `direct`                     | n/a   | row never in psk.spots |
+
+Tests: `python3 tests/test_pskreporter_forwarder.py` — fakes for
+clickhouse-driver, ftlib PskReporter, and the leader URL fetch.
+18 pass; no ClickHouse or network required.
