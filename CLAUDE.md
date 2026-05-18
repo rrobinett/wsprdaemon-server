@@ -95,3 +95,92 @@ Each service reads a JSON config file (path passed as a CLI argument or defaulti
 - File operations use hard links where possible to avoid copying large .tbz files.
 - Remote rsync uses `--bwlimit` and checks free space on the destination before transferring.
 - Retry logic throughout uses exponential backoff with jitter.
+
+## psk.spots ingestion (Phase 2 PR 1, default off)
+
+`wsprdaemon_server.py` can also ingest FT8/FT4/MSK144 spots from the same
+.tbz pipeline into the `psk.spots` ClickHouse table. The feature is
+**off by default** during rollout — flip it on per host with either:
+
+```bash
+sudo systemctl edit wsprdaemon_server@wsprdaemon   # add Environment=WSPRDAEMON_INGEST_PSK=1
+# or, ad hoc:
+WSPRDAEMON_INGEST_PSK=1 wsprdaemon_server.py ...
+# or, --ingest-psk on the CLI
+```
+
+Expected tar layout (Phase 2): modes live as **peer subdirs** at the tar
+root, alongside the existing `wsprdaemon/` (or new `wspr/`) wspr tree:
+
+```
+<tar root>/
+├── wspr/spots/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_spots.txt    # WSPR (new root)
+├── wsprdaemon/spots/...                                       # WSPR (legacy root, still accepted)
+├── ft8/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_ft8.jsonl
+├── ft4/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_ft4.jsonl
+└── routing.json                                               # optional per-receiver forwarding flags
+```
+
+Each `*.jsonl` file is one ClickHouse row per line — directly the dict
+that `psk-recorder`'s `ch_tailer` writes to local SQLite. The server
+fills in path-derived fields (`rx_site`, `receiver`, `band`) and the
+`forward_to_pskreporter` flag from `routing.json` before insert.
+
+`routing.json` (optional, at tar root):
+
+```json
+{
+  "default": {"forward_to_pskreporter": true},
+  "AC0G=ND_EN16ov/KA9Q_DXE": {"forward_to_pskreporter": false}
+}
+```
+
+Default when missing: forward everything. The flag governs whether the
+forthcoming gw1-elected `pskreporter_forwarder` service (Phase 2 PR 2)
+re-posts the row to pskreporter.info.
+
+Adding a new modulation = add a string to `config['psk_modes']` (default
+`['ft8', 'ft4', 'msk144']`). Schema is mode-agnostic.
+
+Tests: `python3 tests/test_psk_ingest.py` — exercises parsing + scanning
+helpers against synthetic extracted-tar trees. No ClickHouse required.
+
+## PSKReporter forwarder (Phase 2 PR 2)
+
+Two new daemons:
+
+* `pskreporter_forwarder.py` — runs on each wd{10,20,30}. Polls
+  `psk.spots WHERE forward_to_pskreporter=1 AND ingested_at > <watermark>`
+  every 30 s and ships rows via `ftlib-pskreporter`. Only the
+  gw1-elected leader actually forwards; the others idle but keep
+  their watermark fresh so failover is gap-free. systemd unit:
+  `pskreporter-forwarder.service`.
+
+* `pskreporter_forward_elector.py` — runs on gw1. TCP-probes the
+  ClickHouse port on each wd candidate (default order: wd10, wd20,
+  wd30) every 30 s and writes the first-healthy short hostname to
+  `/var/www/html/pskreporter-leader.txt`. nginx serves the file at
+  `http://gw1.wsprdaemon.org/pskreporter-leader.txt` — each forwarder
+  polls that URL. systemd unit: `pskreporter-forward-elector.service`.
+
+Why a static file via nginx: gw1 doesn't need SSH into the wd
+servers (and shouldn't), and the wd servers don't need to coordinate
+with each other. Failure mode: if gw1 is unreachable, each wd's
+forwarder falls back to its last-known leader state — losing
+contact with gw1 doesn't drop PSKReporter delivery.
+
+Operator override: pin a leader with `--pin wd20` on the elector,
+or by hand-editing the published file. Auto mode resumes on
+restart.
+
+Per-spot routing flag (set by psk-recorder Phase 2 PR 3):
+
+| `PSK_DELIVERY_MODE` (client) | `forward_to_pskreporter` (row) | Forwarder action |
+|---|---|---|
+| `server` (default)           | 1     | POST to PSKReporter |
+| `both`                       | 0     | skip (client posts direct) |
+| `direct`                     | n/a   | row never in psk.spots |
+
+Tests: `python3 tests/test_pskreporter_forwarder.py` — fakes for
+clickhouse-driver, ftlib PskReporter, and the leader URL fetch.
+18 pass; no ClickHouse or network required.

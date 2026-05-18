@@ -20,13 +20,13 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 import clickhouse_connect       # HTTP client — used only for the admin setup queries
 import clickhouse_driver        # native TCP client — used for the hot insert path (port 9000)
 import logging
 
 # Version
-VERSION = "2.26.0"  # native TCP inserts via clickhouse-driver (HTTP via clickhouse-connect was hanging on lost responses during catch-up bursts)
+VERSION = "2.27.0"  # psk.spots ingestion path (FT8/FT4/...); gated by WSPRDAEMON_INGEST_PSK=1
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -38,6 +38,14 @@ DEFAULT_CONFIG = {
     'clickhouse_database': 'wsprdaemon',
     'clickhouse_spots_table': 'spots',
     'clickhouse_noise_table': 'noise',
+    # psk.spots ingestion (FT8/FT4/MSK144/...): off by default during rollout.
+    # Flip via env WSPRDAEMON_INGEST_PSK=1 or --ingest-psk.
+    'ingest_psk': False,
+    'clickhouse_psk_database': 'psk',
+    'clickhouse_psk_spots_table': 'spots',
+    'psk_modes': ['ft8', 'ft4', 'msk144'],   # peer subdirs scanned at tar root
+    'max_psk_per_insert': 50000,
+    'batch_flush_psk': 50000,
     'incoming_tbz_dirs': [],  # Must be specified via --incoming-dirs
     'extraction_dir': '/tmp/wsprdaemon/extraction',
     'processed_tbz_file': '/var/lib/wsprdaemon/wsprdaemon/processed_tbz_list.txt',
@@ -364,6 +372,9 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
         admin_client.command(create_noise_table_sql)
         log(f"Table {config['clickhouse_database']}.{config['clickhouse_noise_table']} ready", "INFO")
 
+        if config.get('ingest_psk'):
+            setup_psk_tables(admin_client, config)
+
         return True
 
     except Exception as e:
@@ -450,21 +461,356 @@ def mark_tbz_processed(tbz_file: Path, processed_file: Path, max_size: int):
         log(f"Error writing processed file: {e}", "ERROR")
 
 
-def extract_tbz(tbz_source, extraction_dir: Path) -> bool:
-    """Extract a .tbz file (or bytes) to the extraction directory.
-    tbz_source can be a Path or bytes/BytesIO object."""
+# ---------------------------------------------------------------------------
+# psk.spots ingestion (Phase 2 PR 1)
+# ---------------------------------------------------------------------------
+
+def setup_psk_tables(admin_client, config: Dict) -> None:
+    """Ensure the `psk` database and `psk.spots` table exist (idempotent).
+
+    Schema mirrors schema/psk.spots.sql in this repo. Kept inline so the
+    server can self-bootstrap on a fresh wd{10,20,30} install without an
+    out-of-band SQL apply step.
+    """
+    psk_db = config['clickhouse_psk_database']
+    psk_table = config['clickhouse_psk_spots_table']
+
+    result = admin_client.query(
+        f"SELECT 1 FROM system.databases WHERE name = '{psk_db}'"
+    )
+    if not result.result_rows:
+        log(f"Creating database {psk_db}...", "INFO")
+        admin_client.command(f"CREATE DATABASE {psk_db}")
+
+    create_psk_table_sql = f"""
+    CREATE TABLE IF NOT EXISTS {psk_db}.{psk_table}
+    (
+        `time`                  DateTime               CODEC(Delta(4), ZSTD(3)),
+        `ingested_at`           DateTime DEFAULT now() CODEC(Delta(4), ZSTD(3)),
+        `mode`                  LowCardinality(String) CODEC(ZSTD(3)),
+        `decoder_kind`          LowCardinality(String) CODEC(ZSTD(3)),
+        `rx_sign`               LowCardinality(String) CODEC(ZSTD(3)),
+        `rx_loc`                LowCardinality(String) CODEC(ZSTD(3)),
+        `rx_site`               LowCardinality(String) CODEC(ZSTD(3)),
+        `receiver`              LowCardinality(String) CODEC(ZSTD(3)),
+        `host_id`               LowCardinality(String) CODEC(ZSTD(3)),
+        `tx_call`               LowCardinality(String) CODEC(ZSTD(3)),
+        `grid`                  LowCardinality(String) CODEC(ZSTD(3)),
+        `report`                Nullable(Int16)        CODEC(ZSTD(3)),
+        `message`               String                 CODEC(ZSTD(3)),
+        `frequency`             UInt64    CODEC(Delta(8), ZSTD(3)),
+        `band`                  Int16     CODEC(T64, ZSTD(3)),
+        `snr_db`                Nullable(Int16)   CODEC(ZSTD(3)),
+        `score`                 Nullable(Int16)   CODEC(ZSTD(3)),
+        `dt`                    Float32   CODEC(Delta(4), ZSTD(3)),
+        `spectral_width_hz`     Nullable(Float32) CODEC(ZSTD(3)),
+        `forward_to_pskreporter` UInt8    DEFAULT 1 CODEC(ZSTD(3)),
+        `processing_version`    LowCardinality(String) CODEC(ZSTD(3)),
+        INDEX rx_sign_idx rx_sign TYPE bloom_filter GRANULARITY 1,
+        INDEX tx_call_idx tx_call TYPE bloom_filter GRANULARITY 1
+    )
+    ENGINE = ReplacingMergeTree
+    PARTITION BY toYYYYMM(time)
+    ORDER BY (mode, rx_sign, receiver, time, frequency)
+    SETTINGS index_granularity = 8192,
+             min_age_to_force_merge_seconds = 120
+    """
+    admin_client.command(create_psk_table_sql)
+    log(f"Table {psk_db}.{psk_table} ready", "INFO")
+
+
+def load_routing(extraction_dir: Path) -> Dict:
+    """Read the per-tar `routing.json` if present.
+
+    Schema (all optional):
+        {
+          "default":  {"forward_to_pskreporter": true},
+          "<RX_SITE>/<RECEIVER>": {"forward_to_pskreporter": false}
+        }
+
+    A missing or unreadable file is treated as "forward everything" — the
+    Phase 2 PR 1 / PR 3 contract: client sets the policy, server respects
+    it; old clients that ship no routing.json keep the safe default.
+    """
+    routing_file = extraction_dir / 'routing.json'
+    fallback = {'default': {'forward_to_pskreporter': True}}
+    if not routing_file.exists():
+        return fallback
     try:
-        if isinstance(tbz_source, (bytes, bytearray)):
-            tbz_source = io.BytesIO(tbz_source)
-        if isinstance(tbz_source, io.BytesIO):
-            with tarfile.open(fileobj=tbz_source, mode='r:bz2') as tar:
-                tar.extractall(path=extraction_dir)
-        else:
-            with tarfile.open(tbz_source, 'r:bz2') as tar:
-                tar.extractall(path=extraction_dir)
+        with open(routing_file) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return fallback
+        return data
+    except Exception as e:
+        log(f"Error reading routing.json: {e}", "WARNING")
+        return fallback
+
+
+def _forward_flag(routing: Dict, receiver_key: str) -> bool:
+    per_recv = routing.get(receiver_key) or {}
+    if 'forward_to_pskreporter' in per_recv:
+        return bool(per_recv['forward_to_pskreporter'])
+    default = routing.get('default') or {}
+    return bool(default.get('forward_to_pskreporter', True))
+
+
+def process_mode_files(extraction_dir: Path, mode: str,
+                       routing: Dict, host_id: str) -> List[Dict]:
+    """Scan `<extraction_dir>/<mode>/RX_SITE/RECEIVER/BAND/*_<mode>.jsonl`
+    and return one row per parsed line.
+
+    File format is JSONL — one psk.spots row per line, as written by
+    hs-uploader's wsprdaemon-tar transport (Phase 2 PR 5). Each row should
+    already carry the fields produced by psk-recorder's ch_tailer; this
+    function only fills in path-derived fields and applies the routing
+    flag.
+
+    The function is mode-agnostic: pass 'ft8', 'ft4', 'msk144', …; new
+    modulations only need to be added to config['psk_modes'].
+    """
+    rows: List[Dict] = []
+
+    mode_root = extraction_dir / mode
+    if not mode_root.exists():
+        return rows
+
+    spot_files = list(mode_root.rglob(f'*_{mode}.jsonl'))
+    if not spot_files:
+        return rows
+
+    log(f"Processing {len(spot_files)} {mode} files", "DEBUG")
+
+    for spot_file in spot_files:
+        rel_parts = spot_file.relative_to(mode_root).parts
+        if len(rel_parts) < 4:
+            log(f"Skipping {mode} file with unexpected path depth: {spot_file}",
+                "WARNING")
+            continue
+
+        rx_site_dir = rel_parts[0]   # e.g. AC0G=ND_EN16ov
+        receiver    = rel_parts[1]   # e.g. KA9Q_DXE
+        band_str    = rel_parts[2]   # e.g. '20'
+
+        rx_sign_dir, rx_grid_dir = decode_rx_site_dir(rx_site_dir)
+        band = band_str_to_meters(band_str) or 0
+
+        receiver_key = f"{rx_site_dir}/{receiver}"
+        forward = _forward_flag(routing, receiver_key)
+
+        try:
+            with open(spot_file, 'r') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError as e:
+                        log(f"Skipping bad JSONL line {line_num} in "
+                            f"{spot_file.name}: {e}", "WARNING")
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+
+                    # Path-derived identity (fallback only; producer-set
+                    # fields are authoritative when present).
+                    row.setdefault('rx_sign', rx_sign_dir)
+                    row.setdefault('rx_loc',  rx_grid_dir)
+                    row['rx_site']  = rx_site_dir
+                    row['receiver'] = receiver
+                    if not row.get('host_id'):
+                        row['host_id'] = host_id or ''
+                    if not row.get('mode'):
+                        row['mode'] = mode
+                    row['band'] = band
+                    row['forward_to_pskreporter'] = bool(forward)
+                    rows.append(row)
+        except Exception as e:
+            log(f"Error reading {spot_file}: {e}", "WARNING")
+
+    log(f"Processed {len(rows)} {mode} rows", "DEBUG")
+    return rows
+
+
+def _parse_psk_time(ts) -> datetime:
+    """Coerce a JSONL `time` value into a naive UTC datetime.
+
+    Accepts (a) an ISO 8601 string with or without trailing Z, (b) a
+    POSIX epoch number, (c) a datetime instance (already parsed). Raises
+    on anything else so the per-record quarantine in `insert_psk_spots`
+    catches it.
+    """
+    if isinstance(ts, datetime):
+        if ts.tzinfo is not None:
+            return ts.astimezone(timezone.utc).replace(tzinfo=None)
+        return ts
+    if isinstance(ts, (int, float)):
+        return datetime.utcfromtimestamp(float(ts))
+    if isinstance(ts, str):
+        cleaned = ts.replace('Z', '+00:00')
+        dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    raise ValueError(f"unparseable psk row time: {ts!r}")
+
+
+def convert_psk_spot_to_clickhouse(row: Dict) -> Dict:
+    """Convert a psk-recorder JSONL row to a clickhouse-driver insert dict."""
+    return {
+        'time':                  _parse_psk_time(row.get('time')),
+        'mode':                  (row.get('mode') or '').lower(),
+        'decoder_kind':          row.get('decoder_kind') or '',
+        'rx_sign':               row.get('rx_sign') or '',
+        'rx_loc':                row.get('rx_loc') or '',
+        'rx_site':               row.get('rx_site') or '',
+        'receiver':              row.get('receiver') or '',
+        'host_id':               row.get('host_id') or '',
+        'tx_call':               row.get('tx_call') or '',
+        'grid':                  row.get('grid') or '',
+        'report':                row.get('report'),
+        'message':               row.get('message') or '',
+        'frequency':             int(row.get('frequency') or 0),
+        'band':                  int(row.get('band') or 0),
+        'snr_db':                row.get('snr_db'),
+        'score':                 row.get('score'),
+        'dt':                    float(row.get('dt') or 0.0),
+        'spectral_width_hz':     row.get('spectral_width_hz'),
+        'forward_to_pskreporter': 1 if row.get('forward_to_pskreporter', True) else 0,
+        'processing_version':    row.get('processing_version') or '',
+    }
+
+
+def insert_psk_spots(client, rows: List[Dict], database: str, table: str,
+                     max_per_insert: int = 50000) -> bool:
+    """Insert psk rows into ClickHouse in batches.
+
+    Mirrors `insert_spots`: per-record convert with quarantine for bad
+    times, batched VALUES insert via clickhouse-driver native TCP.
+    """
+    if not rows:
+        return True
+
+    good_records: List[Dict] = []
+    bad_count = 0
+    for row in rows:
+        try:
+            good_records.append(convert_psk_spot_to_clickhouse(row))
+        except Exception as e:
+            bad_count += 1
+            log(f"REJECT psk row "
+                f"(time={row.get('time','?')} rx={row.get('rx_sign','?')} "
+                f"tx={row.get('tx_call','?')}): {e}", "WARNING")
+
+    if bad_count:
+        log(f"Quarantined {bad_count} bad psk row(s) of {len(rows)}", "ERROR")
+
+    if not good_records:
+        return True
+
+    try:
+        column_names = list(good_records[0].keys())
+        cols_sql = ','.join(column_names)
+        sql = f"INSERT INTO {database}.{table} ({cols_sql}) VALUES"
+        total = len(good_records)
+        for i in range(0, total, max_per_insert):
+            batch = good_records[i:i+max_per_insert]
+            data = [tuple(r[c] for c in column_names) for r in batch]
+            client.execute(sql, data)
+            log(f"Inserted psk batch {i//max_per_insert + 1} "
+                f"({len(batch)} rows)", "DEBUG")
         return True
     except Exception as e:
-        log(f"Failed to extract tbz: {e}", "ERROR")
+        log(f"Error inserting psk rows: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def extract_host_id(extraction_dir: Path) -> str:
+    """Best-effort host_id from `uploads_config.txt`, or empty string.
+
+    Used to fill row['host_id'] when the producer didn't set one. The
+    field exists for multi-host fan-out — a single SDR site running
+    multiple radiods on the same box still needs to be distinguishable
+    from a sibling site under the same reporter callsign.
+    """
+    config_file = extraction_dir / 'uploads_config.txt'
+    if not config_file.exists():
+        return ''
+    try:
+        with open(config_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('HOST_ID='):
+                    return line.split('=', 1)[1].strip('"\'')
+    except Exception:
+        pass
+    return ''
+
+
+# Magic bytes for the two supported compressors. bzip2 is the historical
+# format; zstd was added in Phase 2 PR 5 after a B4-100 benchmark showed
+# ~47× faster decompression with similar ratios. The producer (hs-uploader
+# WsprdaemonTarSftp) chooses; the server sniffs.
+_BZ2_MAGIC  = b"BZh"           # bzip2 file marker (3 bytes)
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"  # zstandard frame magic (4 bytes)
+
+
+def _sniff_compression(head: bytes) -> str:
+    """Return 'bz2', 'zstd', or 'unknown' from the first few bytes."""
+    if head.startswith(_ZSTD_MAGIC):
+        return "zstd"
+    if head.startswith(_BZ2_MAGIC):
+        return "bz2"
+    return "unknown"
+
+
+def extract_tbz(tbz_source, extraction_dir: Path) -> bool:
+    """Extract a tar file (bzip2 or zstd) to the extraction directory.
+
+    `tbz_source` is a Path or bytes/BytesIO. Compression is sniffed
+    from the leading magic bytes so the producer can flip bz2↔zstd
+    without coordinating filename extensions with this server.
+
+    The filename suffix is historically `.tbz` for backward compat;
+    `.tar.zst` and `.tar.bz2` are accepted as additional aliases by
+    the discovery loop (not this function).
+    """
+    try:
+        if isinstance(tbz_source, (bytes, bytearray)):
+            data = bytes(tbz_source)
+        elif isinstance(tbz_source, io.BytesIO):
+            data = tbz_source.getvalue()
+        else:
+            data = Path(tbz_source).read_bytes()
+    except OSError as e:
+        log(f"Failed to read tar source: {e}", "ERROR")
+        return False
+
+    fmt = _sniff_compression(data[:8])
+    try:
+        if fmt == "zstd":
+            try:
+                import zstandard
+            except ImportError:
+                log("Tar is zstd-compressed but `zstandard` is not installed. "
+                    "Run: pip install zstandard", "ERROR")
+                return False
+            dctx = zstandard.ZstdDecompressor()
+            raw = dctx.decompress(data, max_output_size=2 * 1024 * 1024 * 1024)
+            with tarfile.open(fileobj=io.BytesIO(raw), mode='r:') as tar:
+                tar.extractall(path=extraction_dir)
+        elif fmt == "bz2":
+            with tarfile.open(fileobj=io.BytesIO(data), mode='r:bz2') as tar:
+                tar.extractall(path=extraction_dir)
+        else:
+            log(f"Unknown compression in tar source (head={data[:8]!r})", "ERROR")
+            return False
+        return True
+    except Exception as e:
+        log(f"Failed to extract tar ({fmt}): {e}", "ERROR")
         return False
 
 
@@ -660,8 +1006,9 @@ def decode_rx_site_dir(rx_site_dir: str) -> Tuple[str, str]:
 def process_spot_files(extraction_dir: Path, client_version: Optional[str]) -> List[Dict]:
     """Process all spot files inside an extracted tbz and return spot records.
 
-    Expected directory structure inside the tbz:
-        wsprdaemon/spots/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_spots.txt
+    Expected directory structure inside the tbz (either layout accepted):
+        wspr/spots/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_spots.txt        (Phase 2+)
+        wsprdaemon/spots/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_spots.txt  (legacy)
 
     rx_sign and rx_loc come directly from the parsed spot line (fields 22 and 21).
     The directory-decoded values are used only as a fallback when those fields
@@ -669,7 +1016,12 @@ def process_spot_files(extraction_dir: Path, client_version: Optional[str]) -> L
     """
     all_spots = []
 
-    spots_root = extraction_dir / 'wsprdaemon' / 'spots'
+    # New layout (Phase 2): peer mode-named roots — `wspr/spots/...`.
+    # Legacy layout (pre-2026-05): single service-named root `wsprdaemon/spots/...`.
+    # Server accepts both during transition; tar producer flips when ready.
+    spots_root = extraction_dir / 'wspr' / 'spots'
+    if not spots_root.exists():
+        spots_root = extraction_dir / 'wsprdaemon' / 'spots'
     if not spots_root.exists():
         log("No spots directory found in tbz", "DEBUG")
         return []
@@ -865,7 +1217,10 @@ def process_noise_files(extraction_dir: Path, running_jobs: Optional[str],
     """
     noise_records = []
 
-    noise_root = extraction_dir / 'wsprdaemon' / 'noise'
+    # Accept new `wspr/noise/...` (Phase 2) or legacy `wsprdaemon/noise/...`.
+    noise_root = extraction_dir / 'wspr' / 'noise'
+    if not noise_root.exists():
+        noise_root = extraction_dir / 'wsprdaemon' / 'noise'
     if not noise_root.exists():
         log("No noise directory found in tbz", "DEBUG")
         return []
@@ -1087,8 +1442,16 @@ def _provision_sftp_user_on_gw(gw: str, username: str, pubkey: str) -> None:
 
 
 def maybe_provision_sftp(worker_dir) -> None:
-    """Check for client_upload_info.txt and provision SFTP access on all gateways."""
-    info_file = worker_dir / 'wsprdaemon' / 'client_upload_info.txt'
+    """Check for client_upload_info.txt and provision SFTP access on all gateways.
+
+    Phase 2 PR 5 moves the file to the tar ROOT alongside uploads_config.txt
+    (matching how `get_client_version` already reads its config from root).
+    The legacy `wsprdaemon/client_upload_info.txt` path is still accepted
+    so wd-upload-style clients keep working during transition.
+    """
+    info_file = worker_dir / 'client_upload_info.txt'
+    if not info_file.exists():
+        info_file = worker_dir / 'wsprdaemon' / 'client_upload_info.txt'
     if not info_file.exists():
         return
     data = {}
@@ -1109,12 +1472,18 @@ def maybe_provision_sftp(worker_dir) -> None:
         except Exception as exc:
             log(f"Error provisioning {username} on {gw}: {exc}", "WARNING")
 
-def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path) -> Optional[Tuple]:
+def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path,
+                          psk_modes: Optional[List[str]] = None) -> Optional[Tuple]:
     """Read tbz file into RAM then extract and parse in a private temp directory.
 
     Reading the file content in one shot minimises disk seeks — one sequential
     read per file instead of multiple random seeks during tarfile streaming.
-    Returns (tbz_file, spots, noise_records) on success, or None on failure.
+    Returns (tbz_file, spots, noise_records, psk_rows) on success, None on failure.
+
+    `psk_modes` is the list of peer-named modulation subdirs to scan at the
+    tar root (`ft8`, `ft4`, `msk144`, …). Empty/None disables psk ingestion
+    for this tbz; non-empty enables it and `routing.json` is consulted for
+    per-receiver forwarding flags.
     """
     worker_dir = base_extraction_dir / f"worker_{threading.get_ident()}_{tbz_file.stem}"
     try:
@@ -1144,7 +1513,14 @@ def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path) -> Optional
         spots = process_spot_files(worker_dir, client_version)
         noise_records = process_noise_files(worker_dir, running_jobs, receiver_descriptions)
 
-        return (tbz_file, spots, noise_records)
+        psk_rows: List[Dict] = []
+        if psk_modes:
+            routing = load_routing(worker_dir)
+            host_id = extract_host_id(worker_dir)
+            for mode in psk_modes:
+                psk_rows.extend(process_mode_files(worker_dir, mode, routing, host_id))
+
+        return (tbz_file, spots, noise_records, psk_rows)
 
     except Exception as e:
         log(f"Error processing {tbz_file.name}: {e}", "ERROR")
@@ -1176,6 +1552,9 @@ def main():
                        help='Override default spots table name')
     parser.add_argument('--noise-table', default=None,
                        help='Override default noise table name')
+    parser.add_argument('--ingest-psk', action='store_true',
+                       help='Enable FT8/FT4/MSK144 ingest into psk.spots '
+                            '(also honors WSPRDAEMON_INGEST_PSK=1 env var)')
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
     
     args = parser.parse_args()
@@ -1218,6 +1597,17 @@ def main():
     config['dry_run'] = args.dry_run
     if args.dry_run:
         log("DRY RUN mode - no database inserts will be performed", "INFO")
+
+    # psk.spots ingestion — explicit opt-in via CLI flag or env var. Off by
+    # default during Phase 2 rollout so a stock wsprdaemon-server install
+    # ignores any ft8/ft4 subdirs that may show up in tar files.
+    if args.ingest_psk or os.environ.get('WSPRDAEMON_INGEST_PSK', '0') == '1':
+        config['ingest_psk'] = True
+        log(f"PSK ingestion ENABLED: modes={config['psk_modes']} "
+            f"-> {config['clickhouse_psk_database']}.{config['clickhouse_psk_spots_table']}",
+            "INFO")
+    else:
+        log("PSK ingestion disabled (use --ingest-psk or WSPRDAEMON_INGEST_PSK=1)", "DEBUG")
 
     # Parse incoming directories from command line
     config['incoming_tbz_dirs'] = [d.strip() for d in args.incoming_dirs.split(',') if d.strip()]
@@ -1335,20 +1725,22 @@ def main():
         def flush_thread_worker():
             pending_spots = []
             pending_noise = []
+            pending_psk   = []
             pending_tbz   = []
             last_flush    = time.time()
 
             def do_flush():
-                nonlocal pending_spots, pending_noise, pending_tbz, last_flush
-                if not pending_spots and not pending_noise:
+                nonlocal pending_spots, pending_noise, pending_psk, pending_tbz, last_flush
+                if not pending_spots and not pending_noise and not pending_psk:
                     pending_tbz = []
                     last_flush = time.time()
                     return
 
                 if config.get('dry_run'):
                     log(f"DRY RUN: would flush {len(pending_spots)} spots, "
-                        f"{len(pending_noise)} noise from {len(pending_tbz)} tbz files", "INFO")
-                    pending_spots, pending_noise, pending_tbz = [], [], []
+                        f"{len(pending_noise)} noise, {len(pending_psk)} psk "
+                        f"from {len(pending_tbz)} tbz files", "INFO")
+                    pending_spots, pending_noise, pending_psk, pending_tbz = [], [], [], []
                     last_flush = time.time()
                     return
 
@@ -1393,6 +1785,31 @@ def main():
                         flush_errors.append("noise")
                         success = False
 
+                # psk.spots flush — independent of wspr success so a transient
+                # wsprdaemon-side error doesn't strand psk rows in memory.
+                # psk failure does NOT block tbz deletion: the producer's
+                # retention janitor (Phase 2 PR 4) keeps a local copy long
+                # enough that re-shipping would be cheap, and one lost psk
+                # batch shouldn't pin tbz files on the gateway forever.
+                if pending_psk and success:
+                    max_retries, retry_delay, ok = 3, 2, False
+                    for attempt in range(max_retries):
+                        if insert_psk_spots(client, pending_psk,
+                                            config['clickhouse_psk_database'],
+                                            config['clickhouse_psk_spots_table'],
+                                            config['max_psk_per_insert']):
+                            log(f"Flushed {len(pending_psk)} psk rows", "INFO")
+                            ok = True
+                            break
+                        if attempt < max_retries - 1:
+                            log(f"PSK flush failed, retrying in {retry_delay}s", "WARNING")
+                            time.sleep(retry_delay)
+                            retry_delay *= 2
+                    if not ok:
+                        log(f"PSK flush failed after {max_retries} attempts", "ERROR")
+                        flush_errors.append("psk")
+                        # don't block tbz cleanup
+
                 if success:
                     for tbz_file in pending_tbz:
                         mark_tbz_processed(tbz_file, processed_file,
@@ -1401,7 +1818,7 @@ def main():
                             tbz_file.unlink()
                         except Exception as e:
                             log(f"Failed to delete {tbz_file.name}: {e}", "WARNING")
-                    pending_spots, pending_noise, pending_tbz = [], [], []
+                    pending_spots, pending_noise, pending_psk, pending_tbz = [], [], [], []
 
                 last_flush = time.time()
 
@@ -1409,30 +1826,41 @@ def main():
                 try:
                     item = results_queue.get(timeout=config['batch_flush_seconds'])
                 except queue.Empty:
-                    if pending_spots or pending_noise:
+                    if pending_spots or pending_noise or pending_psk:
                         log(f"Timeout flush: {len(pending_spots)} spots, "
-                            f"{len(pending_noise)} noise, {len(pending_tbz)} files", "INFO")
+                            f"{len(pending_noise)} noise, {len(pending_psk)} psk, "
+                            f"{len(pending_tbz)} files", "INFO")
                         do_flush()
                     continue
 
                 if item is SENTINEL:
-                    if pending_spots or pending_noise:
+                    if pending_spots or pending_noise or pending_psk:
                         log(f"Final flush: {len(pending_spots)} spots, "
-                            f"{len(pending_noise)} noise, {len(pending_tbz)} files", "INFO")
+                            f"{len(pending_noise)} noise, {len(pending_psk)} psk, "
+                            f"{len(pending_tbz)} files", "INFO")
                         do_flush()
                     break
 
-                tbz_file, spots, noise_records = item
+                # Workers return a 4-tuple (tbz, spots, noise, psk). Tolerate
+                # a 3-tuple for in-flight upgrade from older worker pools.
+                if len(item) == 4:
+                    tbz_file, spots, noise_records, psk_rows = item
+                else:
+                    tbz_file, spots, noise_records = item
+                    psk_rows = []
                 pending_spots.extend(spots)
                 pending_noise.extend(noise_records)
+                pending_psk.extend(psk_rows)
                 pending_tbz.append(tbz_file)
 
                 elapsed = time.time() - last_flush
                 if (len(pending_spots) >= config['batch_flush_spots'] or
                         len(pending_noise) >= config['batch_flush_noise'] or
+                        len(pending_psk) >= config['batch_flush_psk'] or
                         elapsed >= config['batch_flush_seconds']):
                     log(f"Flush trigger: {len(pending_spots)} spots, "
-                        f"{len(pending_noise)} noise, {elapsed:.1f}s elapsed", "INFO")
+                        f"{len(pending_noise)} noise, {len(pending_psk)} psk, "
+                        f"{elapsed:.1f}s elapsed", "INFO")
                     do_flush()
 
         flusher = threading.Thread(target=flush_thread_worker, daemon=True)
@@ -1443,8 +1871,10 @@ def main():
         # flusher can consume.  We can't reference results_queue from a subprocess —
         # queue.Queue is not picklable.
         Pool = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+        psk_modes_arg = config['psk_modes'] if config.get('ingest_psk') else None
         with Pool(max_workers=n_workers) as executor:
-            futures = {executor.submit(extract_and_parse_tbz, f, extraction_dir): f
+            futures = {executor.submit(extract_and_parse_tbz, f, extraction_dir,
+                                       psk_modes_arg): f
                        for f in unprocessed}
             for future in as_completed(futures):
                 try:

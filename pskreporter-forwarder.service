@@ -1,0 +1,38 @@
+# /etc/systemd/system/pskreporter-forwarder.service
+#
+# Per-wd PSKReporter forwarder (Phase 2 PR 2).  Runs on wd10, wd20,
+# wd30; only the gw1-elected leader actually POSTs to PSKReporter,
+# the others idle.  See pskreporter_forwarder.py docstring.
+#
+# Operator setup:
+#   1. pip install ftlib-pskreporter (or symlink to /opt/git/sigmond/ftlib-pskreporter)
+#   2. mkdir -p /var/lib/wsprdaemon/pskreporter_forwarder
+#   3. /etc/default/pskreporter-forwarder:
+#        THIS_HOST=wd10
+#        CLICKHOUSE_USER=wspr
+#        CLICKHOUSE_PASSWORD=...
+#   4. systemctl enable --now pskreporter-forwarder
+[Unit]
+Description=PSKReporter forwarder (wsprdaemon-server)
+Documentation=https://github.com/rrobinett/wsprdaemon-server
+After=network-online.target clickhouse-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=wsprdaemon
+EnvironmentFile=-/etc/default/pskreporter-forwarder
+ExecStart=/opt/wsprdaemon-server/venv/bin/python \
+    /opt/wsprdaemon-server/pskreporter_forwarder.py \
+    --this-host ${THIS_HOST} \
+    --clickhouse-user ${CLICKHOUSE_USER} \
+    --clickhouse-password ${CLICKHOUSE_PASSWORD}
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pskreporter-forwarder
+
+[Install]
+WantedBy=multi-user.target
