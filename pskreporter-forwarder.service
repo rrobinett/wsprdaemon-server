@@ -5,13 +5,24 @@
 # the others idle.  See pskreporter_forwarder.py docstring.
 #
 # Operator setup:
-#   1. pip install ftlib-pskreporter (or symlink to /opt/git/sigmond/ftlib-pskreporter)
+#   1. /opt/wsprdaemon-server/venv/bin/pip install \
+#          'git+https://github.com/pjsg/ftlib-pskreporter.git'
 #   2. mkdir -p /var/lib/wsprdaemon/pskreporter_forwarder
-#   3. /etc/default/pskreporter-forwarder:
-#        THIS_HOST=wd10
-#        CLICKHOUSE_USER=wspr
+#      chown wsprdaemon:wsprdaemon /var/lib/wsprdaemon/pskreporter_forwarder
+#   3. ln -s ~wsprdaemon/wsprdaemon-server/pskreporter_forwarder.py \
+#          /usr/local/bin/pskreporter_forwarder.py
+#      (mirrors the wsprdaemon_server.py symlink pattern; the canonical
+#       source lives in the wsprdaemon user's home dir, /usr/local/bin
+#       is the stable runtime path.)
+#   4. /etc/default/pskreporter-forwarder:
+#        THIS_HOST=wd30
+#        CLICKHOUSE_USER=chadmin
 #        CLICKHOUSE_PASSWORD=...
-#   4. systemctl enable --now pskreporter-forwarder
+#        # Optional during single-server staging — pin leadership to
+#        # this host so the forwarder skips the gw1 elector URL fetch
+#        # entirely.  Drop once nginx-on-gw1 is in place.
+#        PSKREPORTER_FORWARDER_PIN_LEADER=wd30
+#   5. systemctl enable --now pskreporter-forwarder
 [Unit]
 Description=PSKReporter forwarder (wsprdaemon-server)
 Documentation=https://github.com/rrobinett/wsprdaemon-server
@@ -24,7 +35,7 @@ User=wsprdaemon
 Group=wsprdaemon
 EnvironmentFile=-/etc/default/pskreporter-forwarder
 ExecStart=/opt/wsprdaemon-server/venv/bin/python \
-    /opt/wsprdaemon-server/pskreporter_forwarder.py \
+    /usr/local/bin/pskreporter_forwarder.py \
     --this-host ${THIS_HOST} \
     --clickhouse-user ${CLICKHOUSE_USER} \
     --clickhouse-password ${CLICKHOUSE_PASSWORD}
