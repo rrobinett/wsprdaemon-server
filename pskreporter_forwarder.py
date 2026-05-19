@@ -125,14 +125,24 @@ def fetch_leader(url: str, *, timeout: float = DEFAULT_HTTP_TIMEOUT) -> str:
     return body.strip()
 
 
-def is_self_leader(state: LeaderState, *, this_host: str) -> bool:
+def is_self_leader(state: LeaderState, *, this_host: str,
+                   pin: Optional[str] = None) -> bool:
     """Are we currently the elected leader?
 
-    On the conservative side: if we have NO valid leader info (cold
-    start failed, gw1 unreachable, etc.), default to NOT-leader.  Loss
-    of contact with gw1 is exactly when we DON'T want N servers each
+    If ``pin`` is set (via PSKREPORTER_FORWARDER_PIN_LEADER env or
+    --pin-leader flag), use it as a static override — useful for
+    single-server staging deployments where we haven't yet stood up
+    the gw1 elector + HTTP serving infrastructure.  Caller is
+    responsible for ensuring at most one wd has its pin set.
+
+    Otherwise fall back to the gw1-elected URL state.  On the
+    conservative side: if we have NO valid leader info (cold start
+    failed, gw1 unreachable, etc.), default to NOT-leader.  Loss of
+    contact with gw1 is exactly when we DON'T want N servers each
     deciding they're in charge.
     """
+    if pin is not None:
+        return pin.strip().lower() == this_host.lower()
     if state.elected is None:
         return False
     return state.elected.lower() == this_host.lower()
@@ -259,7 +269,12 @@ def _pskreporter_for_station(
             grid=rx_loc,
             antenna="wsprdaemon-forwarded",
             dummy=dummy,
-            tcp=False,    # UDP is PSKReporter's primary path
+            # TCP path: ftlib's tcp_upload() opens a session per upload
+            # and reports server-side errors back (UDP is silent on
+            # rejection).  Matches what the producer's hs-uploader
+            # PskReporterTcp transport uses, so server-side dedup on
+            # PSKReporter's end has identical session-id behavior.
+            tcp=True,
         )
         cache[key] = inst
     return inst
@@ -319,6 +334,11 @@ class ForwarderConfig:
     poll_sec: int = DEFAULT_POLL_SEC
     leader_poll_sec: int = DEFAULT_LEADER_POLL_SEC
     dummy: bool = False
+    # Optional static leader override — when set, skips the gw1 URL
+    # fetch entirely and treats this_host as the leader iff it matches
+    # this value.  Used during the wd30-only staging rollout before
+    # the gw1 elector is stood up.
+    pin_leader: Optional[str] = None
     psk_cache: Dict[Tuple[str, str], object] = field(default_factory=dict)
 
 
@@ -340,9 +360,19 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
         logger.info("cold start: watermark seeded to %s", watermark.isoformat())
 
     leader = LeaderState()
+    if cfg.pin_leader is not None:
+        logger.info(
+            "leader: static pin to %r — gw1 elector URL fetch skipped",
+            cfg.pin_leader,
+        )
     while not _STOP:
         now = time.monotonic()
-        if now - leader.last_fetch >= cfg.leader_poll_sec or leader.elected is None:
+        # In pin mode, skip the URL fetch entirely; is_self_leader honors
+        # cfg.pin_leader as the source of truth.
+        if cfg.pin_leader is None and (
+            now - leader.last_fetch >= cfg.leader_poll_sec
+            or leader.elected is None
+        ):
             try:
                 elected = fetch_leader(cfg.leader_url)
                 if elected != (leader.elected or ""):
@@ -355,7 +385,8 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
                                exc, leader.elected)
             leader.last_fetch = now
 
-        if not is_self_leader(leader, this_host=cfg.this_host):
+        if not is_self_leader(leader, this_host=cfg.this_host,
+                              pin=cfg.pin_leader):
             # Idle.  Keep watermark fresh-ish so failover finds a small
             # lookback window, not a year-old replay.  Bump only when
             # the source has clearly moved past us.
@@ -431,6 +462,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--dummy", action="store_true",
                    help="don't actually POST to PSKReporter (test mode); the "
                         "ftlib PskReporter prints spots to stdout instead")
+    p.add_argument("--pin-leader", default=os.environ.get(
+                       "PSKREPORTER_FORWARDER_PIN_LEADER"),
+                   help="static leader override (short hostname): skip "
+                        "the gw1 URL fetch entirely; treat THIS_HOST as "
+                        "leader iff it matches this value. Used during "
+                        "single-server staging rollouts before the gw1 "
+                        "elector is in place. Also reads "
+                        "PSKREPORTER_FORWARDER_PIN_LEADER env var.")
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     p.add_argument("-v", "--verbose", action="count", default=0)
     args = p.parse_args(argv)
@@ -455,6 +494,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         poll_sec=args.poll_sec,
         leader_poll_sec=args.leader_poll_sec,
         dummy=args.dummy,
+        pin_leader=args.pin_leader,
     )
     return run_loop(cfg)
 

@@ -247,6 +247,20 @@ class TestLeaderState(unittest.TestCase):
         s = pf.LeaderState(elected=None)
         self.assertFalse(pf.is_self_leader(s, this_host="wd10"))
 
+    def test_pin_overrides_elected(self):
+        """pin=wd30 + elected=wd10 → wd30 is leader; this_host=wd10 returns False."""
+        s = pf.LeaderState(elected="wd10")
+        self.assertFalse(pf.is_self_leader(s, this_host="wd10", pin="wd30"))
+        self.assertTrue(pf.is_self_leader(s, this_host="wd30", pin="wd30"))
+
+    def test_pin_works_with_no_elected_url_state(self):
+        """In pin mode the elector URL doesn't even need to be reachable —
+        an empty LeaderState should still resolve to leader=this_host iff
+        pin matches."""
+        s = pf.LeaderState(elected=None)
+        self.assertTrue(pf.is_self_leader(s, this_host="wd30", pin="wd30"))
+        self.assertFalse(pf.is_self_leader(s, this_host="wd10", pin="wd30"))
+
 
 # ── elector ─────────────────────────────────────────────────────────────────
 
