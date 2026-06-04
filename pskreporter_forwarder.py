@@ -260,12 +260,19 @@ def _pskreporter_for_station(
     receiver's identity (callsign + grid).  Antenna tag identifies
     the forwarder path explicitly so the audit trail is unambiguous.
     """
-    key = (rx_sign, rx_loc)
+    # Merge co-located receivers (AC0G/B1,B2,B4 share one grid) into a
+    # SINGLE pskreporter identity so ftlib's spotEquals dedups across
+    # them: pskreporter gets one "<base-call> @ <grid>" report per
+    # sender instead of one per receiver (operator choice 2026-06-04,
+    # option b).  psk.spots on this host is AC0G-only, so stripping the
+    # /Bx suffix is safe.
+    merged_call = rx_sign.split("/", 1)[0]
+    key = (merged_call, rx_loc)
     inst = cache.get(key)
     if inst is None:
         from pskreporter import PskReporter   # ftlib-pskreporter
         inst = PskReporter(
-            callsign=rx_sign,
+            callsign=merged_call,
             grid=rx_loc,
             antenna="wsprdaemon-forwarded",
             dummy=dummy,
