@@ -266,7 +266,14 @@ def _pskreporter_for_station(
     # sender instead of one per receiver (operator choice 2026-06-04,
     # option b).  psk.spots on this host is AC0G-only, so stripping the
     # /Bx suffix is safe.
-    merged_call = rx_sign.split("/", 1)[0]
+    # PSKREPORTER_FORWARDER_MERGE_BASE=0 disables the merge: each
+    # rx_sign (e.g. AC0G/B4) reports under its own suffixed callsign,
+    # giving per-receiver identity on pskreporter maps (operator
+    # choice 2026-07-02 — one site-wide reporter_id, visible as-is).
+    _merge = os.environ.get(
+        "PSKREPORTER_FORWARDER_MERGE_BASE", "1"
+    ).strip().lower() not in ("0", "false", "no")
+    merged_call = rx_sign.split("/", 1)[0] if _merge else rx_sign
     key = (merged_call, rx_loc)
     inst = cache.get(key)
     if inst is None:
