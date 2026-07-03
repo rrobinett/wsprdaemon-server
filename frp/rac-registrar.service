@@ -1,0 +1,14 @@
+[Unit]
+Description=RAC self-service registrar (station accounts + ports for frps-secure)
+Documentation=file:/home/wsprdaemon/wsprdaemon-server/frp/rac-registrar.py
+After=network.target
+
+[Service]
+# root: creates the per-station accounts and their authorized_keys
+User=root
+ExecStart=/usr/bin/python3 /home/wsprdaemon/wsprdaemon-server/frp/rac-registrar.py --port 35737
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
