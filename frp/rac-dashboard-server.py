@@ -95,21 +95,27 @@ def init_db():
         last_seen INTEGER NOT NULL,
         disconnected_at INTEGER)''')
     con.execute('CREATE INDEX IF NOT EXISTS idx_sess_name ON sessions(name)')
+    try:  # added later: remember each station's RAC number so OFFLINE
+        con.execute('ALTER TABLE sessions ADD COLUMN rac INTEGER')
+    except sqlite3.OperationalError:
+        pass  # column already exists
     con.commit()
     con.close()
 
 
 def record(online, now):
+    """online: {client_name: rac_or_None}"""
     con = db()
     c = con.cursor()
-    for name in online:
+    for name, rac in online.items():
         row = c.execute('SELECT id FROM sessions WHERE name=? AND disconnected_at IS NULL',
                         (name,)).fetchone()
         if row:
-            c.execute('UPDATE sessions SET last_seen=? WHERE id=?', (now, row[0]))
+            c.execute('UPDATE sessions SET last_seen=?, rac=COALESCE(?,rac) WHERE id=?',
+                      (now, rac, row[0]))
         else:
-            c.execute('INSERT INTO sessions(name,connected_at,last_seen) VALUES(?,?,?)',
-                      (name, now, now))
+            c.execute('INSERT INTO sessions(name,connected_at,last_seen,rac) VALUES(?,?,?,?)',
+                      (name, now, now, rac))
     for sid, name, last_seen in c.execute(
             'SELECT id,name,last_seen FROM sessions WHERE disconnected_at IS NULL').fetchall():
         if name not in online:
@@ -126,11 +132,12 @@ def status_map():
         MAX(disconnected_at IS NULL) AS active,
         MAX(last_seen) AS last_seen,
         MIN(connected_at) AS first_seen,
-        COUNT(*) AS sessions
+        COUNT(*) AS sessions,
+        MAX(rac) AS rac
         FROM sessions GROUP BY name''').fetchall()
     con.close()
     return {r[0]: {'active': bool(r[1]), 'last_seen': r[2],
-                   'first_seen': r[3], 'sessions': r[4]} for r in rows}
+                   'first_seen': r[3], 'sessions': r[4], 'rac': r[5]} for r in rows}
 
 
 def history(name):
@@ -178,10 +185,22 @@ def parse(name):
     return name, 'ssh', 'ssh', 'mesh-only', 'SSH'
 
 
+def rac_of(svcs):
+    """Derive the RAC number from any of a client's ports — every band
+    (35800 ssh/vm-ssh, 45800 web/vm-web, 50800 host-ssh, 55800 host-ui)
+    is base + rac."""
+    for s in svcs.values():
+        p = s.get('port')
+        if isinstance(p, int):
+            for base in (35800, 45800, 50800, 55800):
+                if base <= p <= base + 999:
+                    return p - base
+    return None
+
+
 def live_services():
-    """{client: {label: svc}} for currently-online proxies, + set of online clients."""
+    """{client: {label: svc}} for currently-online proxies, + {client: rac}."""
     clients = {}
-    online = set()
     for p in fetch_proxies():
         name = strip_hash(p.get('name', ''))
         if not name or p.get('status') != 'online':
@@ -189,12 +208,12 @@ def live_services():
         client, kind, proto, tier, label = parse(name)
         if p.get('_src') == 'legacy':
             client += ' [legacy]'
-        online.add(client)
         conf = p.get('conf') or {}
         clients.setdefault(client, {})[label] = {
             'kind': kind, 'proto': proto, 'tier': tier, 'label': label,
             'port': conf.get('remotePort'),
             'user': (conf.get('metadatas') or {}).get('user')}
+    online = {c: rac_of(svcs) for c, svcs in clients.items()}
     return clients, online
 
 
@@ -262,18 +281,24 @@ def render_main(gw_ip, tier):
     nact = sum(1 for n in names if stat.get(n, {}).get('active') or n in vis)
     b.append(f'<div class="sub">via gw2 <code>{gw_ip}</code> &middot; {tl} &middot; '
              f'{nact} active / {len(names)} known &middot; auto-refresh 30s</div>')
-    b.append('<table><tr><th>Name</th><th>Status</th>')
+    b.append('<table><tr><th>Name</th><th>RAC</th><th>Status</th>')
     for h, _ls, _k in present:
         b.append(f'<th class="svc">{h}</th>')
     b.append('</tr>')
     for name in names:
         active = stat.get(name, {}).get('active') or name in vis
         ls = stat.get(name, {}).get('last_seen')
+        # live ports first; for offline stations fall back to the number
+        # remembered in the history DB
+        rac = rac_of(vis.get(name, {})) if name in vis else None
+        if rac is None:
+            rac = stat.get(name, {}).get('rac')
         rowcls = '' if active else ' class="off-row"'
         st = '<span class="on">&#9679; active</span>' if active else (
             f'<span class="ago">last seen {ago(ls, now)}</span>' if ls else '&mdash;')
         b.append(f'<tr{rowcls}><td class="name">'
                  f'<a href="?h={html.escape(name)}">{html.escape(name)}</a></td>'
+                 f'<td class="name">{rac if rac is not None else "&mdash;"}</td>'
                  f'<td>{st}</td>')
         svcs = vis.get(name, {})
         for _h, labels, kind in present:
@@ -292,6 +317,34 @@ def render_main(gw_ip, tier):
         b.append('</tr>')
     b.append('</table>')
     return page('Sigmond RAC', ''.join(b))
+
+
+def render_api(tier):
+    """Machine-readable view for tooling (ssr.sh etc.): every known station
+    with its RAC number, live services (tier-filtered like the page), and
+    status. GET /api"""
+    now = int(time.time())
+    clients, _online = live_services()
+    stat = status_map()
+    out = []
+    for name in sorted(set(stat) | set(clients)):
+        svcs = {lab: s for lab, s in clients.get(name, {}).items()
+                if not (tier == 'rac' and s['tier'] == 'mesh-only')}
+        rac = rac_of(clients.get(name, {})) if name in clients else None
+        if rac is None:
+            rac = stat.get(name, {}).get('rac')
+        out.append({
+            'name': name,
+            'rac': rac,
+            'legacy': name.endswith(' [legacy]'),
+            'active': bool(stat.get(name, {}).get('active') or name in clients),
+            'last_seen': stat.get(name, {}).get('last_seen'),
+            'services': {lab: {'port': s['port'], 'proto': s['proto'],
+                               'kind': s['kind'], 'tier': s['tier']}
+                         for lab, s in svcs.items()},
+        })
+    return json.dumps({'generated': now, 'tier': tier, 'stations': out},
+                      indent=1) + '\n'
 
 
 def render_history(name, gw_ip):
@@ -329,8 +382,13 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b'forbidden: WireGuard admin networks only')
             return
         try:
-            q = parse_qs(urlparse(self.path).query)
-            if 'h' in q and q['h']:
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            ctype = 'text/html; charset=utf-8'
+            if u.path == '/api':
+                body = render_api(tier)
+                ctype = 'application/json'
+            elif 'h' in q and q['h']:
                 body = render_history(q['h'][0], local)
             else:
                 body = render_main(local, tier)
@@ -341,7 +399,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(('error: %s' % exc).encode())
             return
         self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(page_b)))
         self.end_headers()
         self.wfile.write(page_b)
