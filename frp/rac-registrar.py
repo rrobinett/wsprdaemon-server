@@ -32,8 +32,13 @@ logged (journal + registry file) and revocable: delete the key line
 from /home/<SITE>/.ssh/authorized_keys (takes effect on next login).
 
 API (JSON in/out):
-  POST /register  {"site": "AI6VN_151", "rac": 151,
-                   "pubkey": "ssh-ed25519 AAAA... root@host"}
+  POST /register  {"site": "AI6VN_151", "rac": 151,      # rac optional —
+                   "pubkey": "ssh-ed25519 AAAA..."}      # omit to auto-assign
+      Auto-assignment picks the lowest free number >= 500 after checking
+      the registry, both live frps instances, WireGuard peers, the
+      cumulative ever-seen file and the admin's rac-reserved.txt (see the
+      auto-assignment block below). A site that is already registered
+      always gets its existing number back (sticky).
     200 -> {"ok": true, "site": ..., "rac": ..., "user": "<16hex>",
             "token": "<fleet token>", "server_addr": "gw2.wsprdaemon.org",
             "server_port": 35736,
@@ -59,7 +64,7 @@ import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 FRPS_TOML = "/home/frp/frps-secure.toml"
 REGISTRY = "/home/frp/rac-registry.json"
@@ -67,6 +72,32 @@ SERVER_ADDR = "gw2.wsprdaemon.org"
 SERVER_PORT = 35736
 
 BANDS = {"vm_ssh": 35800, "vm_web": 45800, "host_ssh": 50800, "host_ui": 55800}
+
+# ── auto-assignment ─────────────────────────────────────────────────────────
+# Stations are identified by reporter ID; the RAC number is plumbing — so
+# clients may omit "rac" and let the gateway pick. There is NO complete
+# record of every RAC the legacy fleet ever used (frps forgets proxies on
+# restart, the dashboard db keeps names not ports, and offline legacy
+# stations can reappear), so auto-assignment defends in depth:
+#   1. floor 500 — the observed legacy fleet lives in 0-199, so auto picks
+#      can't land on a sleeping legacy station's number;
+#   2. skip everything visible RIGHT NOW on both frps instances (secure
+#      :7501 and the legacy open server :7500), mapped port→rac;
+#   3. skip WireGuard wd-rac peers (10.111.220.(10+rac) for rac 0-199);
+#   4. skip RAC_SEEN — a cumulative ever-seen file this service grows from
+#      the live views on every request;
+#   5. skip RAC_RESERVED — admin-maintained, one rac per line, for known
+#      offline legacy stations (comments with # allowed).
+# frps itself is the final arbiter: a port already bound just fails at
+# frpc connect time, which the wizard's channel verification surfaces.
+AUTO_FLOOR = 500
+RAC_SEEN = "/home/frp/rac-seen.json"
+RAC_RESERVED = "/home/frp/rac-reserved.txt"
+WG_CONF = "/etc/wireguard/wd-rac.conf"
+FRPS_APIS = [
+    ("secure", "http://127.0.0.1:7501/api/proxy/tcp", "admin:admin"),
+    ("open",   "http://127.0.0.1:7500/api/proxy/tcp", "admin:admin"),
+]
 
 SITE_RE = re.compile(r"^[A-Z0-9][A-Z0-9_-]{2,31}$")
 PUBKEY_RE = re.compile(
@@ -94,6 +125,88 @@ def key_user(pubkey_line):
 def valid_rac(rac):
     # Mirror add-rac-client.sh: 200-299 is the HamSCI range, not WD's.
     return isinstance(rac, int) and 0 <= rac <= 999 and not 200 <= rac <= 299
+
+
+def port_to_rac(port):
+    """Reverse-map any known band (incl. the legacy 35800/45800 ssh/web
+    bands, which share bases with vm_ssh/vm_web) back to a rac number."""
+    for base in (35800, 45800, 50800, 55800):
+        if base <= port <= base + 999:
+            return port - base
+    return None
+
+
+def live_racs():
+    """rac numbers implied by every proxy currently known to either frps
+    instance. Unreachable APIs are logged and skipped (floor + frps port
+    arbitration still protect us)."""
+    import base64
+    import urllib.request
+    racs = set()
+    for label, url, auth in FRPS_APIS:
+        try:
+            req = urllib.request.Request(url)
+            req.add_header("Authorization",
+                           "Basic " + base64.b64encode(auth.encode()).decode())
+            data = json.load(urllib.request.urlopen(req, timeout=5))
+            for p in data.get("proxies") or []:
+                port = (p.get("conf") or {}).get("remotePort")
+                r = port_to_rac(port) if isinstance(port, int) else None
+                if r is not None:
+                    racs.add(r)
+        except Exception as e:
+            log.warning("frps %s API unavailable (%s) — skipping", label, e)
+    return racs
+
+
+def wg_racs():
+    """rac numbers implied by wd-rac WireGuard peers:
+    add-rac-client.sh maps rac 0-199 -> 10.111.220.(10+rac)."""
+    racs = set()
+    try:
+        with open(WG_CONF) as f:
+            for m in re.finditer(r"AllowedIPs\s*=\s*10\.111\.220\.(\d+)/32", f.read()):
+                octet = int(m.group(1))
+                if 10 <= octet <= 209:
+                    racs.add(octet - 10)
+    except OSError:
+        pass
+    return racs
+
+
+def reserved_racs():
+    """Union of every reservation source; also grows the cumulative
+    ever-seen file from the current live view."""
+    racs = set()
+    if os.path.exists(REGISTRY):
+        with open(REGISTRY) as f:
+            racs |= {int(k) for k in json.load(f)}
+    seen = set()
+    if os.path.exists(RAC_SEEN):
+        with open(RAC_SEEN) as f:
+            seen = set(json.load(f))
+    live = live_racs()
+    if not live <= seen:
+        tmp = RAC_SEEN + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(sorted(seen | live), f)
+        os.replace(tmp, RAC_SEEN)
+    racs |= seen | live | wg_racs()
+    if os.path.exists(RAC_RESERVED):
+        with open(RAC_RESERVED) as f:
+            for line in f:
+                line = line.split("#")[0].strip()
+                if line.isdigit():
+                    racs.add(int(line))
+    return racs
+
+
+def pick_free_rac():
+    taken = reserved_racs()
+    for n in range(AUTO_FLOOR, 1000):
+        if n not in taken:
+            return n
+    return None
 
 
 def ensure_account(site, pubkey_line):
@@ -198,12 +311,35 @@ class Handler(BaseHTTPRequestHandler):
         if not SITE_RE.match(site):
             self._reply(400, {"ok": False, "error": "bad site name (A-Z 0-9 _ -, 3-32 chars)"})
             return
-        if not valid_rac(rac):
-            self._reply(400, {"ok": False, "error": "RAC must be 0-199 or 300-999"})
+        auto = rac in (None, "", "auto")
+        if not auto and not valid_rac(rac):
+            self._reply(400, {"ok": False, "error": "RAC must be 0-199 or 300-999 (or omit it to auto-assign)"})
             return
         if not PUBKEY_RE.match(pubkey):
             self._reply(400, {"ok": False, "error": "pubkey doesn't look like an OpenSSH public key line"})
             return
+
+        # Sticky: a site that's already registered keeps its number — this
+        # is what makes `sigmond-setup --reconfigure` idempotent.
+        existing = None
+        if os.path.exists(REGISTRY):
+            with open(REGISTRY) as f:
+                for rk, ent in json.load(f).items():
+                    if ent["site"] == site:
+                        existing = int(rk)
+        if existing is not None:
+            if not auto and rac != existing:
+                self._reply(409, {"ok": False, "error":
+                    "site %s is already registered as RAC %d" % (site, existing)})
+                return
+            rac = existing
+        elif auto:
+            rac = pick_free_rac()
+            if rac is None:
+                log.error("auto-assign: no free RAC left in %d-999", AUTO_FLOOR)
+                self._reply(503, {"ok": False, "error": "no free RAC numbers left — contact the admin"})
+                return
+            log.info("auto-assigned RAC %d to site %s", rac, site)
 
         user = key_user(pubkey)
         err = claim(site, rac, user)
@@ -221,6 +357,7 @@ class Handler(BaseHTTPRequestHandler):
         log.info("REGISTERED site=%s rac=%s user=%s ports=%s (from %s)", site, rac, user, ports, ip)
         self._reply(200, {
             "ok": True, "site": site, "rac": rac, "user": user,
+            "auto_assigned": auto and existing is None,
             "token": fleet_token(),
             "server_addr": SERVER_ADDR, "server_port": SERVER_PORT,
             "ports": ports,
