@@ -261,7 +261,7 @@ def page(title, body):
             '</head><body>' + body + '</body></html>')
 
 
-def render_main(gw_ip, tier):
+def render_main(gw_ip, tier, sort='name', desc=False):
     now = int(time.time())
     clients, _online = live_services()
     stat = status_map()
@@ -274,25 +274,42 @@ def render_main(gw_ip, tier):
             vis[name] = f
     present = [(h, ls, k) for (h, ls, k) in COLUMNS
                if any(any(l in vis[c] for l in ls) for c in vis)]
-    names = sorted(set(stat) | set(vis))
+
+    def row_facts(name):
+        rac = rac_of(vis.get(name, {})) if name in vis else None
+        if rac is None:
+            rac = stat.get(name, {}).get('rac')
+        active = bool(stat.get(name, {}).get('active') or name in vis)
+        ls = stat.get(name, {}).get('last_seen') or 0
+        return rac, active, ls
+
+    def sort_key(name):
+        rac, active, ls = row_facts(name)
+        if sort == 'rac':
+            return (rac is None, rac if rac is not None else 0, name.lower())
+        if sort == 'status':
+            # active first, then most recently seen
+            return (not active, -ls, name.lower())
+        return (name.lower(),)
+    names = sorted(set(stat) | set(vis), key=sort_key, reverse=desc)
 
     b = ['<h1>Sigmond Remote Access Channel (RAC)</h1>']
     tl = 'full mesh view' if tier == 'mesh' else 'wd-rac view (shareable services only)'
     nact = sum(1 for n in names if stat.get(n, {}).get('active') or n in vis)
     b.append(f'<div class="sub">via gw2 <code>{gw_ip}</code> &middot; {tl} &middot; '
              f'{nact} active / {len(names)} known &middot; auto-refresh 30s</div>')
-    b.append('<table><tr><th>Name</th><th>RAC</th><th>Status</th>')
+    def th(col, label):
+        # clicking the current sort column flips direction
+        d = '&amp;d=1' if (sort == col and not desc) else ''
+        arrow = (' &#9660;' if desc else ' &#9650;') if sort == col else ''
+        return f'<th><a href="?s={col}{d}">{label}</a>{arrow}</th>'
+    b.append('<table><tr>' + th('name', 'Name') + th('rac', 'RAC') + th('status', 'Status'))
     for h, _ls, _k in present:
         b.append(f'<th class="svc">{h}</th>')
     b.append('</tr>')
     for name in names:
-        active = stat.get(name, {}).get('active') or name in vis
+        rac, active, _lastseen = row_facts(name)
         ls = stat.get(name, {}).get('last_seen')
-        # live ports first; for offline stations fall back to the number
-        # remembered in the history DB
-        rac = rac_of(vis.get(name, {})) if name in vis else None
-        if rac is None:
-            rac = stat.get(name, {}).get('rac')
         rowcls = '' if active else ' class="off-row"'
         st = '<span class="on">&#9679; active</span>' if active else (
             f'<span class="ago">last seen {ago(ls, now)}</span>' if ls else '&mdash;')
@@ -391,7 +408,10 @@ class Handler(BaseHTTPRequestHandler):
             elif 'h' in q and q['h']:
                 body = render_history(q['h'][0], local)
             else:
-                body = render_main(local, tier)
+                sort = (q.get('s') or ['name'])[0]
+                if sort not in ('name', 'rac', 'status'):
+                    sort = 'name'
+                body = render_main(local, tier, sort, bool(q.get('d')))
             page_b = body.encode()
         except Exception as exc:
             self.send_response(502)
