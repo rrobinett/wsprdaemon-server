@@ -39,6 +39,14 @@ DB_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rac-histo
 POLL_SEC   = 30
 RETAIN_SEC = 180 * 86400          # prune closed sessions older than ~6 months
 
+# Shared encrypted ssr conf blobs, served verbatim at GET /conf?f=<name>
+# (mesh tier ONLY). These are openssl-encrypted by the admin's passphrase —
+# gw2 serves ciphertext; decryption happens on the admin's machine. The
+# gw2 checkout of wd-rac is the master copy; ssr v3.14+ fetches from here
+# instead of relying on git-distributed copies.
+CONF_DIR = '/home/wsprdaemon/wd-rac/conf'
+CONF_WHITELIST = ('rac-master.conf.enc', 'rac-hamsci-master.conf.enc')
+
 SUFFIXES = [
     ('-host-ssh', 'ssh', 'ssh',   'mesh-only', 'host SSH'),
     ('-host-ui',  'web', 'https', 'mesh-only', 'Proxmox UI'),
@@ -402,6 +410,33 @@ class Handler(BaseHTTPRequestHandler):
             u = urlparse(self.path)
             q = parse_qs(u.query)
             ctype = 'text/html; charset=utf-8'
+            if u.path == '/conf':
+                # encrypted credential blobs: full-trust mesh tier only
+                if tier != 'mesh':
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(b'forbidden: mesh tier only')
+                    return
+                f = (q.get('f') or ['rac-master.conf.enc'])[0]
+                if f not in CONF_WHITELIST:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b'unknown conf')
+                    return
+                try:
+                    with open(os.path.join(CONF_DIR, f), 'rb') as fh:
+                        blob = fh.read()
+                except OSError:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b'conf not present on gateway')
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/octet-stream')
+                self.send_header('Content-Length', str(len(blob)))
+                self.end_headers()
+                self.wfile.write(blob)
+                return
             if u.path == '/api':
                 body = render_api(tier)
                 ctype = 'application/json'
