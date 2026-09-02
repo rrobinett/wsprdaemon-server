@@ -921,6 +921,13 @@ function wd-client-to-server-setup()
 
     (( ${verbosity-0} )) && echo "netcat opened a connection to ${rac_tunnel_server}:${client_ip_port} for RAC ${client_rac}"
 
+    ### Drop any host key we remember for this RAC's tunnel address BEFORE the scp.  A rebuilt
+    ### client comes up with a new SSH host key, and SSH_OPTS uses StrictHostKeyChecking=accept-new,
+    ### which accepts a first-seen key but REFUSES a changed one -- so a stale entry here wedges the
+    ### scp with "REMOTE HOST IDENTIFICATION HAS CHANGED" and password auth is disabled before the
+    ### password is ever tried.  That is exactly how RAC 161 (HPi7 rebuild) failed 2026-09-02.
+    ssh-keygen -f "${HOME}/.ssh/known_hosts" -R "[${rac_tunnel_server}]:${client_ip_port}" >/dev/null 2>&1
+
     (( ${verbosity-0} )) && echo "Get a copy of that server's public key so it can login here on this server"
     if ! scp_with_pass -P ${client_ip_port} ${client_user}@${rac_tunnel_server}:~/.ssh/id_*.pub  /tmp/rac_${client_rac}_key.pub > /dev/null 2>&1 ; then
         echo "ERROR: Can't scp a copy of that RAC's public key file, so we can't copy it to this server"
