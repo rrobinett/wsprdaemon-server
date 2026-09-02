@@ -74,7 +74,7 @@ import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 # After every successful registration, push this gateway's state to the
 # standby right away (rac-failover-sync.service; the hourly timer is the
@@ -298,7 +298,14 @@ def claim(site, rac, user, registry=REGISTRY):
         rk = str(rac)
         ent = reg.get(rk)
         if ent and ent["site"] != site:
-            return "RAC %d is already registered to site %s" % (rac, ent["site"])
+            if user in ent.get("users", []):
+                # Same node key, new name: the station was renamed (e.g. a
+                # WsprDaemon host now registering under its reporter ID after
+                # a manual registration). Keep the RAC, take the new name.
+                log.info("RAC %d: site renamed %s -> %s (same node key %s)", rac, ent["site"], site, user)
+                ent["site"] = site
+            else:
+                return "RAC %d is already registered to site %s" % (rac, ent["site"])
         for other_rk, other in reg.items():
             if other["site"] == site and other_rk != rk:
                 return "site %s is already registered as RAC %s" % (site, other_rk)
