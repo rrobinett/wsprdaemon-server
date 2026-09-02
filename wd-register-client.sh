@@ -849,7 +849,10 @@ function wd-remove-gw-keys-from-client() {
 function wd-client-to-server-setup()
 {
     local client_rac=$1
-    local client_user=${2-wsprdaemon}
+    ### Keep the caller's argument separate from the default, so we can tell "the operator asked
+    ### for wsprdaemon" apart from "nobody said, so we assumed wsprdaemon".
+    local client_user_arg="${2-}"
+    local client_user=${client_user_arg:-wsprdaemon}
     local rc
 
     # Validate input BEFORE using it in arithmetic
@@ -881,9 +884,19 @@ function wd-client-to-server-setup()
         return 1
     fi
 
-    ### Override client_user with the name from the SSR config (e.g. 'alan' for RAC 161)
-    ### The command-line arg is only a fallback when the config has no user field.
-    if [[ -n "${client_user_name}" ]]; then
+    ### A login name given on the command line WINS over the one stored in the encrypted config.
+    ### It used to be the other way round, which left the operator no way to correct a stale
+    ### entry: RAC 161 is recorded as user=alan, but that machine was rebuilt and now runs WD as
+    ### 'wsprdaemon', so every registration attempt scp'd as a user that no longer exists there
+    ### and no argument could say otherwise.  The stored value is still the default when the
+    ### caller says nothing, and we say plainly which one is being used.
+    if [[ -n "${client_user_arg}" ]]; then
+        if [[ -n "${client_user_name}" && "${client_user_name}" != "${client_user_arg}" ]]; then
+            echo "Using login user '${client_user_arg}' from the command line, overriding '${client_user_name}' in the encrypted config"
+            echo "   (edit the config entry for RAC ${client_rac} to make this permanent)"
+        fi
+        client_user="${client_user_arg}"
+    elif [[ -n "${client_user_name}" ]]; then
         if [[ "${client_user_name}" != "${client_user}" ]]; then
             echo "Using SSR config login user '${client_user_name}' (not default '${client_user}')"
         fi
