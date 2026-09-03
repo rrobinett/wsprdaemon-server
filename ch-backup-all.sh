@@ -11,22 +11,33 @@
 #   ch-backup-all.sh --status       [backup_dir] Show progress of most recent or specified backup
 #   ch-backup-all.sh --refresh      [backup_dir] Refresh stale size estimates in state file
 #   ch-backup-all.sh --restore      [backup_dir] Restore all tables from a native backup
+#   ch-backup-all.sh --prune        [base_dir]   Delete all but the newest N backups under base_dir
+#
+# Retention:
+#   After a fully successful --local/--offsite run, all but the newest KEEP backup
+#   directories under the base dir are deleted (newest N by directory name, i.e. by date).
+#   KEEP defaults to DEFAULT_KEEP below; override with the CH_BACKUP_KEEP environment
+#   variable or the --keep N option. --dry-run makes --prune only report what it would delete.
 #
 
 set -euo pipefail
 
-VERSION="3.14.0"
+VERSION="3.15.0"
 CH_CONF="/etc/wsprdaemon/clickhouse.conf"
 STATE_FILE_NAME="backup-state.tsv"
 
 DEFAULT_LOCAL_BASE="/srv/wd_archive/ch-archives"
 DEFAULT_OFFSITE_BASE="/mnt/offsite/ch-backups"
+DEFAULT_KEEP=4                          # backups to retain per base dir after a successful run
+KEEP="${CH_BACKUP_KEEP:-$DEFAULT_KEEP}"  # env override; --keep N overrides both
+DRY_RUN=0
 
 ZSTD_CORES=4          # cores per zstd instance; with 9 parallel tables x 4 = 36 total
 ZSTD_LEVEL_LOCAL=1    # local backup: fast compression, space less critical
 ZSTD_LEVEL_OFFSITE=3  # offsite backup: better compression for smaller transfer size
 
 STATUS_SEARCH_PATHS=(
+    /srv/wd_archive/ch-archives
     /mnt/ch_archive1/ch-backups
     /srv/wd_archive/ch-backups
     /srv/ch_archive/ch-backups
@@ -235,6 +246,58 @@ cmd_status() {
     echo "========================================================"
 }
 
+# Delete all but the newest $KEEP backup directories under a base dir.
+# Only directories named like 2026-08-30_100000 directly under base_dir are candidates.
+prune_old_backups() {
+    local base="$1"
+    local keep="${2:-$KEEP}"
+
+    if [[ ! "$keep" =~ ^[0-9]+$ ]] || (( keep < 1 )); then
+        echo "ERROR: KEEP must be a positive integer, got '${keep}' - skipping prune" >&2
+        return 1
+    fi
+    if [[ "$base" != /* || "$base" == "/" || ! -d "$base" ]]; then
+        echo "ERROR: refusing to prune '${base}' (must be an existing absolute directory)" >&2
+        return 1
+    fi
+
+    local -a candidates=()
+    local d
+    for d in "${base}"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]/; do
+        [[ -d "$d" ]] || continue
+        candidates+=("${d%/}")
+    done
+    # Glob expansion is sorted, and the names sort chronologically.
+    local total=${#candidates[@]}
+    local excess=$(( total - keep ))
+
+    echo "Retention: ${total} backup dir(s) under ${base}, keeping newest ${keep}"
+    if (( excess <= 0 )); then
+        echo "Retention: nothing to prune"
+        return 0
+    fi
+
+    local i sz
+    for (( i = 0; i < excess; i++ )); do
+        d="${candidates[$i]}"
+        sz=$(du -sh "$d" 2>/dev/null | cut -f1) || sz="?"
+        if (( DRY_RUN )); then
+            echo "Retention: would delete ${d} (${sz:-?})"
+        else
+            echo "Retention: deleting ${d} (${sz:-?})"
+            rm -rf --one-file-system -- "$d"
+        fi
+    done
+    (( DRY_RUN )) || echo "Retention: kept $(( total - excess )) backup(s), deleted ${excess}"
+    return 0
+}
+
+cmd_prune() {
+    local base="${1:-$DEFAULT_LOCAL_BASE}"
+    (( DRY_RUN )) && echo "DRY RUN: no directories will be deleted"
+    prune_old_backups "$base" "$KEEP"
+}
+
 run_native_backup() {
     local backup_dir="$1"
     local mode="$2"
@@ -274,6 +337,7 @@ run_native_backup() {
     echo "Total size: $(sudo du -sh "$backup_dir" | cut -f1)"
     if (( failed > 0 )); then echo "FAILURES: $failed tables failed"; exit 1; fi
     echo "All tables backed up successfully"
+    prune_old_backups "$(dirname "$backup_dir")" "$KEEP"
 }
 
 run_zstd_backup() {
@@ -337,6 +401,7 @@ run_zstd_backup() {
     echo "Total size: $(du -sh "$backup_dir" | cut -f1)"
     if (( failed > 0 )); then echo "FAILURES: $failed tables failed"; exit 1; fi
     echo "All tables backed up successfully"
+    prune_old_backups "$(dirname "$backup_dir")" "$KEEP"
 }
 
 run_zstd_backup_seq() {
@@ -382,6 +447,7 @@ run_zstd_backup_seq() {
     echo "Total size: $(du -sh "$backup_dir" | cut -f1)"
     if (( failed > 0 )); then echo "FAILURES: $failed tables failed"; exit 1; fi
     echo "All tables backed up successfully"
+    prune_old_backups "$(dirname "$backup_dir")" "$KEEP"
 }
 
 cmd_restore() {
@@ -423,8 +489,36 @@ usage() {
     echo "  $0 --status       [backup_dir] Show progress (auto-finds most recent)"
     echo "  $0 --refresh      [backup_dir] Refresh stale size estimates"
     echo "  $0 --restore      [backup_dir] Restore all tables from native backup"
+    echo "  $0 --prune        [base_dir]   Delete all but the newest KEEP backups"
+    echo "                                  Default: ${DEFAULT_LOCAL_BASE}"
+    echo ""
+    echo "Options (any position):"
+    echo "  --keep N      Backups to retain after a successful run or --prune"
+    echo "                (default ${DEFAULT_KEEP}; env CH_BACKUP_KEEP overrides; current: ${KEEP})"
+    echo "  --dry-run     With --prune: only report what would be deleted"
     echo "  $0 --version"
 }
+
+# Pull global options (--keep N, --dry-run) out of the argument list first.
+ARGS=()
+while (( $# > 0 )); do
+    case "$1" in
+        --keep)
+            if [[ -z "${2:-}" || ! "$2" =~ ^[0-9]+$ || "$2" -lt 1 ]]; then
+                echo "ERROR: --keep requires a positive integer" >&2; exit 1
+            fi
+            KEEP="$2"; shift 2 ;;
+        --keep=*)
+            KEEP="${1#--keep=}"
+            if [[ ! "$KEEP" =~ ^[0-9]+$ || "$KEEP" -lt 1 ]]; then
+                echo "ERROR: --keep requires a positive integer" >&2; exit 1
+            fi
+            shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        *) ARGS+=("$1"); shift ;;
+    esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
 
 CMD="${1:-}"
 shift || true
@@ -462,6 +556,9 @@ case "$CMD" in
         ;;
     --restore)
         cmd_restore "${1:-}"
+        ;;
+    --prune)
+        cmd_prune "${1:-}"
         ;;
     --version)
         echo "ch-backup-all.sh v${VERSION}"
