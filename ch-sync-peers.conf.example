@@ -1,0 +1,18 @@
+# /etc/wsprdaemon/ch-sync-peers.conf - optional overrides for ch-sync-peers (bash syntax)
+#
+# Peers to reconcile against. Default: wd10 wd20 wd30 minus this host.
+#PEERS="wd10 wd20"
+#
+# Tables to reconcile (db.table). Tables missing locally or on a peer are skipped.
+#TABLES="wspr.rx wsprdaemon.spots wsprdaemon.noise psk.spots pskreporter.rx"
+#
+# Regular-run window in hours (the daily timer passes --lookback 720 explicitly).
+#LOOKBACK_HOURS=48
+#
+# Ignore rows newer than this many minutes; they may still be arriving on either side.
+#CUTOFF_MINUTES=20
+#
+# Restrict a table to specific source peers. pskreporter.rx is only ingested on WD10,
+# so every other host pulls it from WD10 alone (and WD10 itself never pulls it).
+#declare -A TABLE_PEERS
+#TABLE_PEERS[pskreporter.rx]="wd10"

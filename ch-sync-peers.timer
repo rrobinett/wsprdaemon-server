@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ch-sync-peers every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+RandomizedDelaySec=120
+Persistent=true
+Unit=ch-sync-peers.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the deep ch-sync-peers pass daily at 04:30 UTC
+
+[Timer]
+OnCalendar=*-*-* 04:30:00 UTC
+RandomizedDelaySec=600
+Persistent=true
+Unit=ch-sync-peers-daily.service
+
+[Install]
+WantedBy=timers.target
