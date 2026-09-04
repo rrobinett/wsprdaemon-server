@@ -750,6 +750,26 @@ else
 fi
 
 # ============================================================================
+# Install ch-sync-peers + timers (hourly-bucket reconciliation with peer WDs)
+# ============================================================================
+echo ""
+echo "Installing ch-sync-peers and its timers..."
+chmod +x "$SCRIPT_DIR/ch-sync-peers.sh"
+ln -sf "$SCRIPT_DIR/ch-sync-peers.sh" /usr/local/sbin/ch-sync-peers
+echo "  Symlink: /usr/local/sbin/ch-sync-peers -> $SCRIPT_DIR/ch-sync-peers.sh"
+install -m 644 "$SCRIPT_DIR/ch-sync-peers.service"       /etc/systemd/system/ch-sync-peers.service
+install -m 644 "$SCRIPT_DIR/ch-sync-peers.timer"         /etc/systemd/system/ch-sync-peers.timer
+install -m 644 "$SCRIPT_DIR/ch-sync-peers-daily.service" /etc/systemd/system/ch-sync-peers-daily.service
+install -m 644 "$SCRIPT_DIR/ch-sync-peers-daily.timer"   /etc/systemd/system/ch-sync-peers-daily.timer
+if [[ ! -f /etc/wsprdaemon/ch-sync-peers.conf ]]; then
+    install -m 644 "$SCRIPT_DIR/ch-sync-peers.conf.example" /etc/wsprdaemon/ch-sync-peers.conf
+    echo "  Installed default /etc/wsprdaemon/ch-sync-peers.conf (all settings commented out)"
+fi
+systemctl daemon-reload
+systemctl enable --now ch-sync-peers.timer ch-sync-peers-daily.timer
+echo "  Enabled: ch-sync-peers.timer (every 15 min), ch-sync-peers-daily.timer (04:30 UTC)"
+
+# ============================================================================
 # Create/update configuration files
 # ============================================================================
 

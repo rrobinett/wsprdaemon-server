@@ -31,6 +31,7 @@
 #   TABLES="wspr.rx ..."          default: see below
 #   LOOKBACK_HOURS=48             default window for a regular run
 #   CUTOFF_MINUTES=20             ignore the most recent N minutes (still arriving)
+#   CHUNK_HOURS=48                process long windows in slices of this many hours
 #   declare -A TABLE_PEERS; TABLE_PEERS[pskreporter.rx]="wd10"
 #                                 restrict a table to specific source peers
 #
@@ -39,7 +40,7 @@
 
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 CONF="/etc/wsprdaemon/ch-sync-peers.conf"
 CH_CONF="/etc/wsprdaemon/clickhouse.conf"
 LOG="/var/log/wsprdaemon/ch-sync-peers.log"
@@ -50,6 +51,7 @@ PEERS=""
 TABLES="wspr.rx wsprdaemon.spots wsprdaemon.noise psk.spots pskreporter.rx"
 LOOKBACK_HOURS=48
 CUTOFF_MINUTES=20
+CHUNK_HOURS=48           # compare/copy at most this many hours per query batch (bounds memory on big tables)
 declare -A TABLE_PEERS
 TABLE_PEERS[pskreporter.rx]="wd10"
 
@@ -87,6 +89,7 @@ CH_PASS="${CLICKHOUSE_ROOT_ADMIN_PASSWORD:?}"
 
 [[ "$LOOKBACK_HOURS" =~ ^[0-9]+$ ]] || { echo "ERROR: LOOKBACK_HOURS must be an integer" >&2; exit 1; }
 [[ "$CUTOFF_MINUTES" =~ ^[0-9]+$ ]] || { echo "ERROR: CUTOFF_MINUTES must be an integer" >&2; exit 1; }
+[[ "$CHUNK_HOURS" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: CHUNK_HOURS must be a positive integer" >&2; exit 1; }
 
 SELF=$(hostname | tr 'A-Z' 'a-z')
 if [[ -n "$OPT_PEERS" ]]; then
@@ -142,6 +145,13 @@ log "=== ch-sync-peers v${VERSION} on ${SELF}: peers=[${PEERS% }] tables=[${TABL
 T0=$(date +%s)
 TOTAL_TABLES=0; TOTAL_HOURS=0; TOTAL_COPIES=0; TOTAL_ROWS=0; TOTAL_ERRORS=0
 
+CHUNK_SECS=$(( CHUNK_HOURS * 3600 ))
+N_CHUNKS=$(( (CUTOFF_EPOCH - SINCE_EPOCH + CHUNK_SECS - 1) / CHUNK_SECS ))
+CHUNK_NO=0
+for (( CH_SINCE = SINCE_EPOCH; CH_SINCE < CUTOFF_EPOCH; CH_SINCE += CHUNK_SECS )); do
+CH_UNTIL=$(( CH_SINCE + CHUNK_SECS )); (( CH_UNTIL > CUTOFF_EPOCH )) && CH_UNTIL=$CUTOFF_EPOCH
+CHUNK_NO=$((CHUNK_NO+1))
+(( N_CHUNKS > 1 )) && vlog "--- chunk ${CHUNK_NO}/${N_CHUNKS}: $(date -u -d @$CH_SINCE '+%F %H:00')..$(date -u -d @$CH_UNTIL '+%F %H:%M') UTC"
 for table in $TABLES; do
     db="${table%%.*}"; tbl="${table#*.}"
     [[ "$db" != "$table" && -n "$tbl" ]] || { log "ERROR: table must be db.name, got '$table'"; TOTAL_ERRORS=$((TOTAL_ERRORS+1)); continue; }
@@ -152,7 +162,7 @@ for table in $TABLES; do
         vlog "SKIP $table: not present locally"; continue
     fi
     cols=$(ch "SELECT arrayStringConcat(groupArray(name), ', ') FROM (SELECT name FROM system.columns WHERE database = '$(sql_str "$db")' AND table = '$(sql_str "$tbl")' AND default_kind NOT IN ('ALIAS','MATERIALIZED') ORDER BY position)") || { TOTAL_ERRORS=$((TOTAL_ERRORS+1)); continue; }
-    TOTAL_TABLES=$((TOTAL_TABLES+1))
+    (( CHUNK_NO == 1 )) && TOTAL_TABLES=$((TOTAL_TABLES+1))
 
     peers_for_table="${TABLE_PEERS[$table]:-$PEERS}"
     for peer in $peers_for_table; do
@@ -172,7 +182,7 @@ for table in $TABLES; do
         else
             ident="cityHash64(*)"
         fi
-        where_win="time >= toDateTime(${SINCE_EPOCH}) AND time < toDateTime(${CUTOFF_EPOCH})"
+        where_win="time >= toDateTime(${CH_SINCE}) AND time < toDateTime(${CH_UNTIL})"
         hour_expr="toUnixTimestamp(toStartOfHour(time, 'UTC'))"
 
         declare -A lc=() pc=()
@@ -185,7 +195,7 @@ for table in $TABLES; do
             n_hours=$((n_hours+1))
             l=${lc[$h]:-0}; p=${pc[$h]:-0}
             (( p == 0 || p == l )) && continue
-            h_end=$(( h + 3600 )); (( h_end > CUTOFF_EPOCH )) && h_end=$CUTOFF_EPOCH
+            h_end=$(( h + 3600 )); (( h_end > CH_UNTIL )) && h_end=$CH_UNTIL
             hour_txt=$(date -u -d @$h '+%F %H:00')
             where_hour="time >= toDateTime(${h}) AND time < toDateTime(${h_end})"
             if (( DRY_RUN )); then
@@ -217,12 +227,13 @@ for table in $TABLES; do
             fi
             rm -f /tmp/ch-sync-peers.err.$$
         done
-        if (( n_copy > 0 || VERBOSE )); then
+        if (( n_copy > 0 || (VERBOSE && N_CHUNKS == 1) )); then
             log "$table <- $peer: $n_hours hours compared, $n_copy hours $( (( DRY_RUN )) && echo 'would be ' )copied, ~$n_rows rows added"
         fi
         TOTAL_HOURS=$((TOTAL_HOURS + n_hours)); TOTAL_COPIES=$((TOTAL_COPIES + n_copy)); TOTAL_ROWS=$((TOTAL_ROWS + n_rows))
         unset lc pc
     done
+done
 done
 
 log "=== done in $(( $(date +%s) - T0 ))s: $TOTAL_TABLES tables, $TOTAL_HOURS hour-comparisons, $TOTAL_COPIES hours copied, ~$TOTAL_ROWS rows added, $TOTAL_ERRORS errors"
