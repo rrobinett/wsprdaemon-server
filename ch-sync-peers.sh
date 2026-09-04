@@ -40,7 +40,7 @@
 
 set -uo pipefail
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 CONF="/etc/wsprdaemon/ch-sync-peers.conf"
 CH_CONF="/etc/wsprdaemon/clickhouse.conf"
 LOG="/var/log/wsprdaemon/ch-sync-peers.log"
@@ -191,6 +191,31 @@ for table in $TABLES; do
 
         hours=$(printf '%s\n' "${!lc[@]}" "${!pc[@]}" | sort -un)
         n_hours=0; n_copy=0; n_rows=0
+
+        # Fast path: the peer has rows in this chunk and we have none at all
+        # (initial history load). One INSERT for the whole chunk instead of one
+        # per hour, so the peer scans its partition once instead of CHUNK_HOURS times.
+        if (( ${#lc[@]} == 0 && ${#pc[@]} > 0 )); then
+            p_total=0; for h in "${!pc[@]}"; do p_total=$((p_total + pc[$h])); done
+            chunk_txt="$(date -u -d @$CH_SINCE '+%F %H:00')..$(date -u -d @$CH_UNTIL '+%F %H:%M')"
+            n_hours=${#pc[@]}
+            if (( DRY_RUN )); then
+                log "WOULD COPY $table <- $peer whole chunk $chunk_txt local=0 peer=$p_total"
+                n_copy=$n_hours; n_rows=$p_total
+            else
+                t1=$(date +%s)
+                if ch "INSERT INTO ${table} (${cols}) SELECT ${cols} FROM $(rem "$peer" "$table") WHERE ${where_win}" >/dev/null 2>/tmp/ch-sync-peers.err.$$; then
+                    after=$(ch "SELECT count() FROM ${table} WHERE ${where_win}" 2>/dev/null || echo "?")
+                    log "COPY $table <- $peer whole chunk $chunk_txt local=0 peer=$p_total now=$after ($(( $(date +%s) - t1 ))s)"
+                    n_copy=$n_hours; [[ "$after" =~ ^[0-9]+$ ]] && n_rows=$after
+                else
+                    log "ERROR $table <- $peer chunk $chunk_txt copy failed: $(head -c 300 /tmp/ch-sync-peers.err.$$ | tr '\n' ' ')"
+                    TOTAL_ERRORS=$((TOTAL_ERRORS+1))
+                fi
+                rm -f /tmp/ch-sync-peers.err.$$
+            fi
+            hours=""
+        fi
         for h in $hours; do
             n_hours=$((n_hours+1))
             l=${lc[$h]:-0}; p=${pc[$h]:-0}
