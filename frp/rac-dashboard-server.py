@@ -105,11 +105,13 @@ SUFFIXES = [
     ('-host-ui',  'web', 'https', 'mesh-only', 'Proxmox UI'),
     ('-vm-ssh',   'ssh', 'ssh',   'mesh-only', 'VM SSH'),
     ('-vm-web',   'web', 'http',  'shareable', 'VM ka9q-web'),
+    ('-vm-grape', 'web', 'http',  'shareable', 'GRAPE charts'),  # WD 3.4.6+ carrier strip charts, 40800+rac
     ('-ssh',      'ssh', 'ssh',   'mesh-only', 'SSH'),        # receiver (smd)
     ('-web',      'web', 'http',  'shareable', 'ka9q-web'),   # receiver (smd)
 ]
 COLUMNS = [
     ('VM Web',          ['VM ka9q-web', 'ka9q-web'], 'web'),
+    ('GRAPE charts',    ['GRAPE charts'],            'web'),
     ('VM SSH',          ['VM SSH', 'SSH'],           'ssh'),
     ('Proxmox UI',      ['Proxmox UI'],              'web'),
     ('Proxmox box SSH', ['host SSH'],                'ssh'),
@@ -312,7 +314,7 @@ def rac_of(svcs):
         if isinstance(p, int):
             if 37800 <= p <= 37899:      # Wsprsonde band: ID 2000-2099
                 return p - 35800
-            for base in (35800, 45800, 50800, 55800):
+            for base in (35800, 40800, 45800, 50800, 55800):
                 if base <= p <= base + 999:
                     return p - base
     return None

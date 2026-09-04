@@ -19,6 +19,7 @@ by hand:
          vm-web   45800+n     (the decoder VM's ka9q-web)
          host-ssh 50800+n     (the Proxmox host's sshd)
          host-ui  55800+n     (the Proxmox web UI, https :8006)
+         vm-grape 40800+n     (WsprDaemon GRAPE carrier strip-chart page, http :8088; WD 3.4.6+)
 
      All four bands stay inside the wd-rac WireGuard tier's allowed
      35800-59999 range for RAC 0-999.  Suffixes match rac-dashboard's
@@ -74,7 +75,7 @@ import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 
 # After every successful registration, push this gateway's state to the
 # standby right away (rac-failover-sync.service; the hourly timer is the
@@ -106,7 +107,7 @@ GATEWAYS = [
     {"name": "gw1", "addr": "gw1.wsprdaemon.org", "port": 35736, "role": "standby"},
 ]
 
-BANDS = {"vm_ssh": 35800, "vm_web": 45800, "host_ssh": 50800, "host_ui": 55800}
+BANDS = {"vm_ssh": 35800, "vm_web": 45800, "host_ssh": 50800, "host_ui": 55800, "vm_grape": 40800}
 
 # ── auto-assignment ─────────────────────────────────────────────────────────
 # Stations are identified by reporter ID; the RAC number is plumbing — so
@@ -178,7 +179,7 @@ def valid_rac(rac):
 def port_to_rac(port):
     """Reverse-map any known band (incl. the legacy 35800/45800 ssh/web
     bands, which share bases with vm_ssh/vm_web) back to a rac number."""
-    for base in (35800, 45800, 50800, 55800):
+    for base in (35800, 40800, 45800, 50800, 55800):
         if base <= port <= base + 999:
             return port - base
     return None
