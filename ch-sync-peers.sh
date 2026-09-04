@@ -40,7 +40,7 @@
 
 set -uo pipefail
 
-VERSION="1.0.2"
+VERSION="1.0.3"
 CONF="/etc/wsprdaemon/ch-sync-peers.conf"
 CH_CONF="/etc/wsprdaemon/clickhouse.conf"
 LOG="/var/log/wsprdaemon/ch-sync-peers.log"
@@ -121,7 +121,7 @@ fi
 ch() {  # run a query locally; stdout = result, non-zero on error (stderr masked)
     clickhouse-client --user "$CH_USER" --password "$CH_PASS" \
         --max_execution_time 0 --receive_timeout 7200 --send_timeout 7200 \
-        --query "$1" </dev/null 2> >(sed "s/$CH_PASS/<pw>/g" >&2)
+        --query "$1" </dev/null 9>&- 2> >(sed "s/$CH_PASS/<pw>/g" >&2)
 }
 rem() {  # remote(peer, db.table) expression with credentials
     echo "remote('$1', $2, '$CH_USER', '$CH_PASS')"
