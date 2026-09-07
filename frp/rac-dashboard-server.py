@@ -105,12 +105,16 @@ SUFFIXES = [
     ('-host-ui',  'web', 'https', 'mesh-only', 'Proxmox UI'),
     ('-vm-ssh',   'ssh', 'ssh',   'mesh-only', 'VM SSH'),
     ('-vm-web',   'web', 'http',  'shareable', 'VM ka9q-web'),
+    ('-vm-web2',  'web', 'http',  'shareable', 'VM ka9q-web #2'),  # 2nd RX888's ka9q-web, 46800+rac
+    ('-vm-web3',  'web', 'http',  'shareable', 'VM ka9q-web #3'),  # 3rd RX888's ka9q-web, 47800+rac
     ('-vm-grape', 'web', 'http',  'shareable', 'GRAPE charts'),  # WD 3.4.6+ carrier strip charts, 40800+rac
     ('-ssh',      'ssh', 'ssh',   'mesh-only', 'SSH'),        # receiver (smd)
     ('-web',      'web', 'http',  'shareable', 'ka9q-web'),   # receiver (smd)
 ]
 COLUMNS = [
     ('VM Web',          ['VM ka9q-web', 'ka9q-web'], 'web'),
+    ('VM Web #2',       ['VM ka9q-web #2'],          'web'),
+    ('VM Web #3',       ['VM ka9q-web #3'],          'web'),
     ('GRAPE charts',    ['GRAPE charts'],            'web'),
     ('VM SSH',          ['VM SSH', 'SSH'],           'ssh'),
     ('Proxmox UI',      ['Proxmox UI'],              'web'),
@@ -307,14 +311,14 @@ def parse(name):
 
 def rac_of(svcs):
     """Derive the RAC number from any of a client's ports — every band
-    (35800 ssh/vm-ssh, 45800 web/vm-web, 50800 host-ssh, 55800 host-ui)
+    (35800 ssh/vm-ssh, 45800 web/vm-web, 46800/47800 vm-web2/3, 50800 host-ssh, 55800 host-ui)
     is base + rac."""
     for s in svcs.values():
         p = s.get('port')
         if isinstance(p, int):
             if 37800 <= p <= 37899:      # Wsprsonde band: ID 2000-2099
                 return p - 35800
-            for base in (35800, 40800, 45800, 50800, 55800):
+            for base in (35800, 40800, 45800, 46800, 47800, 50800, 55800):
                 if base <= p <= base + 999:
                     return p - base
     return None

@@ -17,6 +17,8 @@ by hand:
 
          vm-ssh   35800+n     (the decoder VM's sshd)
          vm-web   45800+n     (the decoder VM's ka9q-web)
+         vm-web2  46800+n     (ka9q-web of the 2nd RX888 at a multi-RX888 site; WD master after 3.4.6)
+         vm-web3  47800+n     (ka9q-web of the 3rd RX888)
          host-ssh 50800+n     (the Proxmox host's sshd)
          host-ui  55800+n     (the Proxmox web UI, https :8006)
          vm-grape 40800+n     (WsprDaemon GRAPE carrier strip-chart page, http :8088; WD 3.4.6+)
@@ -75,7 +77,7 @@ import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 # After every successful registration, push this gateway's state to the
 # standby right away (rac-failover-sync.service; the hourly timer is the
@@ -107,7 +109,11 @@ GATEWAYS = [
     {"name": "gw1", "addr": "gw1.wsprdaemon.org", "port": 35736, "role": "standby"},
 ]
 
-BANDS = {"vm_ssh": 35800, "vm_web": 45800, "host_ssh": 50800, "host_ui": 55800, "vm_grape": 40800}
+# vm_web2 / vm_web3 (registrar 1.5.0): the ka9q-web pages of a site's 2nd and 3rd RX888 (WsprDaemon
+# publishes one ka9q-web@<instance> per radiod when KA9Q_WEB_SYSTEMD=yes).  46800/47800 sit right after
+# vm_web's 45800-46799 and below host_ssh's 50800, still inside the wd-rac tier's 35800-59999.
+BANDS = {"vm_ssh": 35800, "vm_web": 45800, "vm_web2": 46800, "vm_web3": 47800,
+         "host_ssh": 50800, "host_ui": 55800, "vm_grape": 40800}
 
 # ── auto-assignment ─────────────────────────────────────────────────────────
 # Stations are identified by reporter ID; the RAC number is plumbing — so
@@ -179,7 +185,7 @@ def valid_rac(rac):
 def port_to_rac(port):
     """Reverse-map any known band (incl. the legacy 35800/45800 ssh/web
     bands, which share bases with vm_ssh/vm_web) back to a rac number."""
-    for base in (35800, 40800, 45800, 50800, 55800):
+    for base in (35800, 40800, 45800, 46800, 47800, 50800, 55800):
         if base <= port <= base + 999:
             return port - base
     return None
