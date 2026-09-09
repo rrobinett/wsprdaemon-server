@@ -95,8 +95,12 @@ def kick_failover_sync():
 
 FRPS_TOML = "/home/frp/frps-secure.toml"
 REGISTRY = "/home/frp/rac-registry.json"
-SERVER_ADDR = "gw2.wsprdaemon.org"
-SERVER_PORT = 35736
+# The gateway this registrar speaks for.  Defaults are gw2's; a standby or a
+# lab replica sets RAC_SERVER_ADDR / RAC_SERVER_PORT (and RAC_GATEWAYS, a JSON
+# list, when it has no gw1-style standby) in the unit's Environment= so the
+# same file runs unmodified everywhere (AI6VN lab Central, 2026-09-09).
+SERVER_ADDR = os.environ.get("RAC_SERVER_ADDR", "gw2.wsprdaemon.org")
+SERVER_PORT = int(os.environ.get("RAC_SERVER_PORT", "35736"))
 
 # Every gateway a client should hold a tunnel to, primary first. Returned as
 # "gateways" alongside the legacy single server_addr/server_port (kept
@@ -104,7 +108,7 @@ SERVER_PORT = 35736
 # identity -- pubkey hash, fleet token, port band -- is the same on every
 # gateway; the gw2->gw1 failover replication (sync-failover-state.sh) is
 # what guarantees that, so a client can arrive at the standby unannounced.
-GATEWAYS = [
+GATEWAYS = json.loads(os.environ["RAC_GATEWAYS"]) if os.environ.get("RAC_GATEWAYS") else [
     {"name": "gw2", "addr": SERVER_ADDR, "port": SERVER_PORT, "role": "primary"},
     {"name": "gw1", "addr": "gw1.wsprdaemon.org", "port": 35736, "role": "standby"},
 ]
