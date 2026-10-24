@@ -37,12 +37,17 @@ clients have today. Today the HamSCI side has one gateway; WsprDaemon has two.
 5. **Automatic switchover to the secure tier.** Once the station's key is on
    file, the client moves itself to frps-secure (TLS + TOFU-checked login) and
    stops using the open tier.
-6. **Non-DASI stations.** Today a HamSCI RAC number comes only from a DASI
-   number (RAC 220+N), and there is no registrar on hs0. Decide how a non-DASI
-   HamSCI station gets a RAC number under TOFU.
-7. **Dashboard.** Once VPN2 exists, its `rac-dashboard` must list both
-   tiers. hs0's `dashboard.conf` had to be fixed by hand to show the secure
-   tier (2026-09-16).
+6. **Non-DASI stations: supported** (Rob, 2026-10-24). There may be few,
+   but they are welcome. Today a HamSCI RAC number comes only from a DASI
+   number (RAC 220+N), and there is no registrar on hs0, so non-DASI
+   stations need a way to get a RAC number under TOFU.
+7. **Dashboard.** VPN2's `rac-dashboard.conf` must list both its open and
+   its secure frps, or the stations on the tier it leaves out are invisible.
+   hs0 had exactly that bug until 2026-09-16.
+8. **Access levels: deferred.** Separating which ports each kind of user may
+   reach, with authorized users and permission levels, is a larger problem
+   for later. For now anyone who can open the HamSCI dashboard sees
+   everything on it: the Proxmox links and the VM links (Rob, 2026-10-24).
 
 ## Reference
 
