@@ -107,20 +107,62 @@ SUFFIXES = [
     ('-vm-web',   'web', 'http',  'shareable', 'VM ka9q-web'),
     ('-vm-web2',  'web', 'http',  'shareable', 'VM ka9q-web #2'),  # 2nd RX888's ka9q-web, 46800+rac
     ('-vm-web3',  'web', 'http',  'shareable', 'VM ka9q-web #3'),  # 3rd RX888's ka9q-web, 47800+rac
-    ('-vm-grape', 'web', 'http',  'shareable', 'GRAPE charts'),  # WD 3.4.6+ carrier strip charts, 40800+rac
+    ('-vm-grape', 'web', 'http',  'shareable', 'GRAPE charts'),
+    # The sigmond decoder VM serves THREE web UIs, not one.  Without these
+    # two suffixes parse() falls through to its default and renders each
+    # channel as its OWN station row -- W3USR_020-vm-gmag appeared as a
+    # phantom machine (rob, 2026-09-21).  Bands avoid 46800/47800 above.
+    ('-vm-station', 'web', 'http', 'shareable', 'Station web'),   # 48800+rac
+    ('-vm-gmag',   'web', 'http', 'shareable', 'Magnetometer'),  # 49800+rac  # WD 3.4.6+ carrier strip charts, 40800+rac
     ('-ssh',      'ssh', 'ssh',   'mesh-only', 'SSH'),        # receiver (smd)
     ('-web',      'web', 'http',  'shareable', 'ka9q-web'),   # receiver (smd)
 ]
+# Order is the reading order rob asked for (2026-09-30): SSH first, because it
+# is what an operator reaches for, then everything the decoder VM serves, and
+# only then the Proxmox host.  Every VM column is named "VM ..." so the groups
+# are tellable apart at a glance.
+# rob, 2026-10-20: the columns that only a handful of stations have (2nd/3rd
+# RX888, station web, magnetometer, the Proxmox host) go to the far right, so
+# the common ones stay together on the left and the rare ones may run off the
+# edge of a narrow window.  Sonde SSH appears only on the Wsprsondes tab.
 COLUMNS = [
+    # --- the decoder VM, the columns most stations have ---
+    ('VM SSH',          ['VM SSH', 'SSH'],           'ssh'),
     ('VM Web',          ['VM ka9q-web', 'ka9q-web'], 'web'),
+    ('VM GRAPE',        ['GRAPE charts'],            'web'),
+    # --- rare: only a few stations have these ---
+    ('VM Station',      ['Station web'],             'web'),
     ('VM Web #2',       ['VM ka9q-web #2'],          'web'),
     ('VM Web #3',       ['VM ka9q-web #3'],          'web'),
-    ('GRAPE charts',    ['GRAPE charts'],            'web'),
-    ('VM SSH',          ['VM SSH', 'SSH'],           'ssh'),
+    ('VM Magneto&shy;meter', ['Magnetometer'],       'web'),  # &shy;: lets the narrow header hyphenate
+    # --- the Proxmox host underneath it ---
     ('Proxmox UI',      ['Proxmox UI'],              'web'),
     ('Proxmox box SSH', ['host SSH'],                'ssh'),
+    # --- neither: a Wsprsonde host (Wsprsondes tab only) ---
     ('Sonde SSH',       ['Sonde SSH'],               'ssh'),
 ]
+
+# Per-column fallback when neither the Login column nor the station's own
+# advertised metadata says who to log in as.  rob, 2026-09-30: "for the
+# wsprdaemon [dashboard] the default SSH should be wsprdaemon@<port> -- the
+# typical user logs in as wsprdaemon."
+# ⛔ This used to be a bare `root` for every SSH column, so every station row
+# handed the operator `root@gw2`, which is not how a WsprDaemon receiver is
+# entered at all.
+# ⚠ The Proxmox HOST is the exception that keeps root: applying a station
+# account there would render a command that cannot work.
+# The account a STATION is entered as, per gateway.  rob, 2026-09-30:
+# wsprdaemon on the WsprDaemon dashboard, hamsci on the HamSCI one.
+# ⚠ Config, not code: this same server.py runs on both gateways and the header
+# above is explicit that per-gateway differences live in dashboard.conf.
+# Falls back to default_account so a gateway that sets neither keeps working.
+STATION_ACCOUNT = CFG.get('station_account', DEFAULT_ACCOUNT)
+SSH_DEFAULT_USER = {
+    'VM SSH':    STATION_ACCOUNT,
+    'SSH':       STATION_ACCOUNT,
+    'host SSH':  'root',
+    'Sonde SSH': 'wsprsonde',
+}
 
 
 def svc_visible(svc, tier):
@@ -134,13 +176,29 @@ def svc_visible(svc, tier):
     return svc['tier'] != 'mesh-only'
 
 STYLE = (
-    'body{font-family:system-ui,-apple-system,sans-serif;max-width:1000px;'
-    'margin:2rem auto;padding:0 1rem;color:#222}h1{font-size:1.4rem;margin-bottom:.2rem}'
+    # Left-justified, not centred, to match the HamSCI dashboard on hs0:
+    # margin:auto with a 1000px cap left a wide empty gutter on the left and
+    # pushed the nowrap table off the right edge (rob, 2026-10-20).
+    'body{font-family:system-ui,-apple-system,sans-serif;'
+    'margin:1.5rem 1.25rem;padding:0;color:#222}h1{font-size:1.4rem;margin-bottom:.2rem}'
     '.sub{color:#777;font-size:.85rem;margin-bottom:1rem}'
-    'table{border-collapse:collapse;width:100%;font-size:.92rem}'
-    'th,td{text-align:left;padding:.35rem .8rem;border-bottom:1px solid #ececec;white-space:nowrap}'
-    'th{font-size:.74rem;text-transform:uppercase;letter-spacing:.04em;color:#999;'
-    'border-bottom:2px solid #ddd}th.svc,td.svc{text-align:center}'
+    # Table only as wide as its content (width:100% spread the few columns
+    # across the whole window), and service headers wrap onto two lines
+    # ("VM / MAGNETOMETER") so a column is as narrow as its "open"/"ssh" cell
+    # (rob, 2026-10-20).
+    'table{border-collapse:collapse;width:auto;font-size:.92rem}'
+    'th,td{text-align:left;padding:.3rem .55rem;border-bottom:1px solid #ececec;white-space:nowrap}'
+    'th{font-size:.7rem;text-transform:uppercase;letter-spacing:.03em;color:#999;'
+    'border-bottom:2px solid #ddd;vertical-align:bottom}th.svc,td.svc{text-align:center}'
+    'th.svc{white-space:normal;line-height:1.15;width:4.5em;max-width:6.5em}'
+    # Column headers stay pinned at the top while the station rows scroll
+    # (rob, 2026-10-24).  A sticky cell loses its collapsed border, so the
+    # rule under the headers is drawn with an inset shadow instead.
+    'th{position:sticky;top:0;z-index:1;background:#fff;box-shadow:inset 0 -2px 0 #ddd}'
+    '.tabs{margin:.2rem 0 .9rem;border-bottom:2px solid #ddd}'
+    '.tabs a,.tabs span{display:inline-block;padding:.35rem .9rem;margin-bottom:-2px;'
+    'border-bottom:2px solid transparent;font-size:.92rem}'
+    '.tabs span{border-bottom-color:#1a6dd6;font-weight:600;color:#222}'
     'td.name{font-family:ui-monospace,Menlo,monospace;font-weight:600}'
     'a{color:#1a6dd6;text-decoration:none}a:hover{text-decoration:underline}'
     'code{background:#f4f4f4;padding:.1rem .35rem;border-radius:4px;font-size:.82rem;color:#555}'
@@ -454,8 +512,15 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
         vis = {n: svcs for n, svcs in vis.items()
                if is_sonde(rac_of(svcs)) or is_sonde(stat.get(n, {}).get('rac'))}
         stat = {n: st for n, st in stat.items() if is_sonde(st.get('rac'))}
+    else:
+        # Stations tab: Wsprsondes have their own tab, so leave them (and the
+        # Sonde SSH column) out of this one entirely (rob, 2026-10-20).
+        vis = {n: svcs for n, svcs in vis.items()
+               if not (is_sonde(rac_of(svcs)) or is_sonde(stat.get(n, {}).get('rac')))}
+        stat = {n: st for n, st in stat.items() if not is_sonde(st.get('rac'))}
     present = [(h, ls, k) for (h, ls, k) in COLUMNS
-               if any(any(l in vis[c] for l in ls) for c in vis)]
+               if (h == 'Sonde SSH') == only_sonde
+               and any(any(l in vis[c] for l in ls) for c in vis)]
 
     def row_facts(name):
         rac = rac_of(vis.get(name, {})) if name in vis else None
@@ -481,12 +546,14 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
     b = ['<h1>' + html.escape(TITLE) + heading + '</h1>']
     tl = {'mesh': 'full mesh view', 'sonde': 'wd-sonde view (Wsprsonde hosts only)'}.get(
         tier, 'wd-rac view (shareable services only)')
-    # Admin tiers get a link between the full view and the sonde-only view;
-    # the wd-sonde tier has nothing else to link to.
+    # Admin tiers get Stations / Wsprsondes tabs; the wd-sonde tier has
+    # nothing else to switch to.
     nav = ''
     if tier != 'sonde':
-        nav = (' &middot; <a href="/">all stations</a>' if only_sonde
-               else ' &middot; <a href="/sondes">Wsprsondes only</a>')
+        tabs = [('/', 'Stations', not only_sonde), ('/sondes', 'Wsprsondes', only_sonde)]
+        b.append('<div class="tabs">' + ''.join(
+            f'<span>{lab}</span>' if cur else f'<a href="{href}">{lab}</a>'
+            for href, lab, cur in tabs) + '</div>')
     # Address used in the service links: the sonde-only admin view shows the
     # address typical sonde users have (see SONDE_USER_GW); everything else
     # uses the viewer's own arrival address.
@@ -519,11 +586,20 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
                  f'<a href="?h={html.escape(name)}">{html.escape(name)}</a></td>'
                  f'<td class="name">{rac if rac is not None else "&mdash;"}</td>'
                  f'<td>{st}</td>')
+        ### The Login account is the operator's own record of who to log in as,
+        ### and rob treats it as authoritative: "unless the login column says
+        ### something different ... in which case that's the correct one"
+        ### (2026-09-30).  Hoisted out of the Login cell because the SSH cells
+        ### below need it too -- previously they could offer `root@` while the
+        ### very same row displayed a real account two columns to the left.
+        ### Non-mesh tiers do not load creds, so this is '' there and the
+        ### per-column default applies, exactly as before.
+        c = creds.get(str(rac)) if rac is not None else None
+        login_acct = (c or {}).get('account') or ''
         if tier == 'mesh':
             ### Login: real account + a click-to-copy password (password passed
             ### via a data- attribute, never inlined into the JS string).
-            c = creds.get(str(rac)) if rac is not None else None
-            acct = (c or {}).get('account') or ''
+            acct = login_acct
             pw = (c or {}).get('password') or ''
             if pw:
                 cell = ('%s / <a class="act" href="#" data-pw="%s" '
@@ -545,8 +621,21 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
                          'data-proto="%s" data-port="%s" href="%s://%s:%s/">open</a></td>'
                          % (svc['proto'], svc['port'], svc['proto'], link_ip, svc['port']))
             else:
-                default_user = 'wsprsonde' if svc['tier'] == 'sonde' else 'root'
-                user = svc.get('user') or default_user
+                ### Precedence, most to least authoritative:
+                ###   1. the Login column, when the operator has recorded one
+                ###   2. the station's own advertised metadatas.user
+                ###   3. this column's default (wsprdaemon for a receiver /
+                ###      the VM, root for the Proxmox host, wsprsonde for a
+                ###      sonde)
+                ### ⚠ (1) applies to the STATION's account only -- never to the
+                ### Proxmox host, whose login is root.
+                default_user = ('wsprsonde' if svc['tier'] == 'sonde'
+                                else SSH_DEFAULT_USER.get(svc['label'],
+                                                          DEFAULT_ACCOUNT))
+                _host_login = svc['label'] in ('host SSH',)
+                user = ((not _host_login and login_acct)
+                        or svc.get('user')
+                        or default_user)
                 cmd = 'ssh -p %s %s@%s' % (svc['port'], user, link_ip)
                 b.append('<td class="svc"><a class="act ssh" href="#" title="%s" '
                          'data-port="%s" data-user="%s" '
@@ -715,6 +804,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header('Content-Type', ctype)
+        # Never cache: Safari kept showing a stale copy of the page (old CSS)
+        # across reloads and the 30 s auto-refresh (rob, 2026-10-24).
+        self.send_header('Cache-Control', 'no-store')
         self.send_header('Content-Length', str(len(page_b)))
         self.end_headers()
         self.wfile.write(page_b)

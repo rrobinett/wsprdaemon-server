@@ -1,0 +1,26 @@
+{
+    "frps_apis": [
+        [
+            "secure",
+            "http://127.0.0.1:7502/api/proxy/tcp",
+            "admin:admin"
+        ],
+        [
+            "open",
+            "http://127.0.0.1:7500/api/proxy/tcp",
+            "admin:admin"
+        ]
+    ],
+    "admin_nets": {
+        "10.3.2.1": "mesh"
+    },
+    "default_account": "wsprdaemon",
+    "gateway": "hamsci",
+    "title": "HamSCI",
+    "conf_dir": "/home/rob/rac-dashboard/conf",
+    "conf_whitelist": [
+        "rac-hamsci-master.conf.enc"
+    ],
+    "station_account": "hamsci",
+    "host_label": "hs0"
+}
