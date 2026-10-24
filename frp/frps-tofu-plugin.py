@@ -28,12 +28,24 @@ plugin.  Admission rule (TOFU):
 Registry: /home/frp/rac-tofu-registry.json  (first-come-first-served, and
 the ONLY state — no /home/<SITE> accounts).  Revoke by deleting the entry.
 
+Re-key allow list (v1.1.0): users named in /home/frp/rac-tofu-rekey-allow.txt
+(one per line, # comments) are TEST stations that get reimaged, so each image
+brings a new key.  For them a different key REPLACES the filed one instead of
+being rejected, and the change is logged.  Every other user keeps strict TOFU.
+Never list a field station: anyone could claim a listed name.  The file is
+re-read on every login.
+
+Every entry carries "updated_at" (UTC ISO, set on first claim and on re-key).
+racsync-merge-registry.py uses it so a re-key on one gateway carries to the
+other (newest wins) instead of being kept apart as a conflict.
+
 The frps token is NOT the gate (kept empty); the pubkey is.
 
-Usage:  python3 frps-tofu-plugin.py [--port 9001] [--registry PATH] [--debug]
+Usage:  python3 frps-tofu-plugin.py [--port 9001] [--registry PATH]
+                                   [--rekey-allow PATH] [--debug]
 """
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 import argparse
 import hashlib
@@ -42,12 +54,31 @@ import logging
 import os
 import tempfile
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 log = logging.getLogger("frps-tofu")
 _LOCK = threading.Lock()
 REGISTRY = "/home/frp/rac-tofu-registry.json"
+REKEY_ALLOW = "/home/frp/rac-tofu-rekey-allow.txt"
+
+
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def rekey_allowed(user):
+    """True if USER is a test station listed in the re-key allow list."""
+    try:
+        with open(REKEY_ALLOW) as f:
+            names = {ln.split("#", 1)[0].strip() for ln in f}
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        log.error("re-key allow list unreadable (%s): treating as empty", e)
+        return False
+    return user in names
 
 
 def _fp(pubkey):
@@ -138,7 +169,8 @@ class AuthHandler(BaseHTTPRequestHandler):
                 reg[user] = {"pubkey": pubkey, "fp": _fp(pubkey),
                              "site": metas.get("site", ""),
                              "dasi": metas.get("dasi", ""),
-                             "first_seen": self.headers.get("Date", ""),
+                             "first_seen": _now(),
+                             "updated_at": _now(),
                              "addr": remote}
                 try:
                     save_registry(reg)
@@ -150,6 +182,21 @@ class AuthHandler(BaseHTTPRequestHandler):
                 return self._respond(True, "")
             if entry.get("pubkey", "").strip() == pubkey:
                 log.info("ALLOW %s -- %r matches filed key", remote, user)
+                return self._respond(True, "")
+            if rekey_allowed(user):
+                old_fp = entry.get("fp")
+                entry.update({"pubkey": pubkey, "fp": _fp(pubkey),
+                              "site": metas.get("site", entry.get("site", "")),
+                              "dasi": metas.get("dasi", entry.get("dasi", "")),
+                              "updated_at": _now(), "rekeyed_from": old_fp,
+                              "addr": remote})
+                try:
+                    save_registry(reg)
+                except Exception as e:
+                    log.error("cannot persist registry: %s", e)
+                    return self._respond(False, "server registry error")
+                log.warning("ALLOW %s -- %r RE-KEYED (on the re-key allow list): "
+                            "fp %s -> %s", remote, user, old_fp, _fp(pubkey))
                 return self._respond(True, "")
             log.warning("DENY %s -- %r already claimed by a DIFFERENT key "
                         "(filed fp=%s, presented fp=%s)",
@@ -170,13 +217,15 @@ class AuthHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global REGISTRY
+    global REGISTRY, REKEY_ALLOW
     ap = argparse.ArgumentParser(description=f"frps TOFU auth plugin v{VERSION}")
     ap.add_argument("--port", type=int, default=9001)
     ap.add_argument("--registry", default=REGISTRY)
+    ap.add_argument("--rekey-allow", default=REKEY_ALLOW)
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
     REGISTRY = args.registry
+    REKEY_ALLOW = args.rekey_allow
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
