@@ -1,0 +1,12 @@
+[Unit]
+Description=frps TOFU auth plugin (account-less, pubkey-in-metadata)
+After=network.target
+Before=frps-secure.service
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /home/frp/frps-tofu-plugin.py --port 9001
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
