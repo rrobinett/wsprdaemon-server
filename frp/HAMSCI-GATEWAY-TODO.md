@@ -2,6 +2,15 @@
 
 Note recorded 2026-10-24 (Rob). **None of this work has been started.**
 
+> **Update, same day:** the authoritative plan is in the private repo
+> `HamSCI/hamsci-remote-admin`, `docs/vpn/redundancy-plan.md`. There, hs0 is
+> **vpn1** (`vpn1.hamsci.org`, 23.92.20.151, Newark) and **vpn2 already exists**
+> (`vpn2.hamsci.org`, 172.238.180.229, Chicago). It was built 2026-10-01 to a
+> hardened baseline only, with frps installed but no configuration. The PI's
+> decision is to make vpn2 a hot spare mirroring vpn1 now, failing over by
+> moving `vpn.hamsci.org` to it, and to build dual tunnels with Let's Encrypt
+> later. Changes to those servers are recorded through PRs to that repo.
+
 ## The goal
 
 HamSCI Sigmond clients should get the same remote-access setup that WsprDaemon
@@ -10,7 +19,7 @@ clients have today. Today the HamSCI side has one gateway; WsprDaemon has two.
 | | WsprDaemon | HamSCI today | HamSCI target |
 |---|---|---|---|
 | Gateway 1 | gw2 | hs0 (`vpn.hamsci.org`, 10.3.2.1) | hs0, renamed HamSCI VPN1 |
-| Gateway 2 | gw1 (standby, state synced from gw2) | **none** | HamSCI VPN2: a second Linode, **not created yet** |
+| Gateway 2 | gw1 (standby, state synced from gw2) | vpn2: built to baseline, carries nothing | vpn2 |
 | Clients connected to | both gateways at once (`wd-remote-access@gw1` + `@gw2`) | hs0 only | both VPN1 and VPN2 at once |
 | Enrollment | TOFU on the open tier, then the secure tier | hand-configured (DASI number gives RAC 220+N) | TOFU on the open tier, then automatic switch to secure |
 
