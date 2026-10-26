@@ -161,6 +161,29 @@ def destination_ssh_opts(destination: Dict) -> List[str]:
     return opts
 
 
+def confined_rsync_flags(destination: Dict) -> List[str]:
+    """Extra rsync flags for a destination whose directory we do not own.
+
+    ⛔ `-a` INCLUDES `-p`, AND `-p` RESTAMPS THE DESTINATION DIRECTORY.
+    Measured 2026-10-26: delivering into a drop directory the receiving
+    administrator had set 2775 (setgid, group-writable, so their own ingest
+    service could delete what landed) left it 755 owned by the sending
+    account.  The ingest service then could not remove a single file, and
+    nothing logged an error -- the tars simply accumulated.
+
+    A confined destination's directory belongs to the RECEIVING side.  The
+    sender's job is to put a file there with its mtime intact and touch
+    nothing else, so perms, owner and group are all dropped.
+
+    ⚠ `-t` (times) STAYS.  The mtime is the arrival timestamp the receiving
+    server derives station liveness from; dropping it would silently restamp
+    every delivery with the relay's clock.
+    """
+    if destination_has_shell(destination):
+        return []
+    return ['--no-perms', '--no-owner', '--no-group', '--omit-dir-times']
+
+
 def destination_has_shell(destination: Dict) -> bool:
     """Can we run an arbitrary command on this destination?
 
@@ -944,7 +967,8 @@ class RsyncWorker(threading.Thread):
         ssh_e = 'ssh ' + ' '.join(destination_ssh_opts(
             {**self.destination, 'ssh_key': ssh_key}))
         rsync_cmd = [
-            'rsync', '-a', '-e', ssh_e,
+            'rsync', '-a', *confined_rsync_flags(self.destination),
+            '-e', ssh_e,
             '--remove-source-files', f'--bwlimit={self.config["rsync_bandwidth_limit"]}',
             f'--timeout={self.config["rsync_timeout"]}', '--exclude', '.*',
             str(self.queue_dir) + '/',

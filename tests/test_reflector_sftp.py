@@ -281,3 +281,33 @@ def test_an_rsync_destination_never_takes_the_sftp_path():
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
+
+
+# ---------- the sender must not restamp the receiver's directory ----------
+
+def test_a_confined_destination_does_not_restamp_the_remote_directory():
+    """⛔ `-a` includes `-p`, and `-p` restamps the DESTINATION DIRECTORY.
+    Measured 2026-10-26: delivering into a drop dir the receiving admin had
+    set 2775 (setgid + group-write, so their ingest service could delete what
+    landed) left it 755 owned by the sending account.  The ingest service
+    then could not remove a single file and nothing logged an error — the
+    tars just accumulated.  A confined destination's directory belongs to the
+    receiving side."""
+    flags = rf.confined_rsync_flags(CONFINED_DEST)
+    assert '--no-perms' in flags
+    assert '--no-owner' in flags and '--no-group' in flags
+
+
+def test_those_flags_never_drop_times():
+    """⚠ `-t` is the arrival timestamp the receiving server derives station
+    liveness from.  Dropping it would silently restamp every delivery with
+    the relay's clock."""
+    flags = rf.confined_rsync_flags(CONFINED_DEST)
+    assert '--no-times' not in flags
+    assert '-t' not in [f for f in flags if f.startswith('-') and len(f) == 2]
+
+
+def test_an_ordinary_destination_keeps_plain_archive_semantics():
+    """Mutation guard: existing deployments own their destination dirs and
+    must keep full -a behaviour."""
+    assert rf.confined_rsync_flags(RSYNC_DEST) == []
