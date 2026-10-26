@@ -119,16 +119,16 @@ def log(message: str, level: str = "INFO"):
 # A reflector's destinations have always been hosts we hold a SHELL on, so
 # `rsync -a --remove-source-files` was the only transport it needed.
 #
-# Chaining one reflector into another breaks that assumption.  A HamSCI
-# gateway (vpn1/vpn2) forwarding to a WsprDaemon gateway (gw1/gw2) arrives as
-# an ORDINARY UPLOAD ACCOUNT -- the same `sftponly` class all 92 stations use,
-# with `ForceCommand internal-sftp`, `ChrootDirectory /home/%u` and
-# `AllowTcpForwarding no`.  rsync CANNOT run there: it needs to exec a remote
-# rsync binary, and internal-sftp never gives it a shell to do that in.
+# Chaining one reflector into another breaks that assumption.  One gateway
+# forwarding into another arrives as an ORDINARY UPLOAD ACCOUNT -- the same
+# chrooted `sftponly` class every station uses, with `ForceCommand
+# internal-sftp`, `ChrootDirectory /home/%u` and `AllowTcpForwarding no`.
+# rsync CANNOT run there: it needs to exec a remote rsync binary, and
+# internal-sftp never gives it a shell to do that in.
 #
 # Using the station account class rather than inventing a privileged one is
-# the point.  It adds no new trust: vpn1 can write into its own chroot on gw1
-# and do nothing else, exactly like a station.
+# the point.  It adds no new trust: the relay writes into its own chroot and
+# can do nothing else, exactly like a station.
 #
 # `transport: "sftp"` on a destination selects this path.  Omitted, a
 # destination behaves exactly as it always has, so every existing
@@ -141,6 +141,54 @@ def destination_transport(destination: Dict) -> str:
     return (destination.get('transport') or TRANSPORT_RSYNC).strip().lower()
 
 
+def destination_ssh_opts(destination: Dict) -> List[str]:
+    """The ssh options every transport shares for this destination.
+
+    ⛔ A NON-DEFAULT PORT IS NOT OPTIONAL HERE.  A WsprDaemon server is not
+    reachable on 22 from outside its own network.  Without `port`, every
+    destination silently dials 22 and every delivery times out -- and a
+    timeout reads as "the destination is down" rather than "we called the
+    wrong number".  Which host answers on which port is deployment detail
+    and belongs in the operator's config file, not here: this repo is public.
+    """
+    opts = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new']
+    port = destination.get('port')
+    if port:
+        opts += ['-p', str(port)]
+    key = destination.get('ssh_key')
+    if key:
+        opts += ['-i', str(key)]
+    return opts
+
+
+def destination_has_shell(destination: Dict) -> bool:
+    """Can we run an arbitrary command on this destination?
+
+    ⛔ TWO STARTUP CHECKS ASSUME A SHELL, AND BOTH MISFIRE WITHOUT ONE.
+    verify_destination_rsync() runs `ssh HOST 'which rsync'` and DISABLES the
+    destination when that fails; check_remote_free_space() runs `df` and
+    returns None, which the caller treats as a timed-out check and skips the
+    sync over.  Against a confined account both fail for reasons that have
+    nothing to do with the destination's health, so a perfectly good
+    destination either never starts or never receives a file while the log
+    blames rsync or disk space.
+
+    Two kinds of destination have no shell:
+
+      * `transport: "sftp"` — a chrooted `ForceCommand internal-sftp`
+        station-upload account.
+      * `confined: true` — an account whose authorized_keys pins
+        `command="rrsync -wo <DIR>",restrict`.  rsync still works there,
+        because rrsync IS rsync with a fixed root and write-only
+        enforcement; nothing else does.  That is how one administrative
+        domain delivers into another without being able to read a byte back
+        out -- the property that lets the two stay separated.
+    """
+    if destination_transport(destination) == TRANSPORT_SFTP:
+        return False
+    return not bool(destination.get('confined'))
+
+
 def sftp_batch(files: List[Path], remote_path: str) -> bytes:
     """The sftp batch that delivers ``files`` into ``remote_path``.
 
@@ -149,7 +197,7 @@ def sftp_batch(files: List[Path], remote_path: str) -> bytes:
     name is a tar it can hard-link and forward half-complete.  The rename is
     atomic within the directory, so the final name never exists in a partial
     state.  (This is the same `.part` + rename hs-uploader uses when a
-    station delivers to gw1.)
+    station delivers to a gateway.)
 
     ⛔ `put -P`, NOT `put`.  -P preserves the MTIME, and the mtime is
     load-bearing all the way down this chain: station.heartbeat's
@@ -169,7 +217,8 @@ def sftp_batch(files: List[Path], remote_path: str) -> bytes:
 def verify_destination_rsync(destination: Dict) -> bool:
     name, user, host = destination['name'], destination['user'], destination['host']
     ssh_key = destination.get('ssh_key', '/home/wsprdaemon/.ssh/id_rsa')
-    ssh_base = f"ssh -i {ssh_key} -o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{host}"
+    _opts = ' '.join(destination_ssh_opts({**destination, 'ssh_key': ssh_key}))
+    ssh_base = f"ssh {_opts} -o ConnectTimeout=10 {user}@{host}"
     
     log(f"Checking rsync on {name} ({host})...", "INFO")
     try:
@@ -207,9 +256,10 @@ def verify_all_destinations(config: Dict) -> List[Dict]:
         # nothing to probe and nothing to install.  Probing it would run
         # `ssh ... which rsync`, get "This service allows sftp connections
         # only", and DISABLE a destination that works perfectly.
-        if destination_transport(dest) == TRANSPORT_SFTP:
-            log(f"{dest['name']}: sftp destination — no rsync check "
-                f"(the account is chrooted internal-sftp)", "INFO")
+        if not destination_has_shell(dest):
+            log(f"{dest['name']}: no shell on this destination — skipping the "
+                f"rsync probe (transport={destination_transport(dest)}"
+                f"{', confined' if dest.get('confined') else ''})", "INFO")
             valid.append(dest)
             continue
         if verify_destination_rsync(dest):
@@ -222,17 +272,18 @@ def verify_all_destinations(config: Dict) -> List[Dict]:
 def check_remote_free_space(destination: Dict, path: str, min_percent: int = 25) -> Optional[float]:
     """Check free space on remote server. Returns free percentage or None on error/timeout."""
     name, user, host = destination['name'], destination['user'], destination['host']
-    # ⚠ NOT MEASURABLE OVER SFTP, and "unknown" must not read as "full".
-    # `df` needs a shell, which a chrooted internal-sftp account does not
-    # have.  Returning None here would make the caller skip the sync as if
+    # ⚠ NOT MEASURABLE WITHOUT A SHELL, and "unknown" must not read as "full".
+    # `df` needs a shell, which neither a chrooted internal-sftp account nor
+    # an rrsync-confined one has.  Returning None here would make the caller skip the sync as if
     # the check had TIMED OUT -- it counts consecutive failures and warns
     # about space -- so a perfectly healthy sftp destination would never
     # receive a file, while the log blamed disk space.  Report full instead:
     # the receiving gateway runs its own space guard on the way out.
-    if destination_transport(destination) == TRANSPORT_SFTP:
+    if not destination_has_shell(destination):
         return 100.0
     ssh_key = destination.get('ssh_key', '/home/wsprdaemon/.ssh/id_rsa')
-    ssh_base = f"ssh -i {ssh_key} -o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{host}"
+    _opts = ' '.join(destination_ssh_opts({**destination, 'ssh_key': ssh_key}))
+    ssh_base = f"ssh {_opts} -o ConnectTimeout=10 {user}@{host}"
     
     try:
         result = subprocess.run(
@@ -890,8 +941,10 @@ class RsyncWorker(threading.Thread):
             self._sync_over_sftp(ssh_key)
             return
 
+        ssh_e = 'ssh ' + ' '.join(destination_ssh_opts(
+            {**self.destination, 'ssh_key': ssh_key}))
         rsync_cmd = [
-            'rsync', '-a', '-e', f'ssh -i {ssh_key} -o StrictHostKeyChecking=no',
+            'rsync', '-a', '-e', ssh_e,
             '--remove-source-files', f'--bwlimit={self.config["rsync_bandwidth_limit"]}',
             f'--timeout={self.config["rsync_timeout"]}', '--exclude', '.*',
             str(self.queue_dir) + '/',
@@ -915,8 +968,7 @@ class RsyncWorker(threading.Thread):
         """Deliver the queue to a chrooted upload account by sftp.
 
         Used when this reflector forwards to ANOTHER gateway's station-upload
-        account -- vpn1/vpn2 -> gw1/gw2 -- where there is no shell and so no
-        rsync.  See the transport notes above sftp_batch().
+        account, where there is no shell and so no rsync.  See the transport notes above sftp_batch().
 
         ⛔ DELETE ONLY WHAT SFTP CONFIRMED IT MOVED, AND ONLY AFTER IT DID.
         rsync's --remove-source-files has the same contract and it is the
@@ -936,8 +988,6 @@ class RsyncWorker(threading.Thread):
         batch = sftp_batch(files, self.destination['path'])
         cmd = [
             'sftp', '-b', '-',
-            '-o', 'BatchMode=yes',
-            '-o', 'StrictHostKeyChecking=accept-new',
             '-o', 'ConnectTimeout=10',
             # One connection for the whole queue, reused across passes: this
             # relay ships on the same 5-10 s loop the gateway scans on, and a
@@ -947,7 +997,7 @@ class RsyncWorker(threading.Thread):
             '-o', 'ControlPersist=10m',
             '-o', 'ServerAliveInterval=30',
             '-o', 'ServerAliveCountMax=3',
-            '-i', ssh_key,
+        ] + destination_ssh_opts({**self.destination, 'ssh_key': ssh_key}) + [
             f"{self.destination['user']}@{self.destination['host']}",
         ]
         try:

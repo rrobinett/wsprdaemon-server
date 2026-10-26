@@ -2,14 +2,14 @@
 
 Why this transport exists.  A reflector's destinations have always been hosts
 we hold a shell on, so `rsync -a --remove-source-files` was all it needed.
-Chaining one reflector into another breaks that: vpn1/vpn2 forwarding to
-gw1/gw2 arrive as an ORDINARY UPLOAD ACCOUNT — the `sftponly` class all 92
-stations use, with `ForceCommand internal-sftp`, `ChrootDirectory /home/%u`
-and `AllowTcpForwarding no`.  rsync cannot run there; it needs to exec a
-remote rsync binary and internal-sftp never gives it a shell.
+Chaining one reflector into another breaks that: it arrives as an ORDINARY
+UPLOAD ACCOUNT — the chrooted `sftponly` class every station uses, with
+`ForceCommand internal-sftp` and `AllowTcpForwarding no`.  rsync cannot run
+there; it needs to exec a remote rsync binary and internal-sftp never gives
+it a shell.
 
 Using the station account class rather than inventing a privileged one is the
-point: vpn1 can write into its own chroot on gw1 and do nothing else.
+point: the relay writes into its own chroot and can do nothing else.
 
 Four things must hold, and each one has cost somebody data somewhere:
 
@@ -41,16 +41,16 @@ sys.path.insert(0, str(HERE.parent))
 import wsprdaemon_reflector as rf  # noqa: E402
 
 
-SFTP_DEST = {'name': 'GW1', 'user': 'VPN1_REFLECTOR', 'host': 'gw1.wsprdaemon.org',
+SFTP_DEST = {'name': 'RELAY', 'user': 'relay', 'host': 'relay.example.org',
              'path': 'uploads', 'transport': 'sftp'}
-RSYNC_DEST = {'name': 'WD10', 'user': 'wsprdaemon', 'host': 'WD10',
-              'path': '/var/spool/wsprdaemon/from-gw2'}
+RSYNC_DEST = {'name': 'PEER', 'user': 'wsprdaemon', 'host': 'peer.example.org',
+              'path': '/var/spool/wsprdaemon/incoming'}
 
 
 # ---------- which transport ----------
 
 def test_a_destination_with_no_transport_is_rsync_as_it_always_was():
-    """⛔ Every existing reflector_destinations.json on gw1 and gw2 omits
+    """⛔ Every reflector_destinations.json already deployed omits
     this key.  If the default ever moved, both production gateways would
     stop forwarding to the WD servers."""
     assert rf.destination_transport(RSYNC_DEST) == rf.TRANSPORT_RSYNC
@@ -116,6 +116,73 @@ def test_space_on_an_sftp_destination_reads_full_not_unknown():
         free = rf.check_remote_free_space(SFTP_DEST, 'uploads')
     run.assert_not_called()
     assert free == 100.0
+
+
+# ---------- rrsync-confined destinations ----------
+
+CONFINED_DEST = {'name': 'TARGET', 'user': 'relay', 'host': 'target.example.org',
+                 'path': '.', 'confined': True, 'ssh_key': '/etc/example/id_ed25519'}
+
+
+def test_a_confined_destination_still_uses_rsync():
+    """rrsync IS rsync, with a fixed root and write-only enforcement.  The
+    transport does not change; only our ability to run anything else does."""
+    assert rf.destination_transport(CONFINED_DEST) == rf.TRANSPORT_RSYNC
+    assert rf.destination_has_shell(CONFINED_DEST) is False
+
+
+def test_an_ordinary_rsync_destination_still_has_a_shell():
+    """⛔ Mutation guard.  An ordinary destination has a full shell and both
+    checks must keep running there — losing them would hide a destination
+    that genuinely lacks rsync or is full."""
+    assert rf.destination_has_shell(RSYNC_DEST) is True
+
+
+def test_a_confined_destination_is_not_probed_for_rsync():
+    """⛔ `ssh HOST 'which rsync'` against an authorized_keys pinned to
+    `command="rrsync -wo ~/uploads"` runs RRSYNC, not which, and fails — so
+    the probe would DISABLE a destination that works perfectly."""
+    with mock.patch.object(rf, 'verify_destination_rsync') as probe:
+        valid = rf.verify_all_destinations({'destinations': [CONFINED_DEST]})
+    probe.assert_not_called()
+    assert valid == [CONFINED_DEST]
+
+
+def test_space_on_a_confined_destination_reads_full_not_unknown():
+    with mock.patch.object(rf.subprocess, 'run') as run:
+        free = rf.check_remote_free_space(CONFINED_DEST, 'uploads')
+    run.assert_not_called()
+    assert free == 100.0
+
+
+# ---------- the ssh options (port is load-bearing) ----------
+
+def test_a_non_default_port_reaches_every_transport():
+    """⛔ A destination outside its own network is not necessarily reachable
+    on 22.  Without the port every delivery dials 22 and times out, and a
+    timeout reads as "the destination is down" rather than "we called the
+    wrong number"."""
+    opts = rf.destination_ssh_opts({'port': 2022, 'ssh_key': '/k'})
+    assert '-p' in opts and '2022' in opts
+    assert '-i' in opts and '/k' in opts
+
+
+def test_no_port_means_no_p_flag_so_ssh_uses_its_default():
+    """Mutation guard: existing deployed configs declare no port and must
+    keep reaching their destinations on ssh's default."""
+    opts = rf.destination_ssh_opts({'ssh_key': '/k'})
+    assert '-p' not in opts
+
+
+def test_the_port_reaches_the_sftp_argv_too():
+    with tempfile.TemporaryDirectory() as tmp:
+        q = _queue(tmp, names=('a.tbz',))
+        dest = {**SFTP_DEST, 'port': 2222}
+        with mock.patch.object(rf.subprocess, 'run') as run:
+            run.return_value = subprocess.CompletedProcess([], 0, b'', b'')
+            _Worker(q, dest=dest)._sync_over_sftp('/key')
+        cmd = run.call_args.args[0]
+        assert '-p' in cmd and '2222' in cmd
 
 
 # ---------- delivery ----------
@@ -196,11 +263,11 @@ def test_the_sftp_argv_names_the_account_the_key_and_a_per_host_socket():
             _Worker(q)._sync_over_sftp('/home/wsprdaemon/.ssh/id_rsa')
         cmd = run.call_args.args[0]
         assert cmd[:3] == ['sftp', '-b', '-']
-        assert cmd[-1] == 'VPN1_REFLECTOR@gw1.wsprdaemon.org'
+        assert cmd[-1] == 'relay@relay.example.org'
         assert '/home/wsprdaemon/.ssh/id_rsa' in cmd
         path = [v for f, v in zip(cmd, cmd[1:]) if v.startswith('ControlPath=')]
         assert path and '%h' in path[0], \
-            "the socket must vary per host, or the gw1 master serves gw2"
+            "the socket must vary per host, or one host's master serves another"
 
 
 def test_an_rsync_destination_never_takes_the_sftp_path():
