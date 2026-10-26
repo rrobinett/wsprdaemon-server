@@ -6,6 +6,7 @@ Usage: wsprdaemon_server.py --clickhouse-user <user> --clickhouse-password <pass
 
 import io
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -26,7 +27,7 @@ import clickhouse_driver        # native TCP client — used for the hot insert 
 import logging
 
 # Version
-VERSION = "2.27.0"  # psk.spots ingestion path (FT8/FT4/...); gated by WSPRDAEMON_INGEST_PSK=1
+VERSION = "2.28.0"  # station.heartbeat ingestion (status/); gated by WSPRDAEMON_INGEST_STATUS=1
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -46,6 +47,15 @@ DEFAULT_CONFIG = {
     'psk_modes': ['ft8', 'ft4', 'msk144'],   # peer subdirs scanned at tar root
     'max_psk_per_insert': 50000,
     'batch_flush_psk': 50000,
+    # station.heartbeat ingestion (status/ peer subdir): off by default
+    # during rollout, exactly as psk ingestion was.
+    # Flip via env WSPRDAEMON_INGEST_STATUS=1 or --ingest-status.
+    'ingest_status': False,
+    'clickhouse_status_database': 'station',
+    'clickhouse_status_table': 'heartbeat',
+    'status_subdir': 'status',
+    'max_status_per_insert': 50000,
+    'batch_flush_status': 5000,
     'incoming_tbz_dirs': [],  # Must be specified via --incoming-dirs
     'extraction_dir': '/tmp/wsprdaemon/extraction',
     'processed_tbz_file': '/var/lib/wsprdaemon/wsprdaemon/processed_tbz_list.txt',
@@ -375,6 +385,9 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
         if config.get('ingest_psk'):
             setup_psk_tables(admin_client, config)
 
+        if config.get('ingest_status'):
+            setup_status_tables(admin_client, config)
+
         return True
 
     except Exception as e:
@@ -464,6 +477,79 @@ def mark_tbz_processed(tbz_file: Path, processed_file: Path, max_size: int):
 # ---------------------------------------------------------------------------
 # psk.spots ingestion (Phase 2 PR 1)
 # ---------------------------------------------------------------------------
+
+def setup_status_tables(admin_client, config: Dict) -> None:
+    """Ensure `station.heartbeat` exists (idempotent).
+
+    Schema mirrors schema/station.heartbeat.sql, kept inline for the same
+    reason setup_psk_tables is: a fresh wd{10,20,30} must self-bootstrap
+    without an out-of-band SQL apply step.
+    """
+    db = config['clickhouse_status_database']
+    table = config['clickhouse_status_table']
+
+    result = admin_client.query(
+        f"SELECT 1 FROM system.databases WHERE name = '{db}'")
+    if not result.result_rows:
+        log(f"Creating database {db}...", "INFO")
+        admin_client.command(f"CREATE DATABASE {db}")
+
+    admin_client.command(f"""
+    CREATE TABLE IF NOT EXISTS {db}.{table}
+    (
+        `received_at`    DateTime               CODEC(Delta(4), ZSTD(3)),
+        `ingested_at`    DateTime DEFAULT now() CODEC(Delta(4), ZSTD(3)),
+        `station`        LowCardinality(String) CODEC(ZSTD(3)),
+        `host_id`        LowCardinality(String) CODEC(ZSTD(3)),
+        `role`           LowCardinality(String) CODEC(ZSTD(3)),
+        `gateway`        LowCardinality(String) CODEC(ZSTD(3)),
+        `callsign`       LowCardinality(String) CODEC(ZSTD(3)),
+        `grid`           LowCardinality(String) CODEC(ZSTD(3)),
+        `emitted_at`     DateTime               CODEC(Delta(4), ZSTD(3)),
+        `interval_sec`   UInt16                 CODEC(ZSTD(3)),
+        `schema_version` UInt16                 CODEC(ZSTD(3)),
+        `rollup_verdict` LowCardinality(String) CODEC(ZSTD(3)),
+        `rollup_block`   LowCardinality(String) CODEC(ZSTD(3)),
+        `rollup_reason`  String                 CODEC(ZSTD(3)),
+        `verdict`        Map(LowCardinality(String), LowCardinality(String)),
+        `reason`         Map(LowCardinality(String), String),
+        `envelope_sha`   FixedString(64)        CODEC(ZSTD(3)),
+        `payload`        String                 CODEC(ZSTD(3))
+    )
+    ENGINE = ReplacingMergeTree(ingested_at)
+    PARTITION BY toYYYYMM(received_at)
+    ORDER BY (station, emitted_at, envelope_sha)
+    TTL received_at + INTERVAL 13 MONTH
+    """)
+    log(f"Table {db}.{table} ready", "INFO")
+
+
+def insert_status_rows(client, rows: List[Dict], database: str, table: str,
+                       max_per_insert: int = 50000) -> bool:
+    """Insert station.heartbeat rows in batches.
+
+    Mirrors insert_psk_spots. status_row() has already coerced every field,
+    so there is no per-record conversion step and nothing to quarantine.
+    """
+    if not rows:
+        return True
+    try:
+        column_names = list(rows[0].keys())
+        cols_sql = ','.join(column_names)
+        sql = f"INSERT INTO {database}.{table} ({cols_sql}) VALUES"
+        for i in range(0, len(rows), max_per_insert):
+            batch = rows[i:i + max_per_insert]
+            client.execute(sql, [tuple(r[c] for c in column_names)
+                                 for r in batch])
+            log(f"Inserted status batch {i // max_per_insert + 1} "
+                f"({len(batch)} rows)", "DEBUG")
+        return True
+    except Exception as e:
+        log(f"Error inserting status rows: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return False
+
 
 def setup_psk_tables(admin_client, config: Dict) -> None:
     """Ensure the `psk` database and `psk.spots` table exist (idempotent).
@@ -630,6 +716,207 @@ def process_mode_files(extraction_dir: Path, mode: str,
             log(f"Error reading {spot_file}: {e}", "WARNING")
 
     log(f"Processed {len(rows)} {mode} rows", "DEBUG")
+    return rows
+
+
+# ---------- station.heartbeat ingestion (status/ subdir) ----------
+#
+# sigmond/tasks/plan-status-via-uploader.md Phase 1.  Status envelopes ride
+# the SAME .tbz as spots, as a peer subdir at the tar root, exactly as the
+# psk modes do:
+#
+#     <tar root>/status/<ROLE>/<HOST_ID>/<YYYYMMDDTHHMMSSZ>.jsonl
+#
+# one envelope per line.  Wire contract:
+# sigmond/lib/sigmond/heartbeat_schema.py (kind "station_heartbeat",
+# schema_version 1).  Gated off by default, like psk ingestion:
+# --ingest-status or WSPRDAEMON_INGEST_STATUS=1.
+
+STATUS_KIND = "station_heartbeat"
+STATUS_ROLES = ("vm", "pm")
+# Four states, from heartbeat_schema.VERDICTS.  Neither INCONCLUSIVE nor
+# INDETERMINATE may ever render as healthy, which is why a two-state verdict
+# was rejected there and why they are carried through verbatim here.
+STATUS_VERDICTS = ("VALID", "INVALID", "INCONCLUSIVE", "INDETERMINATE")
+
+
+def status_gateway_from_dir(incoming_dir) -> str:
+    """'gw1' from .../from-gw1, '' when the directory does not say.
+
+    The gateway is a property of WHERE the tar landed, not of anything the
+    station claims, so it is read from the spool path and never from the
+    envelope.
+    """
+    name = Path(incoming_dir).name
+    m = re.match(r'^from-(.+)$', name)
+    return m.group(1) if m else ''
+
+
+def _status_dt(value) -> Optional[datetime]:
+    """An envelope timestamp as a naive UTC datetime, or None.
+
+    Accepts ISO 8601 with or without a trailing Z, an epoch number, or a
+    datetime.  None (rather than a raise) because a bad `emitted_at` is
+    forensic detail: it must not cost us the row, whose availability signal
+    is the tar's mtime and is unaffected.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return (value.astimezone(timezone.utc).replace(tzinfo=None)
+                if value.tzinfo else value)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.utcfromtimestamp(float(value))
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        txt = value.strip().replace('Z', '+00:00')
+        try:
+            parsed = datetime.fromisoformat(txt)
+        except ValueError:
+            return None
+        return (parsed.astimezone(timezone.utc).replace(tzinfo=None)
+                if parsed.tzinfo else parsed)
+    return None
+
+
+def status_row(envelope: Dict, *, role: str, host_id: str,
+               received_at: datetime, gateway: str) -> Optional[Dict]:
+    """One station.heartbeat row from one envelope, or None if it is not one.
+
+    ⛔ `role` AND `host_id` COME FROM THE TAR PATH, NEVER FROM THE BLOCKS.
+    Inferring "pm" from the presence of a `rac` block would misfile every
+    Proxmox host that carries no RAC switch script — pm-heartbeat.py leaves
+    `rac` out on exactly those hosts, so the inference fails for the hosts
+    least likely to be noticed.
+
+    ⛔ `received_at` IS THE TAR'S MTIME.  Availability comes from arrival; a
+    station that has stopped cannot report that it stopped.  `emitted_at` is
+    stored for forensics and must never decide liveness.
+
+    An envelope that is not a station_heartbeat, or carries no station name,
+    is rejected: those are the two fields the row is keyed on, and a row
+    keyed on a guess is worse than no row.  Everything else is permitted to
+    be missing — ADDITIVE FIELDS ARE ALLOWED AT EVERY DEPTH (validate()'s
+    rule), so a station one release ahead of this server is never dropped for
+    carrying a field we have not learned about yet.
+    """
+    if not isinstance(envelope, dict):
+        return None
+    if envelope.get('kind') != STATUS_KIND:
+        return None
+    station = envelope.get('station')
+    if not isinstance(station, str) or not station.strip():
+        return None
+
+    rollup = envelope.get('rollup')
+    rollup = rollup if isinstance(rollup, dict) else {}
+    blocks = envelope.get('blocks')
+    blocks = blocks if isinstance(blocks, dict) else {}
+
+    verdicts, reasons = {}, {}
+    for name in sorted(blocks):
+        block = blocks[name]
+        if not isinstance(block, dict):
+            continue
+        verdicts[name] = str(block.get('verdict') or '')
+        reasons[name] = str(block.get('reason') or '')
+
+    # The envelope verbatim, with its own key order, so the sha is stable
+    # across re-serialisation and the stored payload IS the evidence.
+    payload = json.dumps(envelope, sort_keys=True, separators=(',', ':'))
+    emitted = _status_dt(envelope.get('emitted_at'))
+
+    try:
+        interval = int(envelope.get('interval_sec') or 0)
+    except (TypeError, ValueError):
+        interval = 0
+    try:
+        schema_version = int(envelope.get('schema_version') or 0)
+    except (TypeError, ValueError):
+        schema_version = 0
+
+    return {
+        'received_at': received_at,
+        'station': station.strip(),
+        'host_id': host_id or '',
+        'role': role or '',
+        'gateway': gateway or '',
+        'callsign': str(envelope.get('callsign') or ''),
+        'grid': str(envelope.get('grid') or ''),
+        # A missing or unparseable emitted_at stores the epoch rather than
+        # losing the row: it is forensic, and the ORDER BY still separates
+        # rows by envelope_sha.
+        'emitted_at': emitted or datetime(1970, 1, 1),
+        'interval_sec': max(0, min(interval, 65535)),
+        'schema_version': max(0, min(schema_version, 65535)),
+        'rollup_verdict': str(rollup.get('verdict') or ''),
+        'rollup_block': str(rollup.get('block') or ''),
+        'rollup_reason': str(rollup.get('reason') or ''),
+        'verdict': verdicts,
+        'reason': reasons,
+        'envelope_sha': hashlib.sha256(payload.encode()).hexdigest(),
+        'payload': payload,
+    }
+
+
+def process_status_files(extraction_dir: Path, status_subdir: str,
+                         received_at: datetime, gateway: str) -> List[Dict]:
+    """Scan `<extraction_dir>/<status_subdir>/<ROLE>/<HOST_ID>/*.jsonl`.
+
+    Mirrors process_mode_files(): path-derived identity, one row per JSONL
+    line, every error contained to the smallest unit so one bad line cannot
+    cost a file and one bad file cannot cost a tar.  A tar whose spots are
+    good must not be rejected because its status was malformed — status is
+    the passenger here, not the cargo.
+    """
+    rows: List[Dict] = []
+    root = extraction_dir / status_subdir
+    if not root.exists():
+        return rows
+
+    files = sorted(root.rglob('*.jsonl'))
+    if not files:
+        return rows
+    log(f"Processing {len(files)} status files", "DEBUG")
+
+    for path in files:
+        rel = path.relative_to(root).parts
+        if len(rel) < 3:
+            log(f"Skipping status file with unexpected path depth: {path}",
+                "WARNING")
+            continue
+        role, host_id = rel[0], rel[1]
+        if role not in STATUS_ROLES:
+            # Not fatal, and not silent: a new role is a schema decision on
+            # both sides, and a typo here would otherwise file a whole host
+            # under a role nothing queries.
+            log(f"Unknown status role {role!r} in {path} — storing it as sent",
+                "WARNING")
+        try:
+            with open(path, 'r') as fh:
+                for line_num, line in enumerate(fh, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        envelope = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        log(f"Skipping bad status line {line_num} in "
+                            f"{path.name}: {exc}", "WARNING")
+                        continue
+                    row = status_row(envelope, role=role, host_id=host_id,
+                                     received_at=received_at, gateway=gateway)
+                    if row is None:
+                        log(f"Skipping non-heartbeat line {line_num} in "
+                            f"{path.name}", "WARNING")
+                        continue
+                    rows.append(row)
+        except Exception as exc:
+            log(f"Error reading {path}: {exc}", "WARNING")
+
+    log(f"Processed {len(rows)} status rows", "DEBUG")
     return rows
 
 
@@ -1473,19 +1760,36 @@ def maybe_provision_sftp(worker_dir) -> None:
             log(f"Error provisioning {username} on {gw}: {exc}", "WARNING")
 
 def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path,
-                          psk_modes: Optional[List[str]] = None) -> Optional[Tuple]:
+                          psk_modes: Optional[List[str]] = None,
+                          status_subdir: Optional[str] = None) -> Optional[Tuple]:
     """Read tbz file into RAM then extract and parse in a private temp directory.
 
     Reading the file content in one shot minimises disk seeks — one sequential
     read per file instead of multiple random seeks during tarfile streaming.
-    Returns (tbz_file, spots, noise_records, psk_rows) on success, None on failure.
+    Returns (tbz_file, spots, noise_records, psk_rows, status_rows) on
+    success, None on failure.
 
     `psk_modes` is the list of peer-named modulation subdirs to scan at the
     tar root (`ft8`, `ft4`, `msk144`, …). Empty/None disables psk ingestion
     for this tbz; non-empty enables it and `routing.json` is consulted for
     per-receiver forwarding flags.
+
+    `status_subdir` names the peer subdir holding station.heartbeat
+    envelopes (`status`). Empty/None disables status ingestion for this tbz.
+    ⛔ The tar's MTIME is read here, before extraction, and carried into
+    every status row as `received_at`: that is the instant the station
+    finished delivering at the gateway, and it is the ONLY liveness signal
+    the board may use. Nothing inside an envelope is allowed to supply it.
     """
     worker_dir = base_extraction_dir / f"worker_{threading.get_ident()}_{tbz_file.stem}"
+    # Read the mtime BEFORE anything touches the file. The reflector
+    # hard-links (mtime preserved) and rsync -a preserves it to every WD
+    # server, so this is one server clock's reading of the gateway arrival,
+    # identical on all three boards.
+    try:
+        tbz_mtime = datetime.utcfromtimestamp(tbz_file.stat().st_mtime)
+    except OSError:
+        tbz_mtime = datetime.utcnow()
     try:
         # Read entire tbz into memory in one shot — minimises disk seek overhead
         try:
@@ -1520,7 +1824,20 @@ def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path,
             for mode in psk_modes:
                 psk_rows.extend(process_mode_files(worker_dir, mode, routing, host_id))
 
-        return (tbz_file, spots, noise_records, psk_rows)
+        status_rows: List[Dict] = []
+        if status_subdir:
+            # ⚠ Contained on purpose: status is the passenger in this tar,
+            # not the cargo. A tar whose spots parsed must never be rejected
+            # because its status did not.
+            try:
+                status_rows = process_status_files(
+                    worker_dir, status_subdir, tbz_mtime,
+                    status_gateway_from_dir(tbz_file.parent))
+            except Exception as exc:
+                log(f"Status parse failed for {tbz_file.name} "
+                    f"(spots unaffected): {exc}", "WARNING")
+
+        return (tbz_file, spots, noise_records, psk_rows, status_rows)
 
     except Exception as e:
         log(f"Error processing {tbz_file.name}: {e}", "ERROR")
@@ -1552,6 +1869,10 @@ def main():
                        help='Override default spots table name')
     parser.add_argument('--noise-table', default=None,
                        help='Override default noise table name')
+    parser.add_argument('--ingest-status', action='store_true',
+                       help='Enable station.heartbeat ingestion from the '
+                            'status/ peer subdir '
+                            '(also honors WSPRDAEMON_INGEST_STATUS=1 env var)')
     parser.add_argument('--ingest-psk', action='store_true',
                        help='Enable FT8/FT4/MSK144 ingest into psk.spots '
                             '(also honors WSPRDAEMON_INGEST_PSK=1 env var)')
@@ -1601,6 +1922,16 @@ def main():
     # psk.spots ingestion — explicit opt-in via CLI flag or env var. Off by
     # default during Phase 2 rollout so a stock wsprdaemon-server install
     # ignores any ft8/ft4 subdirs that may show up in tar files.
+    if (args.ingest_status
+            or os.environ.get('WSPRDAEMON_INGEST_STATUS', '0') == '1'):
+        config['ingest_status'] = True
+        log(f"Status ingestion ENABLED: subdir={config['status_subdir']}/ "
+            f"-> {config['clickhouse_status_database']}."
+            f"{config['clickhouse_status_table']}", "INFO")
+    else:
+        log("Status ingestion disabled (use --ingest-status or "
+            "WSPRDAEMON_INGEST_STATUS=1)", "DEBUG")
+
     if args.ingest_psk or os.environ.get('WSPRDAEMON_INGEST_PSK', '0') == '1':
         config['ingest_psk'] = True
         log(f"PSK ingestion ENABLED: modes={config['psk_modes']} "
@@ -1726,21 +2057,26 @@ def main():
             pending_spots = []
             pending_noise = []
             pending_psk   = []
+            pending_status = []
             pending_tbz   = []
             last_flush    = time.time()
 
             def do_flush():
-                nonlocal pending_spots, pending_noise, pending_psk, pending_tbz, last_flush
-                if not pending_spots and not pending_noise and not pending_psk:
+                nonlocal pending_spots, pending_noise, pending_psk
+                nonlocal pending_status, pending_tbz, last_flush
+                if not (pending_spots or pending_noise or pending_psk
+                        or pending_status):
                     pending_tbz = []
                     last_flush = time.time()
                     return
 
                 if config.get('dry_run'):
                     log(f"DRY RUN: would flush {len(pending_spots)} spots, "
-                        f"{len(pending_noise)} noise, {len(pending_psk)} psk "
+                        f"{len(pending_noise)} noise, {len(pending_psk)} psk, "
+                        f"{len(pending_status)} status "
                         f"from {len(pending_tbz)} tbz files", "INFO")
-                    pending_spots, pending_noise, pending_psk, pending_tbz = [], [], [], []
+                    pending_spots, pending_noise, pending_psk = [], [], []
+                    pending_status, pending_tbz = [], []
                     last_flush = time.time()
                     return
 
@@ -1810,6 +2146,34 @@ def main():
                         flush_errors.append("psk")
                         # don't block tbz cleanup
 
+                # station.heartbeat flush — same containment as psk, and for
+                # a stronger reason: status is the passenger in this tar.
+                # Pinning a tar on the gateway because a heartbeat would not
+                # insert would turn a status fault into a SPOT outage, which
+                # is backwards. The next envelope is 60 s away.
+                if pending_status and success:
+                    max_retries, retry_delay, ok = 3, 2, False
+                    for attempt in range(max_retries):
+                        if insert_status_rows(
+                                client, pending_status,
+                                config['clickhouse_status_database'],
+                                config['clickhouse_status_table'],
+                                config['max_status_per_insert']):
+                            log(f"Flushed {len(pending_status)} status rows",
+                                "INFO")
+                            ok = True
+                            break
+                        if attempt < max_retries - 1:
+                            log(f"Status flush failed, retrying in "
+                                f"{retry_delay}s", "WARNING")
+                            time.sleep(retry_delay)
+                            retry_delay *= 2
+                    if not ok:
+                        log(f"Status flush failed after {max_retries} "
+                            f"attempts", "ERROR")
+                        flush_errors.append("status")
+                        # don't block tbz cleanup
+
                 if success:
                     for tbz_file in pending_tbz:
                         mark_tbz_processed(tbz_file, processed_file,
@@ -1818,7 +2182,8 @@ def main():
                             tbz_file.unlink()
                         except Exception as e:
                             log(f"Failed to delete {tbz_file.name}: {e}", "WARNING")
-                    pending_spots, pending_noise, pending_psk, pending_tbz = [], [], [], []
+                    pending_spots, pending_noise, pending_psk = [], [], []
+                    pending_status, pending_tbz = [], []
 
                 last_flush = time.time()
 
@@ -1826,40 +2191,46 @@ def main():
                 try:
                     item = results_queue.get(timeout=config['batch_flush_seconds'])
                 except queue.Empty:
-                    if pending_spots or pending_noise or pending_psk:
+                    if (pending_spots or pending_noise or pending_psk
+                            or pending_status):
                         log(f"Timeout flush: {len(pending_spots)} spots, "
                             f"{len(pending_noise)} noise, {len(pending_psk)} psk, "
+                            f"{len(pending_status)} status, "
                             f"{len(pending_tbz)} files", "INFO")
                         do_flush()
                     continue
 
                 if item is SENTINEL:
-                    if pending_spots or pending_noise or pending_psk:
+                    if (pending_spots or pending_noise or pending_psk
+                            or pending_status):
                         log(f"Final flush: {len(pending_spots)} spots, "
                             f"{len(pending_noise)} noise, {len(pending_psk)} psk, "
+                            f"{len(pending_status)} status, "
                             f"{len(pending_tbz)} files", "INFO")
                         do_flush()
                     break
 
-                # Workers return a 4-tuple (tbz, spots, noise, psk). Tolerate
-                # a 3-tuple for in-flight upgrade from older worker pools.
-                if len(item) == 4:
-                    tbz_file, spots, noise_records, psk_rows = item
-                else:
-                    tbz_file, spots, noise_records = item
-                    psk_rows = []
+                # Workers return a 5-tuple (tbz, spots, noise, psk, status).
+                # Tolerate the older 4- and 3-tuples for an in-flight upgrade
+                # from a worker pool still running the previous code.
+                tbz_file, spots, noise_records = item[0], item[1], item[2]
+                psk_rows = item[3] if len(item) > 3 else []
+                status_rows = item[4] if len(item) > 4 else []
                 pending_spots.extend(spots)
                 pending_noise.extend(noise_records)
                 pending_psk.extend(psk_rows)
+                pending_status.extend(status_rows)
                 pending_tbz.append(tbz_file)
 
                 elapsed = time.time() - last_flush
                 if (len(pending_spots) >= config['batch_flush_spots'] or
                         len(pending_noise) >= config['batch_flush_noise'] or
                         len(pending_psk) >= config['batch_flush_psk'] or
+                        len(pending_status) >= config['batch_flush_status'] or
                         elapsed >= config['batch_flush_seconds']):
                     log(f"Flush trigger: {len(pending_spots)} spots, "
                         f"{len(pending_noise)} noise, {len(pending_psk)} psk, "
+                        f"{len(pending_status)} status, "
                         f"{elapsed:.1f}s elapsed", "INFO")
                     do_flush()
 
@@ -1872,9 +2243,11 @@ def main():
         # queue.Queue is not picklable.
         Pool = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
         psk_modes_arg = config['psk_modes'] if config.get('ingest_psk') else None
+        status_subdir_arg = (config['status_subdir']
+                             if config.get('ingest_status') else None)
         with Pool(max_workers=n_workers) as executor:
             futures = {executor.submit(extract_and_parse_tbz, f, extraction_dir,
-                                       psk_modes_arg): f
+                                       psk_modes_arg, status_subdir_arg): f
                        for f in unprocessed}
             for future in as_completed(futures):
                 try:

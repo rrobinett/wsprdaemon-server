@@ -145,6 +145,69 @@ Adding a new modulation = add a string to `config['psk_modes']` (default
 Tests: `python3 tests/test_psk_ingest.py` — exercises parsing + scanning
 helpers against synthetic extracted-tar trees. No ClickHouse required.
 
+## station.heartbeat ingestion (status/ subdir, default off)
+
+`wsprdaemon_server.py` can also ingest station STATUS envelopes from the same
+.tbz pipeline into the `station.heartbeat` ClickHouse table.  Off by default,
+exactly like psk ingestion:
+
+```bash
+sudo systemctl edit wsprdaemon_server@wsprdaemon   # Environment=WSPRDAEMON_INGEST_STATUS=1
+# or --ingest-status on the CLI
+```
+
+Tar layout — `status` is a peer subdir at the tar root, beside `wspr/` and the
+psk modes:
+
+```
+<tar root>/status/<ROLE>/<HOST_ID>/<YYYYMMDDTHHMMSSZ>.jsonl    ROLE is 'vm' or 'pm'
+```
+
+One envelope per line.  The wire contract is
+`sigmond/lib/sigmond/heartbeat_schema.py` (`kind = "station_heartbeat"`,
+`schema_version = 1`), and this server does not re-specify it: additive fields
+are allowed at every depth, so a station one release ahead is never dropped
+for carrying a field we have not learned about yet.
+
+Three rules govern the parse, and each exists because its opposite is a bug
+that hides itself:
+
+- **⛔ `received_at` is the TAR'S MTIME.**  Availability comes from ARRIVAL,
+  never from anything a station says about itself — a station that has stopped
+  cannot report that it stopped.  The mtime survives the reflector's hard-link
+  and `rsync -a`, so it is one server clock's reading of the gateway arrival,
+  identical on wd10, wd20 and wd30.  `emitted_at` is stored for forensics and
+  must never decide liveness.
+- **⛔ `role` and `host_id` come from the TAR PATH**, never from which blocks
+  are present.  Inferring `pm` from a `rac` block would misfile every Proxmox
+  host that carries no RAC switch script, because `pm-heartbeat.py` omits
+  `rac` on exactly those hosts — the inference fails for the hosts least
+  likely to be noticed.
+- **⛔ Status is the PASSENGER in this tar, not the cargo.**  A tar whose
+  spots parsed is never rejected because its status did not, and a status
+  insert that fails never pins a tar on the gateway: that would turn a status
+  fault into a SPOT outage.  The next envelope is 60 s away.
+
+`gateway` is read from the incoming spool directory (`from-gw1` → `gw1`), not
+from the envelope, for the same reason: it is a property of where the tar
+landed.
+
+Schema: `schema/station.heartbeat.sql`, mirrored inline in
+`setup_status_tables()` so a fresh wd self-bootstraps.  A test asserts the two
+copies agree — a row key with no column fails the INSERT for the whole batch,
+which is every station's heartbeat in that flush, not just the one.
+
+Block verdicts and reasons are stored as `Map`s rather than columns on
+purpose: adding a block is a schema change in `heartbeat_schema.py` and must
+not ALSO be a ClickHouse migration.  `payload` holds the envelope verbatim,
+because the rule that a vanished block can never read as healthy only holds if
+the original is recoverable.
+
+Tests: `python3 tests/test_status_ingest.py` — 21, against synthetic extracted
+trees, no ClickHouse required.  All twelve guards are mutation-checked.
+
+Design and remaining phases: `sigmond/tasks/plan-status-via-uploader.md`.
+
 ## PSKReporter forwarder (Phase 2 PR 2)
 
 Two new daemons:
