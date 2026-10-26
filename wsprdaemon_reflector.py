@@ -114,6 +114,58 @@ def log(message: str, level: str = "INFO"):
         handler.flush()
 
 
+# ---------- destination transports: rsync (default) and sftp ----------
+#
+# A reflector's destinations have always been hosts we hold a SHELL on, so
+# `rsync -a --remove-source-files` was the only transport it needed.
+#
+# Chaining one reflector into another breaks that assumption.  A HamSCI
+# gateway (vpn1/vpn2) forwarding to a WsprDaemon gateway (gw1/gw2) arrives as
+# an ORDINARY UPLOAD ACCOUNT -- the same `sftponly` class all 92 stations use,
+# with `ForceCommand internal-sftp`, `ChrootDirectory /home/%u` and
+# `AllowTcpForwarding no`.  rsync CANNOT run there: it needs to exec a remote
+# rsync binary, and internal-sftp never gives it a shell to do that in.
+#
+# Using the station account class rather than inventing a privileged one is
+# the point.  It adds no new trust: vpn1 can write into its own chroot on gw1
+# and do nothing else, exactly like a station.
+#
+# `transport: "sftp"` on a destination selects this path.  Omitted, a
+# destination behaves exactly as it always has, so every existing
+# reflector_destinations.json is unaffected.
+TRANSPORT_RSYNC = 'rsync'
+TRANSPORT_SFTP = 'sftp'
+
+
+def destination_transport(destination: Dict) -> str:
+    return (destination.get('transport') or TRANSPORT_RSYNC).strip().lower()
+
+
+def sftp_batch(files: List[Path], remote_path: str) -> bytes:
+    """The sftp batch that delivers ``files`` into ``remote_path``.
+
+    ⛔ PUT TO `.part`, THEN RENAME.  The receiving gateway's own reflector
+    globs `*.tbz` on a 5 s loop; a tar still being written under its final
+    name is a tar it can hard-link and forward half-complete.  The rename is
+    atomic within the directory, so the final name never exists in a partial
+    state.  (This is the same `.part` + rename hs-uploader uses when a
+    station delivers to gw1.)
+
+    ⛔ `put -P`, NOT `put`.  -P preserves the MTIME, and the mtime is
+    load-bearing all the way down this chain: station.heartbeat's
+    `received_at` is the tar's mtime, which is how the WD servers learn when
+    a station actually delivered. A plain `put` would restamp every tar with
+    the time the RELAY ran, and every station would read as having reported
+    at the relay's cadence instead of its own.
+    """
+    lines = []
+    for f in files:
+        dest = f"{remote_path}/{f.name}"
+        lines.append(f"put -P {f} {dest}.part")
+        lines.append(f"rename {dest}.part {dest}")
+    return ("\n".join(lines) + "\n").encode()
+
+
 def verify_destination_rsync(destination: Dict) -> bool:
     name, user, host = destination['name'], destination['user'], destination['host']
     ssh_key = destination.get('ssh_key', '/home/wsprdaemon/.ssh/id_rsa')
@@ -151,6 +203,15 @@ def verify_destination_rsync(destination: Dict) -> bool:
 def verify_all_destinations(config: Dict) -> List[Dict]:
     valid = []
     for dest in config['destinations']:
+        # An sftp destination has no shell by construction, so there is
+        # nothing to probe and nothing to install.  Probing it would run
+        # `ssh ... which rsync`, get "This service allows sftp connections
+        # only", and DISABLE a destination that works perfectly.
+        if destination_transport(dest) == TRANSPORT_SFTP:
+            log(f"{dest['name']}: sftp destination — no rsync check "
+                f"(the account is chrooted internal-sftp)", "INFO")
+            valid.append(dest)
+            continue
         if verify_destination_rsync(dest):
             valid.append(dest)
         else:
@@ -161,6 +222,15 @@ def verify_all_destinations(config: Dict) -> List[Dict]:
 def check_remote_free_space(destination: Dict, path: str, min_percent: int = 25) -> Optional[float]:
     """Check free space on remote server. Returns free percentage or None on error/timeout."""
     name, user, host = destination['name'], destination['user'], destination['host']
+    # ⚠ NOT MEASURABLE OVER SFTP, and "unknown" must not read as "full".
+    # `df` needs a shell, which a chrooted internal-sftp account does not
+    # have.  Returning None here would make the caller skip the sync as if
+    # the check had TIMED OUT -- it counts consecutive failures and warns
+    # about space -- so a perfectly healthy sftp destination would never
+    # receive a file, while the log blamed disk space.  Report full instead:
+    # the receiving gateway runs its own space guard on the way out.
+    if destination_transport(destination) == TRANSPORT_SFTP:
+        return 100.0
     ssh_key = destination.get('ssh_key', '/home/wsprdaemon/.ssh/id_rsa')
     ssh_base = f"ssh -i {ssh_key} -o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{host}"
     
@@ -815,6 +885,11 @@ class RsyncWorker(threading.Thread):
         log(f"Found {queued_count} files to sync to {self.destination['name']}", "INFO")
 
         ssh_key = self.destination.get('ssh_key', '/home/wsprdaemon/.ssh/id_rsa')
+
+        if destination_transport(self.destination) == TRANSPORT_SFTP:
+            self._sync_over_sftp(ssh_key)
+            return
+
         rsync_cmd = [
             'rsync', '-a', '-e', f'ssh -i {ssh_key} -o StrictHostKeyChecking=no',
             '--remove-source-files', f'--bwlimit={self.config["rsync_bandwidth_limit"]}',
@@ -834,6 +909,75 @@ class RsyncWorker(threading.Thread):
             log(f"Rsync to {self.destination['name']} timed out", "ERROR")
         except Exception as e:
             log(f"Rsync to {self.destination['name']} error: {e}", "ERROR")
+
+
+    def _sync_over_sftp(self, ssh_key: str) -> None:
+        """Deliver the queue to a chrooted upload account by sftp.
+
+        Used when this reflector forwards to ANOTHER gateway's station-upload
+        account -- vpn1/vpn2 -> gw1/gw2 -- where there is no shell and so no
+        rsync.  See the transport notes above sftp_batch().
+
+        ⛔ DELETE ONLY WHAT SFTP CONFIRMED IT MOVED, AND ONLY AFTER IT DID.
+        rsync's --remove-source-files has the same contract and it is the
+        whole safety of the queue: a file deleted on a failed batch is a
+        station's spots gone, with nothing upstream holding a copy. sftp -b
+        stops at the first failing command and exits non-zero, so on any
+        non-zero rc NOTHING here is deleted and the next pass retries the
+        whole queue. A duplicate re-delivery is harmless -- the receiving
+        gateway hard-links by name and the server de-duplicates by hash --
+        while a lost tar is not recoverable.
+        """
+        name = self.destination['name']
+        files = sorted(f for f in self.queue_dir.iterdir()
+                       if f.is_file() and not f.name.startswith('.'))
+        if not files:
+            return
+        batch = sftp_batch(files, self.destination['path'])
+        cmd = [
+            'sftp', '-b', '-',
+            '-o', 'BatchMode=yes',
+            '-o', 'StrictHostKeyChecking=accept-new',
+            '-o', 'ConnectTimeout=10',
+            # One connection for the whole queue, reused across passes: this
+            # relay ships on the same 5-10 s loop the gateway scans on, and a
+            # handshake per pass is the cost the station path already removed.
+            '-o', 'ControlMaster=auto',
+            '-o', f'ControlPath=/run/wsprdaemon-reflector/cm-%r@%h:%p',
+            '-o', 'ControlPersist=10m',
+            '-o', 'ServerAliveInterval=30',
+            '-o', 'ServerAliveCountMax=3',
+            '-i', ssh_key,
+            f"{self.destination['user']}@{self.destination['host']}",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, input=batch, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=self.config['rsync_timeout'] + 30)
+        except subprocess.TimeoutExpired:
+            log(f"sftp to {name} timed out — queue kept for the next pass",
+                "ERROR")
+            return
+        except Exception as e:                      # noqa: BLE001
+            log(f"sftp to {name} error: {e} — queue kept", "ERROR")
+            return
+
+        if result.returncode != 0:
+            err = (result.stdout + result.stderr).decode(errors='replace').strip()
+            log(f"sftp to {name} failed (rc={result.returncode}): "
+                f"{err.splitlines()[-1] if err else '(no output)'} — "
+                f"{len(files)} file(s) kept for the next pass", "ERROR")
+            return
+
+        removed = 0
+        for f in files:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError as e:
+                log(f"{name}: delivered {f.name} but could not remove the "
+                    f"queue copy: {e}", "WARNING")
+        log(f"Successfully sent {removed} file(s) to {name} by sftp", "INFO")
 
 
 def main():
