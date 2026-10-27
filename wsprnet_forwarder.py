@@ -592,9 +592,23 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
                 else:
                     logger.warning("%d spot(s) failed — holding the watermark "
                                    "so the next pass retries them", failed)
+            elif cfg.dry_run:
+                # ⛔ DRY RUN MUST NOT ADVANCE THE WATERMARK.  It is the same
+                # process that goes live later, and the unit file tells
+                # operators to stage this way — so advancing here means the
+                # flip to live silently skips exactly the spots they just
+                # watched it promise to post.  Measured on wd30 2026-10-27:
+                # 40 AC0G/B4 spots from cycle 03:06 were logged "would
+                # forward", the watermark moved past them, and the live
+                # restart never saw them again.
+                logger.info("DRY RUN: would forward %d row(s) — watermark "
+                            "HELD at %s so going live still posts them",
+                            len(rows), since.isoformat())
             else:
-                if leader and cfg.dry_run:
-                    logger.info("DRY RUN: would forward %d row(s)", len(rows))
+                # Idle (not leader): keep the cursor fresh so a promotion is
+                # gap-free.  This one MUST advance — a stale idle watermark
+                # makes a newly promoted server replay hours of spots at the
+                # worst possible moment.
                 since = high
                 write_watermark(cfg.watermark_path, since)
 

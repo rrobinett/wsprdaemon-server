@@ -448,3 +448,50 @@ def test_the_dry_run_env_switch_only_accepts_an_explicit_yes():
         assert wf._env_flag("X_WF_DRY") is False, repr(off)
     del os.environ["X_WF_DRY"]
     assert wf._env_flag("X_WF_DRY") is False
+
+
+# ---------- the watermark and the three roles ----------
+
+def test_DRY_RUN_MUST_NOT_ADVANCE_THE_WATERMARK():
+    """⛔ THE BUG wd30 FOUND, 2026-10-27.  Dry-run is the SAME PROCESS that
+    goes live later, and the unit file tells operators to stage exactly this
+    way — "run with --dry-run first to watch what it WOULD post".  Advancing
+    the watermark here means the flip to live silently skips the very spots
+    they just watched it promise to post.  40 real AC0G/B4 spots from cycle
+    03:06 were lost that way, with the log reading "would forward 40 row(s)"
+    and nothing ever posting them.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        wm = Path(tmp) / "wm"
+        cfg = wf.ForwarderConfig(this_host="wd20", pin_leader="wd20",
+                                 watermark_path=wm, once=True, dry_run=True)
+        posted = []
+        with mock.patch.object(wf, "fetch_pending", return_value=[_row()]), \
+             mock.patch.object(wf, "forward_rows",
+                               side_effect=lambda *a, **k: posted.append(a)), \
+             mock.patch.object(wf, "load_reporter_overrides", return_value={}):
+            wf._STOP = False
+            wf.run_loop(cfg, ch_client_factory=lambda: object())
+        assert posted == [], "dry-run must not post"
+        assert not wm.exists(), (
+            "dry-run wrote a watermark; going live would now skip these rows")
+
+
+def test_an_idle_server_STILL_advances_so_failover_is_gap_free():
+    """The other direction, and it must stay true: a stale idle watermark
+    makes a newly promoted server replay hours of spots at the worst
+    possible moment."""
+    with tempfile.TemporaryDirectory() as tmp:
+        assert _loop_once(tmp, [_row()], leader=False) == T0
+
+
+def test_the_two_branches_are_SEPARATE_in_the_source():
+    """They shared one `else`, which is how the bug existed at all."""
+    import inspect
+    src = inspect.getsource(wf.run_loop)
+    tail = src.split("if failed == 0:")[1]
+    assert "elif cfg.dry_run:" in tail, "dry-run needs its own branch"
+    dry = tail.split("elif cfg.dry_run:")[1].split("            else:")[0]
+    idle = tail.split("elif cfg.dry_run:")[1].split("            else:")[1]
+    assert "write_watermark" not in dry
+    assert "write_watermark" in idle
