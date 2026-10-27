@@ -4,6 +4,11 @@
 # gw1-elected leader actually POSTs, the others idle but keep their
 # watermark fresh so failover is gap-free.  See wsprnet_forwarder.py.
 #
+# ⚠ There is NO ELECTOR yet: gw1 serves no wsprnet-leader.txt, so a host
+# without WSPRNET_FORWARDER_PIN_LEADER stays idle forever, and enabling this
+# on two hosts WITHOUT a pin would have both post everything.  Pin exactly
+# one, the way /etc/default/pskreporter-forwarder already does.
+#
 # ⚠ INERT UNTIL A STATION OPTS IN.  It forwards only rows carrying
 # proxy_upload = 1, and no station sets that today, so enabling this
 # changes nothing until a station is switched to server-side posting.
@@ -27,6 +32,13 @@
 #        #   { "KA9Q_0": {"call": "AC0G", "grid": "EM38ww"} }
 #        # Optional during staging — pin leadership and skip the elector:
 #        #   WSPRNET_FORWARDER_PIN_LEADER=wd20
+#        # Optional — read and log, POST nothing:
+#        #   WSPRNET_FORWARDER_DRY_RUN=1
+#        # Optional — seconds between wsprnet transactions (default 300).
+#        # Several WSPR cycles ride one POST; a transaction costs ~1.5 kB of
+#        # connection setup against 74 B per spot, so this is most of the
+#        # server-side saving.  0 posts on every poll (low latency).
+#        #   WSPRNET_FORWARDER_POST_INTERVAL_SEC=300
 #   4. systemctl enable --now wsprnet-forwarder
 [Unit]
 Description=wsprnet.org forwarder (wsprdaemon-server)
