@@ -365,6 +365,46 @@ Tests: `tests/test_wsprnet_forwarder.py` (32) and `tests/test_wsprnet_routing.py
 `tests/test_transport_wsprdaemon.py` that asserts the server reads back
 exactly what the client wrote.  No ClickHouse or network required.
 
+### The batching window (`--post-interval-sec`, default 300 s)
+
+The forwarder POLLS every `poll_sec` but FETCHES AND POSTS once per
+`post_interval_sec`, so several WSPR cycles ride one wsprnet transaction.
+
+Why it exists, measured on this fleet 2026-10-27: a wsprnet transaction costs
+~1.5 kB of connection setup over plain HTTP and ~8.9 kB over HTTPS, against
+74 B per spot.  At one POST per 2-minute cycle **this proxy posts exactly as
+often as the 85 clients it replaced** — so the fleet-wide saving comes only
+from skipping TLS, and would vanish the day anyone enables it:
+
+| | MB/day, fleet |
+|---|---|
+| 85 clients, HTTPS, 1 POST/cycle (what we replaced) | 683.7 |
+| server, plain HTTP, 1 POST/cycle | 249.3 |
+| server, HTTPS, 1 POST/cycle | **683.7 — no saving at all** |
+| server, plain HTTP, 1 POST/10 min | 179.6 |
+
+The per-STATION saving is unaffected by any of this and is the real prize:
+a median site drops 19.8 → 2.5 MB/day (87 %), and a 500-spot/day site spends
+12,940 B of its link per spot delivered today, 99 % of it overhead.
+
+Two rules the implementation depends on:
+
+- **⛔ The window is enforced by not QUERYING, never by holding rows in
+  memory.**  Rows wait in ClickHouse where they are already durable, and the
+  watermark stays the only cursor.  An accumulator would put minutes of
+  unposted spots in a process a deploy can restart, and they would be lost
+  along with the log line that promised them — the same shape as the dry-run
+  watermark bug below.
+- **⛔ A full batch means there is more**, so it drains immediately instead of
+  waiting out the window.  Otherwise the backlog grows by a window every
+  window and the only symptom is spots reaching wsprnet later and later,
+  never an error.  `DEFAULT_BATCH` is 20,000 because one 5-minute window
+  across this fleet is ~8,000 rows.
+
+Cost is latency: a spot appears on wsprnet up to one window after its cycle.
+wsprnet stores the spot's OWN timestamp, so nothing is distorted — only its
+appearance is later.  `0` restores posting on every poll.
+
 ### Staging state (2026-10-27): LIVE on wd30 for AC0G/B4
 
 There is **no elector**.  gw1 serves neither `wsprnet-leader.txt` nor

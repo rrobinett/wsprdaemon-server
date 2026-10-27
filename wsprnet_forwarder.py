@@ -79,7 +79,27 @@ DEFAULT_COLD_START_MINUTES = 5
 # Larger uploads are silently truncated by the far end, which is the
 # worst possible failure: it looks like success.
 MAX_SPOTS_PER_UPLOAD = 999
-DEFAULT_BATCH = 2000          # rows pulled per poll, before dedup
+# Sized against the batching window below: one 5-minute window across this
+# fleet is ~8,000 rows (2.3 M WSPR spots/day), so a 2,000-row cap would have
+# meant four passes per window and a forwarder that falls permanently behind
+# the moment the fleet grows.
+DEFAULT_BATCH = 20000         # rows pulled per fetch, before dedup
+
+# ⚡ HOW OFTEN WE ACTUALLY POST, as opposed to how often we look.
+#
+# Measured on this fleet 2026-10-27: a wsprnet transaction costs ~1.5 kB of
+# connection setup over plain HTTP and ~8.9 kB over HTTPS, against 74 B per
+# spot.  Posting once per 2-minute cycle, as the stations do, means 79 % of a
+# small site's upload is overhead — and it means this proxy posts exactly as
+# OFTEN as the 85 clients it replaced, so the fleet-wide saving comes only
+# from skipping TLS and would vanish the day we enable it.  Batching several
+# cycles into one transaction is the saving that does not depend on that:
+# 683.7 -> 179.6 MB/day fleet-wide at this interval.
+#
+# The cost is latency: a spot reaches wsprnet up to this long after its
+# cycle.  wsprnet stores the spot's OWN timestamp, so nothing is distorted
+# by the delay — only its appearance is later.  Set 0 to post every poll.
+DEFAULT_POST_INTERVAL_SEC = 300
 
 # Byte-identical to wd-upload-wsprnet and hs_uploader.transports.wsprnet.
 _BOUNDARY = b"--------WD4MeptBoundary"
@@ -569,6 +589,7 @@ class ForwarderConfig:
     poll_sec: int = DEFAULT_POLL_SEC
     leader_poll_sec: int = DEFAULT_LEADER_POLL_SEC
     batch: int = DEFAULT_BATCH
+    post_interval_sec: int = DEFAULT_POST_INTERVAL_SEC
     http_timeout: float = DEFAULT_HTTP_TIMEOUT
     dry_run: bool = False
     once: bool = False
@@ -605,6 +626,11 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
         logger.info("cold start — watermark set to %s", since.isoformat())
 
     was_leader: Optional[bool] = None
+    # Post on the first pass, then once per window.
+    last_post = time.monotonic() - cfg.post_interval_sec
+    if cfg.post_interval_sec:
+        logger.info("batching: fetch and post once per %d s "
+                    "(polling every %d s)", cfg.post_interval_sec, cfg.poll_sec)
     while not _STOP:
         now = time.monotonic()
         # A pinned host answers the leader question by itself.  Probing the
@@ -630,11 +656,28 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
                         state.elected)
             was_leader = leader
 
+        # ⚡ THE BATCHING WINDOW.  We keep POLLING at poll_sec — that is
+        # how the role stays current and how a shutdown stays responsive —
+        # but only FETCH AND POST once per post_interval_sec.
+        #
+        # ⛔ The window is enforced by not QUERYING, never by holding rows
+        # in memory.  Rows wait in ClickHouse, where they are already
+        # durable, and the watermark is the only cursor.  An accumulator
+        # would put minutes of unposted spots in a process that can be
+        # restarted by a deploy, and they would be lost with the log line
+        # that promised them — the same shape of failure the dry-run
+        # watermark bug had.
+        if now - last_post < cfg.post_interval_sec:
+            _interruptible_sleep(cfg.poll_sec)
+            continue
+        last_post = now
+
         try:
             rows = fetch_pending(client, since=since, batch_size=cfg.batch)
         except Exception as exc:                    # noqa: BLE001
             logger.error("ClickHouse query failed: %s", exc)
             rows = []
+        drained_full = len(rows) >= cfg.batch
 
         if rows:
             high = max(r.ingested_at for r in rows)
@@ -677,6 +720,12 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
 
         if cfg.once:
             break
+        if drained_full:
+            # ⛔ A FULL BATCH MEANS THERE IS MORE.  Waiting the whole window
+            # again would let the backlog grow by a window every window, and
+            # the only symptom would be spots reaching wsprnet later and
+            # later — never an error.  Go straight back for the rest.
+            last_post = time.monotonic() - cfg.post_interval_sec
         _interruptible_sleep(cfg.poll_sec)
     return 0
 
@@ -710,6 +759,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--url", default=DEFAULT_URL)
     p.add_argument("--poll-sec", type=int, default=DEFAULT_POLL_SEC)
     p.add_argument("--batch", type=int, default=DEFAULT_BATCH)
+    p.add_argument("--post-interval-sec", type=int,
+                   default=int(os.environ.get(
+                       "WSPRNET_FORWARDER_POST_INTERVAL_SEC")
+                       or DEFAULT_POST_INTERVAL_SEC),
+                   help="seconds between wsprnet transactions; several WSPR "
+                        "cycles ride one POST (0 = post every poll). "
+                        "Env: WSPRNET_FORWARDER_POST_INTERVAL_SEC")
     p.add_argument("--dry-run", action="store_true",
                    default=_env_flag("WSPRNET_FORWARDER_DRY_RUN"),
                    help="read and log, POST nothing "
@@ -733,7 +789,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         reporters_path=a.reporters, db_host=a.clickhouse_host,
         db_port=a.clickhouse_port, db_user=a.clickhouse_user,
         db_password=a.clickhouse_password, url=a.url,
-        poll_sec=a.poll_sec, batch=a.batch, dry_run=a.dry_run, once=a.once)
+        poll_sec=a.poll_sec, batch=a.batch,
+        post_interval_sec=max(0, a.post_interval_sec),
+        dry_run=a.dry_run, once=a.once)
     logger.info("wsprnet_forwarder %s on %s → %s (leader: %s)",
                 VERSION, cfg.this_host, cfg.url,
                 cfg.pin_leader or cfg.leader_url)

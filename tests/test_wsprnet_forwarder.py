@@ -621,3 +621,60 @@ def test_the_SELECT_column_order_matches_the_unpack():
     reverse) shifts every field silently — snr becomes drift, and the spots
     stay plausible."""
     assert len(wf.SELECT_COLUMNS.split(",")) == 15
+
+
+# ---------- the batching window ----------
+
+def _windowed(tmp, rows, *, post_interval, passes, batch=20000):
+    """Run `passes` loop iterations with a stubbed clock; count POSTs."""
+    clock = {"t": 1000.0}
+    calls = []
+    cfg = wf.ForwarderConfig(this_host="wd20", pin_leader="wd20",
+                             watermark_path=Path(tmp) / "wm",
+                             poll_sec=30, batch=batch,
+                             post_interval_sec=post_interval)
+    n = {"i": 0}
+    def monotonic():
+        return clock["t"]
+    def sleep(sec):
+        clock["t"] += sec
+        n["i"] += 1
+        if n["i"] >= passes:
+            wf._STOP = True
+    with mock.patch.object(wf.time, "monotonic", monotonic), \
+         mock.patch.object(wf, "_interruptible_sleep", sleep), \
+         mock.patch.object(wf, "fetch_pending", return_value=rows), \
+         mock.patch.object(wf, "forward_rows",
+                           side_effect=lambda *a, **k: (calls.append(1),
+                                                        (len(rows), 0))[1]), \
+         mock.patch.object(wf, "load_reporter_overrides", return_value={}), \
+         mock.patch.object(wf, "load_declared_identities", return_value={}):
+        wf._STOP = False
+        wf.run_loop(cfg, ch_client_factory=lambda: object())
+    return len(calls)
+
+
+def test_the_window_turns_many_polls_into_ONE_transaction():
+    """⚡ The whole point: at one POST per 2-minute cycle this proxy posts as
+    OFTEN as the 85 clients it replaced, so the fleet-wide saving comes only
+    from skipping TLS and would vanish the day we enable it.  Measured:
+    683.7 -> 179.6 MB/day at a 300 s window."""
+    with tempfile.TemporaryDirectory() as tmp:
+        # 20 polls at 30 s = 600 s of wall clock, 300 s window -> 2 POSTs.
+        assert _windowed(tmp, [_row()], post_interval=300, passes=20) == 2
+
+
+def test_zero_means_post_every_poll():
+    """The low-latency mode stays available and costs nothing to ask for."""
+    with tempfile.TemporaryDirectory() as tmp:
+        assert _windowed(tmp, [_row()], post_interval=0, passes=5) == 5
+
+
+def test_a_FULL_BATCH_does_not_wait_out_the_window():
+    """⛔ A full batch means there is more.  Waiting the whole window again
+    lets the backlog grow by a window every window, and the only symptom is
+    spots reaching wsprnet later and later — never an error."""
+    with tempfile.TemporaryDirectory() as tmp:
+        rows = [_row(tx_sign=f"W{i}ABC") for i in range(4)]
+        # batch=4 means every fetch comes back full -> drain every poll.
+        assert _windowed(tmp, rows, post_interval=300, passes=5, batch=4) == 5
