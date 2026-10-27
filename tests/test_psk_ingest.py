@@ -300,3 +300,113 @@ if __name__ == '__main__':
                 import traceback; traceback.print_exc()
     print(f"\n{'='*60}\n{failures} failure(s)")
     sys.exit(1 if failures else 0)
+
+
+# ---------- declared PSKReporter identity (psk.reporter) ----------
+#
+# Why it exists: `pskreporter_forwarder` used to decide WHO a row was
+# reported under from a fleet-wide env var that stripped the callsign
+# suffix.  On wd30 2026-10-27 that mapped both AC0G/B4 (Missouri) and
+# AC0G/ND (North Dakota) to one identity, so one site's FT8 spots would
+# have been reported from the other's location and de-duplicated against
+# it.  rob's rule: unique by default; merging is declared, and names what
+# it merges with.
+
+
+def test_a_receiver_that_declares_NOTHING_gets_no_identity_row():
+    """⛔ Silence must stay silence.  Inventing an identity here is how a
+    station ends up reported as somebody else."""
+    assert ws._psk_reporter({}, 'AC0G=B4_EM38ww/KA9Q_0') is None
+    assert ws._psk_reporter({'default': {}}, 'AC0G=B4_EM38ww/KA9Q_0') is None
+
+
+def test_a_per_receiver_declaration_beats_the_default():
+    routing = {
+        'default': {'psk_reporter': {'call': 'AC0G', 'grid': 'EM38ww'}},
+        'AC0G=ND_EN16ov/KA9Q_DXE': {
+            'psk_reporter': {'call': 'AC0G/ND', 'grid': 'EN16ov'}},
+    }
+    assert ws._psk_reporter(routing, 'AC0G=ND_EN16ov/KA9Q_DXE') == \
+        ('AC0G/ND', 'EN16ov')
+    assert ws._psk_reporter(routing, 'AC0G=B4_EM38ww/KA9Q_0') == \
+        ('AC0G', 'EM38ww')
+
+
+def test_a_declaration_with_no_CALL_is_dropped_whole():
+    """A grid alone cannot name a reporter, and taking the call from the
+    path while honouring the stated grid would report real spots from a
+    location the operator never claimed."""
+    routing = {'default': {'psk_reporter': {'grid': 'EM38ww'}}}
+    assert ws._psk_reporter(routing, 'AC0G=B4_EM38ww/KA9Q_0') is None
+
+
+def test_the_declaration_rides_the_rows_but_is_NOT_a_psk_spots_column():
+    """⛔ `_psk_call` must never reach the INSERT: an unknown column fails
+    the whole batch, which is every station's spots in that flush."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        _write_jsonl(
+            td / 'ft8' / 'AC0G=ND_EN16ov' / 'KA9Q_DXE' / '20'
+            / '261027_1230_ft8.jsonl',
+            [{'time': '2026-10-27T12:30:15+00:00', 'mode': 'ft8',
+              'tx_call': 'K1ABC', 'grid': 'FN42', 'frequency': 14_074_580}])
+        routing = {'AC0G=ND_EN16ov/KA9Q_DXE':
+                   {'psk_reporter': {'call': 'AC0G/ND', 'grid': 'EN16ov'}}}
+        out = ws.process_mode_files(td, 'ft8', routing, host_id='nd-100')
+        assert out[0]['_psk_call'] == 'AC0G/ND'
+        assert out[0]['_psk_grid'] == 'EN16ov'
+        converted = ws.convert_psk_spot_to_clickhouse(out[0])
+        assert '_psk_call' not in converted and '_psk_grid' not in converted
+
+
+def test_one_identity_row_per_receiver_not_per_spot():
+    """A tar carrying 40,000 FT8 rows from one receiver declares ONE
+    identity; inserting it per row would make a rarely-changing fact the
+    busiest write in the flush."""
+    rows = ([{'rx_sign': 'AC0G/B1', '_psk_call': 'AC0G', '_psk_grid': 'EM38ww'}] * 500
+            + [{'rx_sign': 'AC0G/B2', '_psk_call': 'AC0G', '_psk_grid': 'EM38ww'}] * 500)
+    out = ws.psk_reporter_rows(rows)
+    assert sorted(r['key'] for r in out) == ['AC0G/B1', 'AC0G/B2']
+    assert all(r['call'] == 'AC0G' for r in out)
+
+
+def test_rows_that_declared_nothing_produce_no_identity_rows():
+    assert ws.psk_reporter_rows(
+        [{'rx_sign': 'AC0G/ND', 'tx_call': 'K1ABC'}]) == []
+    # and a declaration with no rx_sign cannot be keyed
+    assert ws.psk_reporter_rows([{'_psk_call': 'AC0G'}]) == []
+
+
+def test_the_key_is_spelled_as_THE_FORWARDER_LOOKS_IT_UP():
+    """⛔ One vocabulary.  The forwarder keys on the bare rx_sign, which in
+    psk.spots already names a single receiver; a key written any other way
+    is a row no lookup will ever find."""
+    import pskreporter_forwarder as pf
+    row = ws.psk_reporter_rows(
+        [{'rx_sign': 'AC0G/ND', '_psk_call': 'AC0G', '_psk_grid': 'EM38ww'}])[0]
+    psk_row = pf.PskRow(
+        time=datetime(2026, 10, 27, tzinfo=timezone.utc),
+        ingested_at=datetime(2026, 10, 27, tzinfo=timezone.utc),
+        mode='ft8', rx_sign='AC0G/ND', rx_loc='EN16ov',
+        tx_call='K1ABC', grid='FN42', frequency=14_074_580,
+        snr_db=-12, dt=0.1)
+    assert pf.reporter_for(psk_row, {row['key']: {'call': row['call'],
+                                                  'grid': row['grid']}}) \
+        == ('AC0G', 'EM38ww')
+
+
+def test_every_psk_identity_row_key_is_a_column_in_the_schema():
+    """⛔ A row key with no column fails the INSERT for the WHOLE batch —
+    every station's spots in that flush, not just the one.  The DDL lives
+    in two files (schema/psk_reporter.sql and the inline copy a fresh wd
+    bootstraps from), so the two can drift apart silently."""
+    import re
+    row_keys = set(ws.psk_reporter_rows(
+        [{'rx_sign': 'AC0G/B1', '_psk_call': 'AC0G', '_psk_grid': 'EM38ww'}])[0])
+    sql_file = (HERE.parent / "schema" / "psk_reporter.sql").read_text()
+    src = (HERE.parent / "wsprdaemon_server.py").read_text()
+    inline = src.split("CREATE TABLE IF NOT EXISTS {db}.{PSK_REPORTER_TABLE}")[1]
+    inline = inline.split('""")')[0]
+    for text, where in ((sql_file, "schema file"), (inline, "inline DDL")):
+        cols = set(re.findall(r"`(\w+)`\s+(?:String|DateTime)", text))
+        assert cols == row_keys, f"{where} disagrees: {cols ^ row_keys}"

@@ -8,6 +8,7 @@ Run with:  python3 tests/test_pskreporter_forwarder.py
 """
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import types as _types
@@ -305,3 +306,125 @@ class TestElector(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ── who a row is reported UNDER ─────────────────────────────────────────────
+#
+# Measured on wd30 2026-10-27, and the reason this exists:
+#
+#   psk.spots  AC0G/B4  rx_loc EM38ww   (Missouri — correct)
+#   psk.spots  AC0G/ND  rx_loc EM38ww   (North Dakota — WRONG, it is EN16ov)
+#
+# The old rule keyed the PskReporter instance on (base callsign, grid).
+# Both rows therefore resolved to ("AC0G", "EM38ww") — ONE instance, one map
+# pin, and one ftlib spotEquals dedup pool, so North Dakota's FT8 spots would
+# have been reported from Missouri and de-duplicated against B4's.
+#
+# rob's rule: every site is unique by default; merging is something a site
+# ASKS for, and names its partner by declaring the same identity.
+
+def _psk_row(rx_sign, rx_loc, tx_call="K1ABC", mode="ft8"):
+    return pf.PskRow(
+        time=datetime(2026, 10, 27, 14, 30, tzinfo=UTC),
+        ingested_at=datetime(2026, 10, 27, 14, 30, 5, tzinfo=UTC),
+        mode=mode, rx_sign=rx_sign, rx_loc=rx_loc,
+        tx_call=tx_call, grid="FN42",
+        frequency=14_074_580, snr_db=-12, dt=0.27)
+
+
+class TestReporterIdentity(unittest.TestCase):
+    def setUp(self):
+        _install_fake_pskreporter()
+        self.cache = {}
+        self._env = os.environ.pop("PSKREPORTER_FORWARDER_MERGE_BASE", None)
+
+    def tearDown(self):
+        os.environ.pop("PSKREPORTER_FORWARDER_MERGE_BASE", None)
+        if self._env is not None:
+            os.environ["PSKREPORTER_FORWARDER_MERGE_BASE"] = self._env
+
+    def test_THE_REAL_ND_AND_B4_COLLAPSE_CANNOT_HAPPEN_BY_DEFAULT(self):
+        """⛔ The production shape, with ND's wrong grid included: even when
+        two receivers share a callsign prefix AND a grid, they must stay
+        separate reporters unless somebody said to merge them."""
+        rows = [_psk_row("AC0G/B4", "EM38ww"),
+                _psk_row("AC0G/ND", "EM38ww", tx_call="W1XYZ")]
+        self.assertEqual(pf.forward_rows(rows, psk_cache=self.cache), 2)
+        self.assertIn(("AC0G/B4", "EM38ww"), self.cache)
+        self.assertIn(("AC0G/ND", "EM38ww"), self.cache)
+        self.assertNotIn(("AC0G", "EM38ww"), self.cache)
+
+    def test_moving_to_the_proxy_does_not_MOVE_THE_CREDIT(self):
+        """The identity a station gets through the proxy is the identity it
+        had posting directly: its own rx_sign and its own grid."""
+        call, grid = pf.reporter_for(_psk_row("AC0G/B4", "EM38ww"))
+        self.assertEqual((call, grid), ("AC0G/B4", "EM38ww"))
+
+    def test_MERGING_HAPPENS_ONLY_WHEN_BOTH_DECLARE_THE_SAME_IDENTITY(self):
+        """'If it wants to be merged, what should it be merged with?' —
+        answered as data: both receivers name the same identity."""
+        decls = {"AC0G/B1": {"call": "AC0G", "grid": "EM38ww"},
+                 "AC0G/B2": {"call": "AC0G", "grid": "EM38ww"}}
+        rows = [_psk_row("AC0G/B1", "EM38ww"),
+                _psk_row("AC0G/B2", "EM38ww", tx_call="W1XYZ"),
+                _psk_row("AC0G/ND", "EN16ov", tx_call="W2GSB")]
+        self.assertEqual(
+            pf.forward_rows(rows, psk_cache=self.cache, overrides=decls), 3)
+        self.assertEqual(sorted(self.cache),
+                         [("AC0G", "EM38ww"), ("AC0G/ND", "EN16ov")])
+        self.assertEqual(len(self.cache[("AC0G", "EM38ww")].spots), 2)
+
+    def test_a_declaration_with_no_CALL_is_ignored_not_half_applied(self):
+        """A grid alone cannot name a reporter.  Honouring it while taking
+        the call from rx_sign would report real spots from a location the
+        operator never claimed for that identity."""
+        decls = {"AC0G/ND": {"call": "", "grid": "EM38ww"}}
+        self.assertEqual(pf.reporter_for(_psk_row("AC0G/ND", "EN16ov"), decls),
+                         ("AC0G/ND", "EN16ov"))
+
+    def test_a_declaration_with_no_GRID_keeps_the_rows_own_grid(self):
+        decls = {"AC0G/B4": {"call": "AC0G", "grid": ""}}
+        self.assertEqual(pf.reporter_for(_psk_row("AC0G/B4", "EM38ww"), decls),
+                         ("AC0G", "EM38ww"))
+
+    def test_the_legacy_env_merge_is_OFF_unless_asked_for(self):
+        self.assertEqual(pf.reporter_for(_psk_row("AC0G/B4", "EM38ww")),
+                         ("AC0G/B4", "EM38ww"))
+        os.environ["PSKREPORTER_FORWARDER_MERGE_BASE"] = "1"
+        self.assertEqual(pf.reporter_for(_psk_row("AC0G/B4", "EM38ww")),
+                         ("AC0G", "EM38ww"))
+
+    def test_a_DECLARATION_beats_the_legacy_env_merge(self):
+        """Otherwise a server-wide switch could still overrule the operator
+        who stated their own identity."""
+        os.environ["PSKREPORTER_FORWARDER_MERGE_BASE"] = "1"
+        decls = {"AC0G/ND": {"call": "AC0G/ND", "grid": "EN16ov"}}
+        self.assertEqual(pf.reporter_for(_psk_row("AC0G/ND", "EN16ov"), decls),
+                         ("AC0G/ND", "EN16ov"))
+
+
+class TestLoadDeclaredIdentities(unittest.TestCase):
+    def test_rows_become_a_lookup_keyed_on_rx_sign(self):
+        ch = _FakeCh([("AC0G/B1", "AC0G", "EM38ww"),
+                      ("AC0G/B2", "AC0G", "EM38ww")])
+        self.assertEqual(pf.load_declared_identities(ch),
+                         {"AC0G/B1": {"call": "AC0G", "grid": "EM38ww"},
+                          "AC0G/B2": {"call": "AC0G", "grid": "EM38ww"}})
+
+    def test_a_row_with_no_call_is_dropped(self):
+        ch = _FakeCh([("AC0G/B1", "", "EM38ww")])
+        self.assertEqual(pf.load_declared_identities(ch), {})
+
+    def test_an_UNREADABLE_table_degrades_to_NO_MERGE_never_to_a_merge(self):
+        """⛔ The failure direction matters.  Losing the declarations must
+        leave every receiver under its own identity — the same one it would
+        have used posting directly — so a database hiccup can never move a
+        station's credit or its map pin."""
+        class _Boom:
+            def execute(self, *a, **k):
+                raise RuntimeError("clickhouse down")
+        self.assertEqual(pf.load_declared_identities(_Boom()), {})
+        self.assertEqual(
+            pf.reporter_for(_psk_row("AC0G/ND", "EN16ov"),
+                            pf.load_declared_identities(_Boom())),
+            ("AC0G/ND", "EN16ov"))

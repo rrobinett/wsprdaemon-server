@@ -244,9 +244,58 @@ Per-spot routing flag (set by psk-recorder Phase 2 PR 3):
 | `both`                       | 0     | skip (client posts direct) |
 | `direct`                     | n/a   | row never in psk.spots |
 
-Tests: `python3 tests/test_pskreporter_forwarder.py` — fakes for
-clickhouse-driver, ftlib PskReporter, and the leader URL fetch.
-18 pass; no ClickHouse or network required.
+### Reporter identity (`psk.reporter`) — unique by default, merging is DECLARED
+
+rob's rule, 2026-10-27: *"each site should include what its callsign is —
+the reporter ID should be unique — and then if it wants to be merged, what
+should it be merged with?"*
+
+- **The default is each row's own `rx_sign` and `rx_loc`** — the identity
+  the station uses posting to PSKReporter directly.  Moving onto the proxy
+  therefore cannot move anyone's credit or their pin on the map.
+- **Two receivers are reported as ONE station only when their operator
+  declares the SAME `(call, grid)` for both**, in `routing.json`
+  (`psk_reporter: {call, grid}`), recorded at ingest into `psk.reporter`
+  (`schema/psk_reporter.sql`).  That is the answer to "merge with what?",
+  expressed as data rather than as a server-wide switch.
+- The key is the bare `rx_sign`, because in `psk.spots` that already names
+  ONE receiver (`AC0G/B4`, `W3USR/02`).  It differs from
+  `wsprdaemon.wsprnet_reporter`, where the receiver is a separate `rx_id`.
+- A declaration with no `call` is dropped whole, never half-applied.
+- An unreadable `psk.reporter` degrades to **no merge**, never to a merge:
+  a database hiccup must not be able to move a station's identity.
+
+**⛔ MERGING MUST NEVER BE INFERRED FROM A SHARED CALLSIGN PREFIX.**  Until
+this change, `PSKREPORTER_FORWARDER_MERGE_BASE` defaulted to `1` and the
+forwarder keyed its ftlib instance on `(base call, grid)` — stripping
+`/suffix` fleet-wide.  Measured on wd30:
+
+| rx_sign | psk.spots rx_loc | truth |
+|---|---|---|
+| `AC0G/B4` | `EM38ww` | Missouri — correct |
+| `AC0G/ND` | `EM38ww` | **North Dakota — the WSPR path has `EN16ov`** |
+
+Both therefore resolved to `("AC0G", "EM38ww")`: one instance, one map pin,
+and one ftlib `spotEquals` dedup pool in which each site deleted the
+other's spots.  `AC0G/B1` and `/B2`, the receivers the merge was written
+for, are not in `psk.spots` at all — so the setting merged exactly the two
+sites that must never merge and none of the ones it was meant for.
+
+`PSKREPORTER_FORWARDER_MERGE_BASE` survives as an operator escape hatch,
+**now defaulting to OFF**, and a declaration beats it.  Flipping the
+default also made two long-failing tests in
+`tests/test_pskreporter_forwarder.py` pass: the suite had encoded
+per-receiver identity all along.
+
+⚠ The wrong `rx_loc` for `AC0G/ND` is a SEPARATE, still-open fault in the
+producer's own data — `process_mode_files` only `setdefault`s `rx_loc` from
+the tar path (`AC0G=ND_EN16ov` → `EN16ov`), so a producer-supplied value
+wins.  It is wrong with or without merging.
+
+Tests: `python3 tests/test_pskreporter_forwarder.py` (30) and the identity
+half of `tests/test_psk_ingest.py` (22) — fakes for clickhouse-driver,
+ftlib PskReporter, and the leader URL fetch.  No ClickHouse or network
+required.  13 mutations across the two, all caught.
 
 ## wsprnet.org forwarder (`wsprnet_forwarder.py`)
 

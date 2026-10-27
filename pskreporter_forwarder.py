@@ -247,6 +247,79 @@ def fetch_pending(
     return out
 
 
+PSK_REPORTER_DB    = "psk"
+PSK_REPORTER_TABLE = "reporter"
+
+
+def load_declared_identities(ch_client, *, db: str = PSK_REPORTER_DB,
+                             table: str = PSK_REPORTER_TABLE
+                             ) -> Dict[str, Dict[str, str]]:
+    """PSKReporter identities STATIONS declared, via `routing.json` at ingest.
+
+    Keyed on `rx_sign`, which in `psk.spots` already names ONE receiver
+    (`AC0G/B4`, `W3USR/02`) rather than a site — unlike `wsprdaemon.spots`,
+    where the receiver is a separate `rx_id`.
+
+    A query failure returns {} rather than raising.  The fallback is each
+    row's own rx_sign and grid, which is the identity the station would
+    have used posting directly, so a degraded read cannot MOVE anyone's
+    credit — it can only fail to honour a requested merge.
+    """
+    sql = (f"SELECT `key`, argMax(`call`, updated_at), "
+           f"argMax(grid, updated_at) FROM {db}.{table} GROUP BY `key`")
+    try:
+        rows = ch_client.execute(sql)
+    except Exception as exc:                        # noqa: BLE001
+        logger.warning("declared PSKReporter identities unreadable (%s) — "
+                       "reporting under each row's own rx_sign", exc)
+        return {}
+    out: Dict[str, Dict[str, str]] = {}
+    for key, call, grid in rows:
+        if key and call:
+            out[str(key)] = {"call": str(call), "grid": str(grid or "")}
+    if out:
+        logger.info("%d declared PSKReporter identit%s loaded",
+                    len(out), "y" if len(out) == 1 else "ies")
+    return out
+
+
+def reporter_for(row: "PskRow",
+                 overrides: Optional[Dict[str, Dict[str, str]]] = None
+                 ) -> Tuple[str, str]:
+    """The (callsign, grid) this row is reported to PSKReporter UNDER.
+
+    ⛔ THE DEFAULT IS THE ROW'S OWN IDENTITY, UNMERGED.  Posting through
+    this server must not change who gets the credit or where they are
+    placed on the map; a station that moves onto the proxy keeps exactly
+    the identity it used posting directly.
+
+    ⛔ MERGING IS A DECLARATION, NEVER AN INFERENCE.  Two receivers merge
+    because their operator declared the SAME identity for both — that is
+    what "merge, and merge with what?" means as data.  It is never
+    derived from a shared callsign prefix: `AC0G/B4` is in Missouri and
+    `AC0G/ND` is in North Dakota, 1,100 km apart, and on 2026-10-27
+    psk.spots additionally carried ND at B4's grid — so a (base-call,
+    grid) rule collapsed two separate sites into one reporter at one
+    location and de-duplicated one against the other.
+
+    `PSKREPORTER_FORWARDER_MERGE_BASE=1` restores the old fleet-wide
+    strip-the-suffix behaviour for receivers that declared nothing.  It
+    defaults OFF and is kept only as an operator escape hatch.
+    """
+    decl = (overrides or {}).get(row.rx_sign)
+    if decl and decl.get("call"):
+        return decl["call"], (decl.get("grid") or row.rx_loc)
+    if _merge_base_enabled():
+        return row.rx_sign.split("/", 1)[0], row.rx_loc
+    return row.rx_sign, row.rx_loc
+
+
+def _merge_base_enabled() -> bool:
+    return os.environ.get(
+        "PSKREPORTER_FORWARDER_MERGE_BASE", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _pskreporter_for_station(
     cache: Dict[Tuple[str, str], object],
     *,
@@ -256,30 +329,26 @@ def _pskreporter_for_station(
 ):
     """Get or create the ftlib PskReporter instance for this rx station.
 
-    One instance per (rx_sign, rx_loc) — the library is keyed on the
-    receiver's identity (callsign + grid).  Antenna tag identifies
-    the forwarder path explicitly so the audit trail is unambiguous.
+    One instance per (callsign, grid) — the library is keyed on the
+    reporter's identity.  Two receivers share an instance only when they
+    resolve to the SAME identity, which is what a declared merge means;
+    ftlib's spotEquals then de-duplicates across them, and that pooling
+    is exactly why an ACCIDENTAL shared identity is destructive.
+
+    Antenna tag identifies the forwarder path explicitly so the audit
+    trail is unambiguous.
     """
-    # Merge co-located receivers (AC0G/B1,B2,B4 share one grid) into a
-    # SINGLE pskreporter identity so ftlib's spotEquals dedups across
-    # them: pskreporter gets one "<base-call> @ <grid>" report per
-    # sender instead of one per receiver (operator choice 2026-06-04,
-    # option b).  psk.spots on this host is AC0G-only, so stripping the
-    # /Bx suffix is safe.
-    # PSKREPORTER_FORWARDER_MERGE_BASE=0 disables the merge: each
-    # rx_sign (e.g. AC0G/B4) reports under its own suffixed callsign,
-    # giving per-receiver identity on pskreporter maps (operator
-    # choice 2026-07-02 — one site-wide reporter_id, visible as-is).
-    _merge = os.environ.get(
-        "PSKREPORTER_FORWARDER_MERGE_BASE", "1"
-    ).strip().lower() not in ("0", "false", "no")
-    merged_call = rx_sign.split("/", 1)[0] if _merge else rx_sign
-    key = (merged_call, rx_loc)
+    # ⛔ The identity is RESOLVED BY THE CALLER (see reporter_for) and
+    # arrives here already decided.  This function must not re-derive it:
+    # the old code stripped the callsign suffix itself, which is how
+    # AC0G/B4 (Missouri) and AC0G/ND (North Dakota) came to share one
+    # instance — and therefore one map pin and one dedup pool.
+    key = (rx_sign, rx_loc)
     inst = cache.get(key)
     if inst is None:
         from pskreporter import PskReporter   # ftlib-pskreporter
         inst = PskReporter(
-            callsign=merged_call,
+            callsign=rx_sign,
             grid=rx_loc,
             antenna="wsprdaemon-forwarded",
             dummy=dummy,
@@ -298,6 +367,7 @@ def forward_rows(
     rows: Sequence[PskRow],
     *,
     psk_cache: Dict[Tuple[str, str], object],
+    overrides: Optional[Dict[str, Dict[str, str]]] = None,
     dummy: bool = False,
 ) -> int:
     """Enqueue rows into PskReporter (ftlib).  Returns count enqueued.
@@ -313,9 +383,9 @@ def forward_rows(
             logger.debug("skipping unrecognized mode %r", row.mode)
             continue
         try:
+            call, grid = reporter_for(row, overrides)
             inst = _pskreporter_for_station(
-                psk_cache, rx_sign=row.rx_sign, rx_loc=row.rx_loc,
-                dummy=dummy,
+                psk_cache, rx_sign=call, rx_loc=grid, dummy=dummy,
             )
             inst.spot(
                 callsign=row.tx_call,
@@ -431,7 +501,9 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
         if not rows:
             _interruptible_sleep(cfg.poll_sec)
             continue
-        enq = forward_rows(rows, psk_cache=cfg.psk_cache, dummy=cfg.dummy)
+        overrides = load_declared_identities(ch)
+        enq = forward_rows(rows, psk_cache=cfg.psk_cache,
+                           overrides=overrides, dummy=cfg.dummy)
         new_wm = max(r.ingested_at for r in rows)
         watermark = new_wm
         write_watermark(cfg.watermark_path, watermark)

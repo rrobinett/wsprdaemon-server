@@ -389,6 +389,7 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
 
         if config.get('ingest_psk'):
             setup_psk_tables(admin_client, config)
+            setup_psk_reporter_table(admin_client, config)
 
         if config.get('ingest_status'):
             setup_status_tables(admin_client, config)
@@ -683,6 +684,82 @@ def insert_wsprnet_reporters(client, rows: List[Dict], database: str) -> bool:
         return False
 
 
+PSK_REPORTER_TABLE = 'reporter'
+
+
+def setup_psk_reporter_table(admin_client, config: Dict) -> None:
+    """Ensure `psk.reporter` exists (idempotent).
+
+    One row per receiver that DECLARED a PSKReporter identity.  `key` is
+    spelled exactly as `pskreporter_forwarder.reporter_for()` looks it up
+    — the bare `rx_sign`, which in psk.spots already names one receiver
+    rather than a site.
+
+    Created unconditionally, like its wsprnet twin: empty means "nobody
+    declared", and a forwarder that found the table missing could not
+    tell that from "this server never built it".  The first is normal;
+    the second would silently report under a default nobody chose.
+    """
+    db = config['clickhouse_psk_database']
+    admin_client.command(f"""
+    CREATE TABLE IF NOT EXISTS {db}.{PSK_REPORTER_TABLE}
+    (
+        `key`        String    CODEC(ZSTD(3)),
+        `call`       String    CODEC(ZSTD(3)),
+        `grid`       String    CODEC(ZSTD(3)),
+        `updated_at` DateTime  CODEC(Delta(4), ZSTD(3))
+    )
+    ENGINE = ReplacingMergeTree(updated_at)
+    ORDER BY key
+    SETTINGS index_granularity = 8192
+    """)
+    log(f"Table {db}.{PSK_REPORTER_TABLE} ready", "INFO")
+
+
+def psk_reporter_rows(rows: List[Dict]) -> List[Dict]:
+    """Deduplicated identity rows from psk rows stamped by process_mode_files.
+
+    One row per receiver, not per spot: a tar carrying 40,000 FT8 rows
+    from one receiver declares one identity.
+    """
+    seen: Dict[str, Dict] = {}
+    now = datetime.utcnow()
+    for row in rows:
+        call = row.get('_psk_call')
+        rx_sign = row.get('rx_sign') or ''
+        if not call or not rx_sign:
+            continue
+        seen[rx_sign] = {
+            'key':        rx_sign,
+            'call':       call,
+            'grid':       row.get('_psk_grid') or '',
+            'updated_at': now,
+        }
+    return list(seen.values())
+
+
+def insert_psk_reporters(client, rows: List[Dict], database: str) -> bool:
+    """Insert declared PSKReporter identities.  Never fails the flush.
+
+    The PASSENGER rule: losing this write degrades to each row's own
+    rx_sign — the identity the station would have used posting directly —
+    while losing the spots would be an outage.
+    """
+    if not rows:
+        return True
+    try:
+        column_names = list(rows[0].keys())
+        cols_sql = ','.join(f'`{c}`' for c in column_names)
+        sql = (f"INSERT INTO {database}.{PSK_REPORTER_TABLE} "
+               f"({cols_sql}) VALUES")
+        client.execute(sql, [tuple(r[c] for c in column_names) for r in rows])
+        log(f"Recorded {len(rows)} PSKReporter identities", "DEBUG")
+        return True
+    except Exception as e:
+        log(f"PSKReporter identity insert failed (continuing): {e}", "WARNING")
+        return False
+
+
 def setup_psk_tables(admin_client, config: Dict) -> None:
     """Ensure the `psk` database and `psk.spots` table exist (idempotent).
 
@@ -824,6 +901,37 @@ def _wsprnet_reporter(routing: Dict, receiver_key: str) -> Optional[Tuple[str, s
     return None
 
 
+PSK_REPORTER_KEY = 'psk_reporter'
+
+
+def _psk_reporter(routing: Dict, receiver_key: str) -> Optional[Tuple[str, str]]:
+    """The (call, grid) this receiver reports to PSKReporter UNDER, or None.
+
+    The twin of `_wsprnet_reporter`, and declared the same way.  Usually
+    absent: the forwarder defaults to the row's own `rx_sign` and grid,
+    which is exactly the identity the station uses posting directly, so
+    moving onto the proxy cannot move anyone's credit.
+
+    It is declared for one reason — to MERGE.  Two receivers that declare
+    the SAME (call, grid) are reported as one station, which is what an
+    operator means by "merge B1 and B2 under AC0G".  Merging is never
+    inferred from a shared callsign prefix: `AC0G/B4` (Missouri) and
+    `AC0G/ND` (North Dakota) share one, and inferring it put North
+    Dakota's spots on a Missouri map pin.
+
+    A declaration with no `call` is dropped rather than half-applied, for
+    the same reason as the wsprnet one: a grid alone cannot name a
+    reporter.
+    """
+    for src in (routing.get(receiver_key) or {}, routing.get('default') or {}):
+        decl = src.get(PSK_REPORTER_KEY)
+        if isinstance(decl, dict):
+            call = str(decl.get('call') or '').strip()
+            if call:
+                return (call, str(decl.get('grid') or '').strip())
+    return None
+
+
 def process_mode_files(extraction_dir: Path, mode: str,
                        routing: Dict, host_id: str) -> List[Dict]:
     """Scan `<extraction_dir>/<mode>/RX_SITE/RECEIVER/BAND/*_<mode>.jsonl`
@@ -866,6 +974,7 @@ def process_mode_files(extraction_dir: Path, mode: str,
 
         receiver_key = f"{rx_site_dir}/{receiver}"
         forward = _forward_flag(routing, receiver_key)
+        psk_ident = _psk_reporter(routing, receiver_key)
 
         try:
             with open(spot_file, 'r') as f:
@@ -894,6 +1003,10 @@ def process_mode_files(extraction_dir: Path, mode: str,
                         row['mode'] = mode
                     row['band'] = band
                     row['forward_to_pskreporter'] = bool(forward)
+                    if psk_ident is not None:
+                        # Underscore-prefixed: collected by
+                        # psk_reporter_rows, never a psk.spots column.
+                        row['_psk_call'], row['_psk_grid'] = psk_ident
                     rows.append(row)
         except Exception as e:
             log(f"Error reading {spot_file}: {e}", "WARNING")
@@ -2354,6 +2467,10 @@ def main():
                                             config['clickhouse_psk_spots_table'],
                                             config['max_psk_per_insert']):
                             log(f"Flushed {len(pending_psk)} psk rows", "INFO")
+                            # Passenger: see insert_psk_reporters.
+                            insert_psk_reporters(
+                                client, psk_reporter_rows(pending_psk),
+                                config['clickhouse_psk_database'])
                             ok = True
                             break
                         if attempt < max_retries - 1:
