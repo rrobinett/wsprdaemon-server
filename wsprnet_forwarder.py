@@ -175,10 +175,12 @@ class SpotRow:
     sync_quality: Optional[float]
     dt: Optional[float]
     code: Optional[int]
+    version: Optional[str] = None
 
 
 SELECT_COLUMNS = ("time, ingested_at, rx_sign, rx_loc, rx_id, tx_sign, tx_loc, "
-                  "frequency_mhz, snr, drift, power, sync_quality, dt, code")
+                  "frequency_mhz, snr, drift, power, sync_quality, dt, code, "
+                  "version")
 
 
 def fetch_pending(ch_client, *, since: datetime, batch_size: int,
@@ -200,7 +202,7 @@ def fetch_pending(ch_client, *, since: datetime, batch_size: int,
     out: List[SpotRow] = []
     for r in ch_client.execute(sql, {"since": since, "lim": batch_size}):
         (t, ing, rxs, rxl, rxid, txs, txl, fmhz,
-         snr, drift, power, sync, dt, code) = r
+         snr, drift, power, sync, dt, code, ver) = r
         if not txs or not rxs:
             continue
         if t.tzinfo is None:
@@ -218,6 +220,7 @@ def fetch_pending(ch_client, *, since: datetime, batch_size: int,
             sync_quality=float(sync) if sync is not None else None,
             dt=float(dt) if dt is not None else None,
             code=int(code) if code is not None else None,
+            version=str(ver) if ver else None,
         ))
     return out
 
@@ -326,6 +329,31 @@ def build_multipart(*, version: str, call: str, grid: str,
 
 # ── Reporter identity ────────────────────────────────────────────────────────
 
+WSPRNET_VERSION_UNKNOWN = "WD_unknown"
+
+
+def wsprnet_version(row: SpotRow) -> str:
+    """The software version wsprnet is told produced this spot.
+
+    ⛔ THE STATION'S VERSION, NEVER THIS FORWARDER'S.  wsprnet uses this
+    field for software-population statistics, and a station that moves to
+    server-side posting must not silently start reporting as something
+    else — every proxied site would collapse into one bogus version and
+    the real spread across the fleet would disappear from wsprnet's view.
+    Stations send `WD_<version>` (hs-uploader
+    `transports/wsprnet.py`: `version=f"WD_{self.version}"`), and the
+    version each tar declared is already stored per row, so we reproduce
+    exactly what the station itself would have sent.
+
+    ⚠ Unknown is reported as unknown, not guessed.  Filling in a
+    plausible "4.0" would be a false claim about someone else's software.
+    In practice opting in requires an hs-uploader that always declares a
+    version, so a missing one means something upstream changed.
+    """
+    v = (row.version or "").strip()
+    return f"WD_{v}" if v else WSPRNET_VERSION_UNKNOWN
+
+
 def reporter_key(row: SpotRow) -> str:
     """The precise key naming ONE receiver: `<rx_sign>/<rx_id>`.
 
@@ -360,16 +388,22 @@ def reporter_for(row: SpotRow, overrides: Dict[str, Dict[str, str]]
 
 
 def group_by_reporter(rows: List[SpotRow], overrides: Dict[str, Dict[str, str]]
-                      ) -> Dict[Tuple[str, str], List[SpotRow]]:
-    """Rows bucketed by the identity they must be POSTed under.
+                      ) -> Dict[Tuple[str, str, str], List[SpotRow]]:
+    """Rows bucketed by (call, grid, version) — one POST each.
 
-    One POST per reporter: the call/grid are multipart FORM fields, not
-    per-line fields, so spots from two different reporters cannot share
-    a transaction without misattributing one of them.
+    call, grid AND version are all multipart FORM fields, not per-line
+    fields, so two rows that disagree on any of them cannot share a
+    transaction without one of them being misreported.  Two reporters in
+    one POST misattributes the spots; two versions in one POST tells
+    wsprnet the wrong software produced half of them.
+
+    In practice a site runs one version, so this splits nothing extra —
+    except across an upgrade, which is exactly when it matters.
     """
-    out: Dict[Tuple[str, str], List[SpotRow]] = {}
+    out: Dict[Tuple[str, str, str], List[SpotRow]] = {}
     for row in rows:
-        out.setdefault(reporter_for(row, overrides), []).append(row)
+        call, grid = reporter_for(row, overrides)
+        out.setdefault((call, grid, wsprnet_version(row)), []).append(row)
     return out
 
 
@@ -476,12 +510,16 @@ def post_mept(url: str, body: bytes, *, timeout: float,
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def forward_rows(rows: List[SpotRow], *, url: str, version: str,
+def forward_rows(rows: List[SpotRow], *, url: str, version: str = "",
                  overrides: Dict[str, Dict[str, str]],
                  timeout: float = DEFAULT_HTTP_TIMEOUT,
                  max_per_upload: int = MAX_SPOTS_PER_UPLOAD,
                  opener=None) -> Tuple[int, int]:
     """Dedup, group by reporter, POST.  Returns (posted, failed).
+
+    ⚠ `version` is NOT what gets POSTed.  Each group reports the
+    STATION's own version (see wsprnet_version); this argument is kept
+    only so callers that logged it still work.
 
     ⛔ CHUNKED AT max_per_upload.  wsprnet SILENTLY TRUNCATES a larger
     transaction, which is the worst failure shape available: it returns
@@ -492,7 +530,7 @@ def forward_rows(rows: List[SpotRow], *, url: str, version: str,
     # receiver in it (see dedup_for_wsprnet), so deduping the mixed batch
     # first would let one site's spot delete 54 other sites' independent
     # reports of the same transmission.
-    for (call, grid), group in group_by_reporter(rows, overrides).items():
+    for (call, grid, ver), group in group_by_reporter(rows, overrides).items():
         group = dedup_for_wsprnet(group)
         lines = [ln for ln in (row_to_mept(r) for r in group) if ln]
         if not lines:
@@ -500,17 +538,17 @@ def forward_rows(rows: List[SpotRow], *, url: str, version: str,
         for i in range(0, len(lines), max_per_upload):
             chunk = lines[i:i + max_per_upload]
             body = build_multipart(
-                version=version, call=call, grid=grid,
+                version=ver, call=call, grid=grid,
                 allmept=("\n".join(chunk) + "\n").encode())
             ok, detail = post_mept(url, body, timeout=timeout, opener=opener)
             if ok:
                 posted += len(chunk)
-                logger.info("posted %d spot(s) as %s/%s — %s",
-                            len(chunk), call, grid, detail)
+                logger.info("posted %d spot(s) as %s/%s (%s) — %s",
+                            len(chunk), call, grid, ver, detail)
             else:
                 failed += len(chunk)
-                logger.warning("POST failed for %s/%s (%d spots): %s",
-                               call, grid, len(chunk), detail)
+                logger.warning("POST failed for %s/%s (%s, %d spots): %s",
+                               call, grid, ver, len(chunk), detail)
     return posted, failed
 
 

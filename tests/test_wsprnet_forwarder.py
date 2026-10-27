@@ -254,7 +254,10 @@ def test_the_body_is_multipart_with_the_wd_boundary_and_fields():
     body = calls[0].data
     assert wf._BOUNDARY in body
     assert b'name="allmept"; filename="spots.txt"' in body
-    assert b"9.9" in body and b"AC0G" in body
+    assert b"AC0G" in body
+    # The version field is the STATION's, not this forwarder's — see
+    # test_wsprnet_is_told_THE_STATIONS_version_not_ours.
+    assert b"9.9" not in body
 
 
 if __name__ == "__main__":
@@ -517,3 +520,104 @@ def test_an_unrecognised_reply_is_kept_not_swallowed():
     assert "nope" in wf._wsprnet_verdict("<html><body>nope</body></html>")
     assert wf._wsprnet_verdict("") == "(empty response)"
     assert len(wf._wsprnet_verdict("x" * 9000)) <= 160
+
+
+# ---------- the version wsprnet is told ----------
+
+def _version_field(req):
+    return req.data.split(b'name="version"')[1].split(b"\r\n\r\n")[1].split(b"\r\n")[0]
+
+
+def test_wsprnet_is_told_THE_STATIONS_version_not_ours():
+    """⛔ wsprnet uses this field for software-population statistics.  A
+    station moving to server-side posting must keep reporting its OWN
+    version, or every proxied site collapses into one bogus version and the
+    real spread across the fleet disappears from wsprnet's view.
+
+    Stations send `WD_<version>` (hs-uploader transports/wsprnet.py:
+    `version=f"WD_{self.version}"`), and the version each tar declared is
+    already stored per row, so we reproduce exactly what the station would
+    have sent itself."""
+    calls = []
+    wf.forward_rows([_row(version="4.0")], url="http://x/", version="9.9",
+                    overrides={}, opener=_ok_opener(calls))
+    assert _version_field(calls[0]) == b"WD_4.0"
+
+
+def test_two_versions_NEVER_share_a_transaction():
+    """version is a FORM field, not a per-line field.  Two versions in one
+    POST tells wsprnet the wrong software produced half the spots — which
+    is exactly what happens across an upgrade."""
+    calls = []
+    rows = [_row(version="4.0", tx_sign="W2NAF"),
+            _row(version="4.1", tx_sign="K3LR")]
+    posted, failed = wf.forward_rows(rows, url="http://x/", version="9.9",
+                                     overrides={}, opener=_ok_opener(calls))
+    assert (posted, failed) == (2, 0)
+    assert len(calls) == 2
+    assert {_version_field(c) for c in calls} == {b"WD_4.0", b"WD_4.1"}
+
+
+def test_an_unknown_version_is_reported_as_unknown_not_guessed():
+    """⚠ Filling in a plausible '4.0' would be a false claim about someone
+    else's software."""
+    assert wf.wsprnet_version(_row(version=None)) == "WD_unknown"
+    assert wf.wsprnet_version(_row(version="   ")) == "WD_unknown"
+    assert wf.wsprnet_version(_row(version=" 4.0 ")) == "WD_4.0"
+
+
+def test_the_version_prefix_matches_what_stations_actually_send():
+    """⛔ CROSS-REPO: the `WD_` prefix is hs-uploader's, and if it drifts
+    here the proxied spots report a version string wsprnet has never seen
+    from this fleet.  Skips without an hs-uploader checkout."""
+    from pathlib import Path as _P
+    src = _P(__file__).resolve().parents[2] / "hs-uploader" / "src" / \
+        "hs_uploader" / "transports" / "wsprnet.py"
+    if not src.exists():
+        import pytest
+        pytest.skip("no hs-uploader checkout to compare against")
+    text = src.read_text()
+    assert 'version=f"WD_{self.version}"' in text, (
+        "hs-uploader changed how it spells the version field; "
+        "wsprnet_version() must change with it")
+
+
+# ---------- the DB -> SpotRow hop (every test above mocks it away) ----------
+
+class _FakeCH:
+    """Answers fetch_pending's SELECT positionally, as clickhouse-driver does."""
+    def __init__(self, rows): self.rows, self.sql, self.params = rows, None, None
+    def execute(self, sql, params=None):
+        self.sql, self.params = sql, params
+        return self.rows
+
+
+def test_fetch_pending_READS_THE_VERSION_COLUMN():
+    """⛔ Every other test builds a SpotRow by hand, so the DB->row hop is
+    exactly where a dropped column hides: the forwarder would keep running
+    and every proxied spot would quietly report WD_unknown to wsprnet."""
+    t = datetime(2026, 10, 27, 3, 6, tzinfo=timezone.utc)
+    ch = _FakeCH([(t, t, "AC0G/B4", "EM38ww", "AC0G-B4", "W2NAF", "FN21",
+                   14.0971234, -12.0, 0, 37, 0.85, 0.3, 2, "4.0")])
+    rows = wf.fetch_pending(ch, since=t, batch_size=10)
+    assert len(rows) == 1
+    assert rows[0].version == "4.0"
+    assert wf.wsprnet_version(rows[0]) == "WD_4.0"
+    assert "version" in ch.sql, "the SELECT must ask for it"
+    assert "proxy_upload = 1" in ch.sql, "and must still select only opt-ins"
+
+
+def test_fetch_pending_tolerates_a_null_version():
+    t = datetime(2026, 10, 27, 3, 6, tzinfo=timezone.utc)
+    ch = _FakeCH([(t, t, "AC0G/B4", "EM38ww", "AC0G-B4", "W2NAF", "FN21",
+                   14.0971234, -12.0, 0, 37, 0.85, 0.3, 2, None)])
+    rows = wf.fetch_pending(ch, since=t, batch_size=10)
+    assert rows[0].version is None
+    assert wf.wsprnet_version(rows[0]) == "WD_unknown"
+
+
+def test_the_SELECT_column_order_matches_the_unpack():
+    """A column added to SELECT_COLUMNS but not to the tuple unpack (or the
+    reverse) shifts every field silently — snr becomes drift, and the spots
+    stay plausible."""
+    assert len(wf.SELECT_COLUMNS.split(",")) == 15
