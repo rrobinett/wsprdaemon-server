@@ -1,0 +1,54 @@
+# /etc/systemd/system/wsprnet-forwarder.service
+#
+# Per-wd wsprnet.org forwarder.  Runs on wd10, wd20, wd30; only the
+# gw1-elected leader actually POSTs, the others idle but keep their
+# watermark fresh so failover is gap-free.  See wsprnet_forwarder.py.
+#
+# ⚠ INERT UNTIL A STATION OPTS IN.  It forwards only rows carrying
+# proxy_upload = 1, and no station sets that today, so enabling this
+# changes nothing until a station is switched to server-side posting.
+# That is deliberate: no flag day, and you can enable one station at a
+# time.  Run with --dry-run first to watch what it WOULD post.
+#
+# Operator setup:
+#   1. mkdir -p /var/lib/wsprdaemon/wsprnet_forwarder
+#      chown wsprdaemon:wsprdaemon /var/lib/wsprdaemon/wsprnet_forwarder
+#   2. ln -s ~wsprdaemon/wsprdaemon-server/wsprnet_forwarder.py \
+#          /usr/local/bin/wsprnet_forwarder.py
+#   3. /etc/default/wsprnet-forwarder:
+#        THIS_HOST=wd20
+#        CLICKHOUSE_USER=chadmin
+#        CLICKHOUSE_PASSWORD=...
+#        # Optional: sites whose wsprnet REPORTER identity differs from
+#        # the per-spot rx_sign (an operator running several receivers
+#        # under one wsprnet identity).  Absent is correct for every
+#        # single-receiver site.
+#        #   /etc/wsprdaemon/wsprnet_reporters.json
+#        #   { "KA9Q_0": {"call": "AC0G", "grid": "EM38ww"} }
+#        # Optional during staging — pin leadership and skip the elector:
+#        #   WSPRNET_FORWARDER_PIN_LEADER=wd20
+#   4. systemctl enable --now wsprnet-forwarder
+[Unit]
+Description=wsprnet.org forwarder (wsprdaemon-server)
+Documentation=https://github.com/rrobinett/wsprdaemon-server
+After=network-online.target clickhouse-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=wsprdaemon
+EnvironmentFile=-/etc/default/wsprnet-forwarder
+ExecStart=/opt/wsprdaemon-server/venv/bin/python \
+    /usr/local/bin/wsprnet_forwarder.py \
+    --this-host ${THIS_HOST} \
+    --clickhouse-user ${CLICKHOUSE_USER} \
+    --clickhouse-password ${CLICKHOUSE_PASSWORD}
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wsprnet-forwarder
+
+[Install]
+WantedBy=multi-user.target

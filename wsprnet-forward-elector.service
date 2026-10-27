@@ -1,0 +1,41 @@
+# /etc/systemd/system/wsprnet-forward-elector.service
+#
+# gw1-side elector for the wsprnet.org forwarder.  Probes the candidate
+# servers' ClickHouse ports and writes the preferred healthy leader's
+# short hostname to /var/www/html/wsprnet-leader.txt (served by nginx at
+# http://gw1.wsprdaemon.org/wsprnet-leader.txt).
+#
+# ⛔ SEPARATE OUTPUT FILE FROM THE PSKReporter ELECTOR, ON PURPOSE.
+# The two have DIFFERENT preference orders and must be able to elect
+# different leaders: sharing one file would silently couple them, so a
+# change to one service's ordering would move the other's traffic too.
+#
+# Preference order (rob, 2026-10-26): wd20 first — it serves fewer
+# public queries than the others — then wd10, then wd30.  Override with
+# repeated --candidate flags in /etc/default/wsprnet-forward-elector,
+# or pin by hand with --pin <host>.
+[Unit]
+Description=wsprnet.org forwarder elector
+Documentation=https://github.com/rrobinett/wsprdaemon-server
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=www-data
+EnvironmentFile=-/etc/default/wsprnet-forward-elector
+ExecStart=/opt/wsprdaemon-server/venv/bin/python \
+    /opt/wsprdaemon-server/pskreporter_forward_elector.py \
+    --candidate wd20.wsprdaemon.org \
+    --candidate wd10.wsprdaemon.org \
+    --candidate wd30.wsprdaemon.org \
+    --output-path /var/www/html/wsprnet-leader.txt
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wsprnet-forward-elector
+
+[Install]
+WantedBy=multi-user.target
