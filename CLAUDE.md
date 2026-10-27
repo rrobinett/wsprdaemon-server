@@ -428,8 +428,9 @@ wsprnet) showing AC0G/B4 unbroken across the cutover.
 
 ### Four defects only deployment found
 
-Both were invisible to a test suite written from the same mental model as the
-code, and both were caught within minutes of touching real data:
+Every one was invisible to a test suite written from the same mental model as
+the code.  The first two surfaced within minutes of touching real data; the
+last two needed a night of it, and the fourth hid the third:
 
 - **One site's spot deleted every other site's.**  `forward_rows` deduped the
   whole batch *before* grouping by reporter.  The dedup key has no receiver in
