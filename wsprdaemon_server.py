@@ -27,7 +27,7 @@ import clickhouse_driver        # native TCP client — used for the hot insert 
 import logging
 
 # Version
-VERSION = "2.29.0"  # forward_to_wsprnet station switch -> proxy_upload; wsprnet reporter identity
+VERSION = "2.30.0"  # spots.ingested_at — the wsprnet forwarder's arrival cursor
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -345,6 +345,7 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
             ov_count      UInt32                            CODEC(T64, ZSTD(1)),
             rx_status     LowCardinality(String) DEFAULT 'No Info' CODEC(LZ4),
             band_m        Int16                             CODEC(T64, ZSTD(1)),
+            ingested_at   DateTime DEFAULT toDateTime(0)    CODEC(Delta(4), ZSTD(3)),
             id            UInt64 ALIAS cityHash64(rx_sign, tx_sign, band, rx_id, time, frequency)
         )
         ENGINE = ReplacingMergeTree()
@@ -381,6 +382,8 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
         """
         admin_client.command(create_noise_table_sql)
         log(f"Table {config['clickhouse_database']}.{config['clickhouse_noise_table']} ready", "INFO")
+
+        ensure_spots_ingested_at(admin_client, config)
 
         setup_wsprnet_reporter_table(admin_client, config)
 
@@ -551,6 +554,43 @@ def insert_status_rows(client, rows: List[Dict], database: str, table: str,
         import traceback
         traceback.print_exc()
         return False
+
+
+def ensure_spots_ingested_at(admin_client, config: Dict) -> None:
+    """Add `ingested_at` to an existing spots table (idempotent, metadata-only).
+
+    The wsprnet forwarder's cursor is ARRIVAL order, not spot time: a
+    station running minutes behind must not have its spots skipped because
+    a prompt station already moved the watermark past their cycle.  So the
+    column has to exist before the forwarder can run at all.
+
+    ⛔⛔ THE DEFAULT MUST BE A CONSTANT, NEVER `now()`.  ClickHouse does
+    not rewrite existing parts when a column is added; it computes the
+    DEFAULT for the missing column AT READ TIME.  With `now()`, all 4.18
+    billion pre-existing rows would read as "just arrived" on every query,
+    so the forwarder would select the entire table, forever, and post a
+    decade of spots to wsprnet.  `toDateTime(0)` makes them read as the
+    epoch, which is below any watermark and therefore invisible.
+    `psk.spots` can use `DEFAULT now()` safely only because it was created
+    with the column and has no partless rows.
+
+    Because the default is a constant, the value has to come from US on
+    every insert — see `convert_spot_to_clickhouse`.  ADD COLUMN itself
+    touches metadata only, so this is fast on a 50 GiB table and safe to
+    run at every startup.
+    """
+    db = config['clickhouse_database']
+    table = config['clickhouse_spots_table']
+    try:
+        admin_client.command(
+            f"ALTER TABLE {db}.{table} ADD COLUMN IF NOT EXISTS "
+            f"`ingested_at` DateTime DEFAULT toDateTime(0) "
+            f"CODEC(Delta(4), ZSTD(3))")
+        log(f"Column {db}.{table}.ingested_at ready", "INFO")
+    except Exception as e:
+        # Not fatal: without it the forwarder cannot run, but ingest can.
+        log(f"Could not add {db}.{table}.ingested_at ({e}) — the wsprnet "
+            f"forwarder will not be able to track arrivals", "ERROR")
 
 
 WSPRNET_REPORTER_TABLE = 'wsprnet_reporter'
@@ -1568,6 +1608,12 @@ def convert_spot_to_clickhouse(spot: Dict) -> Dict:
         'v_lon':         spot.get('v_lon', 0.0),
         'ov_count':      spot.get('ov_count', 0),
         'proxy_upload':  spot.get('proxy_upload', 0),
+        # ARRIVAL time, not spot time.  Written explicitly because the
+        # column's DEFAULT is a constant on purpose (ensure_spots_ingested_at).
+        # ClickHouse's own timezone is UTC on the wd servers, and every
+        # reader of this column compares it only against values it read back
+        # from the same column, so a naive UTC value is self-consistent.
+        'ingested_at':   datetime.utcnow(),
         'band_m':        spot.get('band_m', spot.get('band', 0)),
         'version':       spot.get('client_version', None),
         'rx_status':     'No Info',

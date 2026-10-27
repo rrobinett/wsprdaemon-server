@@ -207,3 +207,44 @@ def test_every_identity_row_key_is_a_column_in_the_schema():
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ---------- the forwarder's arrival cursor ----------
+
+def test_every_spot_carries_an_ARRIVAL_time():
+    """⛔ The forwarder's cursor is arrival order, not spot time.  Without
+    this the column reads as its constant default and the forwarder sees
+    nothing; with spot time as the cursor instead, a station running a few
+    minutes behind is skipped whenever a prompt station has already moved
+    the watermark past that cycle."""
+    from datetime import datetime, timedelta
+    before = datetime.utcnow() - timedelta(seconds=2)
+    ch = ws.convert_spot_to_clickhouse(_spots({})[0])
+    after = datetime.utcnow() + timedelta(seconds=2)
+    assert 'ingested_at' in ch
+    assert before <= ch['ingested_at'] <= after
+    # ...and it is NOT the spot's own time, which is what makes it a cursor.
+    assert ch['ingested_at'] != ch['time']
+
+
+def test_the_added_column_default_is_a_CONSTANT_never_now():
+    """⛔⛔ ClickHouse computes a missing column's DEFAULT at READ time.
+    `DEFAULT now()` would make all 4.18 billion pre-existing rows read as
+    'just arrived' on every query, so the forwarder would select the whole
+    table forever and post a decade of spots to wsprnet."""
+    import inspect, re
+    src = inspect.getsource(ws.ensure_spots_ingested_at)
+    stmt = src.split("ALTER TABLE")[1]
+    assert "toDateTime(0)" in stmt
+    assert not re.search(r"DEFAULT\s+now\(\)", stmt)
+    assert "ADD COLUMN IF NOT EXISTS" in stmt, "must be idempotent at startup"
+
+
+def test_a_fresh_spots_table_declares_the_same_default():
+    """The two spellings — CREATE for a fresh wd, ALTER for an existing one
+    — must not drift, or a new server and an old one disagree about what an
+    unwritten row means."""
+    import inspect, re
+    src = inspect.getsource(ws.setup_clickhouse_tables)
+    m = re.search(r"ingested_at\s+DateTime\s+DEFAULT\s+(\S+)", src)
+    assert m and m.group(1) == "toDateTime(0)", src[:0] or m
