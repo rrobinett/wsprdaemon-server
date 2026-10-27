@@ -70,7 +70,17 @@ DEFAULT_DB_HOST = "localhost"
 DEFAULT_DB_NATIVE_PORT = 9000
 DEFAULT_POLL_SEC = 30
 DEFAULT_LEADER_POLL_SEC = 60
-DEFAULT_HTTP_TIMEOUT = 15
+# ⛔ wsprnet is SLOW, and its own reply measures it: "Processing took 9033
+# milliseconds" for 101 spots — about 89 ms per spot, so a full
+# MAX_SPOTS_PER_UPLOAD upload is ~90 s of work on their side.  A timeout
+# shorter than that does NOT fail safe: wsprnet ingests the spots anyway,
+# we never see the reply, the watermark is held, and the next pass
+# re-posts a batch wsprnet already has.  The backlog then grows, the next
+# POST is bigger and times out sooner — self-reinforcing.  wd30 spent
+# 2026-10-27 doing exactly that, at 4.3x the traffic for zero extra spots.
+# Keep at least 2x the measured worst case (test_the_timeout_must_outlast_
+# wsprnets_OWN_measured_processing_rate pins it).
+DEFAULT_HTTP_TIMEOUT = 180
 DEFAULT_URL = "http://wsprnet.org/meptspots.php"
 DEFAULT_COLD_START_MINUTES = 5
 
@@ -489,7 +499,8 @@ def load_declared_identities(ch_client, *, db: str = "wsprdaemon",
 _ADDED_RE = re.compile(r"(\d+)\s+out of\s+(\d+)\s+spot", re.I)
 
 
-def _wsprnet_verdict(text: str) -> str:
+def _wsprnet_verdict(text: str,
+                     expected: Optional[int] = None) -> str:
     """wsprnet's answer, reduced to the one line that means anything.
 
     It replies with a full HTML page, so logging it raw puts a web page in
@@ -504,13 +515,26 @@ def _wsprnet_verdict(text: str) -> str:
     being ignored, which looks identical to success at the HTTP layer.
     That is why the numbers are surfaced rather than just "HTTP 200".
     """
-    m = _ADDED_RE.search(text)
-    if m:
-        return f"{m.group(1)} of {m.group(2)} spots added"
-    return " ".join(text.split())[:160] or "(empty response)"
+    pairs = _ADDED_RE.findall(text)
+    if not pairs:
+        return " ".join(text.split())[:160] or "(empty response)"
+    # ⛔ SUM EVERY BLOCK.  wsprnet answers a large upload with one such
+    # sentence PER BLOCK, so reading only the first under-reports by the
+    # block size: a 999-spot upload that landed in full read back as
+    # "0 of 100" and looked like a total duplicate rejection.
+    added = sum(int(a) for a, _ in pairs)
+    counted = sum(int(b) for _, b in pairs)
+    verdict = f"{added} of {counted} spots added"
+    if expected is not None and counted != expected:
+        # The silent-truncation shape: HTTP 200, a cheerful verdict, and a
+        # tail wsprnet never acknowledged.  Nothing downstream can see it.
+        verdict += (f" — \u26a0 SENT {expected}, wsprnet accounted for "
+                    f"only {counted}")
+    return verdict
 
 
 def post_mept(url: str, body: bytes, *, timeout: float,
+              expected: Optional[int] = None,
               opener=None) -> Tuple[bool, str]:
     """POST one multipart body.  Returns (ok, detail)."""
     req = urllib.request.Request(
@@ -523,7 +547,8 @@ def post_mept(url: str, body: bytes, *, timeout: float,
         with _open(req, timeout=timeout) as resp:
             code = getattr(resp, "status", None) or resp.getcode()
             text = resp.read().decode("utf-8", errors="replace")
-        return (200 <= int(code) < 300), f"HTTP {code}: {_wsprnet_verdict(text)}"
+        return (200 <= int(code) < 300), (
+            f"HTTP {code}: {_wsprnet_verdict(text, expected)}")
     except urllib.error.HTTPError as exc:
         return False, f"HTTP {exc.code}"
     except Exception as exc:                        # noqa: BLE001
@@ -560,7 +585,8 @@ def forward_rows(rows: List[SpotRow], *, url: str, version: str = "",
             body = build_multipart(
                 version=ver, call=call, grid=grid,
                 allmept=("\n".join(chunk) + "\n").encode())
-            ok, detail = post_mept(url, body, timeout=timeout, opener=opener)
+            ok, detail = post_mept(url, body, timeout=timeout,
+                                   expected=len(chunk), opener=opener)
             if ok:
                 posted += len(chunk)
                 logger.info("posted %d spot(s) as %s/%s (%s) — %s",

@@ -678,3 +678,105 @@ def test_a_FULL_BATCH_does_not_wait_out_the_window():
         rows = [_row(tx_sign=f"W{i}ABC") for i in range(4)]
         # batch=4 means every fetch comes back full -> drain every poll.
         assert _windowed(tmp, rows, post_interval=300, passes=5, batch=4) == 5
+
+
+# ---------- what wsprnet's reply actually accounts for ----------
+#
+# Deployment note (wd30, 2026-10-27).  These four tests exist because the
+# forwarder spent a night re-posting spots wsprnet had already taken.
+# Two separate defects, both invisible at the HTTP layer:
+#
+#   1. wsprnet reports in BLOCKS.  A 999-spot upload comes back with
+#      several "N out of M spot(s) added" sentences, and `.search()` read
+#      only the first — so the journal said "0 of 100" for an upload of
+#      999 that had in fact landed.  61,126 spot-lines went out and the
+#      counter claimed 4,868, while wsprnet's own public record (scraped
+#      into wspr.rx) matched wd30 hour for hour to within six spots.
+#   2. wsprnet is SLOW, and its own reply says so: "Processing took 9033
+#      milliseconds" for 101 spots — 89 ms per spot.  At a 15 s timeout
+#      anything past ~170 spots times out.  B4's rate climbed past that
+#      mid-morning, we abandoned the read, held the watermark and
+#      re-posted a batch wsprnet had already ingested.  Backlog grows,
+#      next POST is bigger, times out sooner.  Self-reinforcing.
+
+
+def test_EVERY_block_wsprnet_reports_is_counted_not_just_the_first():
+    """⛔ wsprnet answers a large upload in blocks.  Reading only the first
+    sentence under-reports by the block size and makes a successful upload
+    look like a total duplicate rejection."""
+    page = ("<html><body><pre>\n"
+            "0 out of 100 spot(s) added<br>\n"
+            "0 out of 100 spot(s) added<br>\n"
+            "37 out of 99 spot(s) added<br>\n"
+            "Processing took 26012 milliseconds.<br>\n</pre></body></html>")
+    assert wf._wsprnet_verdict(page) == "37 of 299 spots added"
+
+
+def test_a_SHORTFALL_between_what_we_SENT_and_what_wsprnet_COUNTED_is_shouted():
+    """The silent-truncation failure shape: HTTP 200, a cheerful verdict,
+    and a tail that wsprnet never acknowledged.  Nothing else in the system
+    can notice it, so the verdict itself has to."""
+    page = "0 out of 100 spot(s) added<br>"
+    loud = wf._wsprnet_verdict(page, expected=999)
+    assert "999" in loud and "100" in loud
+    assert "SENT" in loud          # it must be impossible to read past
+
+
+def test_no_shortfall_means_no_noise():
+    page = "40 out of 101 spot(s) added<br>"
+    assert wf._wsprnet_verdict(page, expected=101) == "40 of 101 spots added"
+    # and saying nothing about what we sent must not invent a complaint
+    assert wf._wsprnet_verdict(page) == "40 of 101 spots added"
+
+
+def test_the_timeout_must_outlast_wsprnets_OWN_measured_processing_rate():
+    """⛔ Measured from wsprnet's own reply: 9033 ms for 101 spots.  A
+    timeout under that for a full upload does not fail safe — wsprnet
+    still ingests the spots, so the retry is pure duplicate traffic."""
+    ms_per_spot = 9033 / 101
+    worst_case_sec = wf.MAX_SPOTS_PER_UPLOAD * ms_per_spot / 1000
+    assert wf.DEFAULT_HTTP_TIMEOUT >= 2 * worst_case_sec, (
+        f"a full {wf.MAX_SPOTS_PER_UPLOAD}-spot upload needs about "
+        f"{worst_case_sec:.0f}s of wsprnet processing; "
+        f"{wf.DEFAULT_HTTP_TIMEOUT}s leaves no headroom")
+
+
+def test_post_mept_tells_the_verdict_how_many_spots_it_SENT():
+    """Without this the shortfall check above can never fire in production."""
+    seen = {}
+
+    class _Resp:
+        status = 200
+        def read(self): return b"0 out of 100 spot(s) added<br>"
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def _opener(req, timeout=None):
+        seen["timeout"] = timeout
+        return _Resp()
+
+    ok, detail = wf.post_mept("http://x/", b"body", timeout=180,
+                              expected=999, opener=_opener)
+    assert ok
+    assert "SENT" in detail and "999" in detail
+    assert seen["timeout"] == 180
+
+
+def test_forward_rows_tells_the_verdict_THE_SIZE_OF_EACH_CHUNK_it_sent():
+    """⛔ The shortfall check is only as good as its wiring.  If forward_rows
+    stops declaring the chunk size, every verdict silently loses the one
+    number that can reveal a truncated upload — and the tests on
+    _wsprnet_verdict alone would all still pass."""
+    rows = [_row(tx_sign=f"W{i:04d}", frequency_mhz=14.0 + i * 0.001)
+            for i in range(1500)]
+    seen = []
+    real = wf._wsprnet_verdict
+
+    def _spy(text, expected=None):
+        seen.append(expected)
+        return real(text, expected)
+
+    with mock.patch.object(wf, "_wsprnet_verdict", _spy):
+        wf.forward_rows(rows, url="http://x/", version="1",
+                        overrides={}, opener=_ok_opener([]))
+    assert seen == [999, 501], f"chunk sizes never reached the verdict: {seen}"

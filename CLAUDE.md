@@ -426,7 +426,7 @@ Proven end to end: B4 tar → gw1/gw2 → reflector → wd30 ingest (`proxy_uplo
 → forwarder → wsprnet.org, confirmed by `wspr.rx` (scraped back **from**
 wsprnet) showing AC0G/B4 unbroken across the cutover.
 
-### Two defects only deployment found
+### Four defects only deployment found
 
 Both were invisible to a test suite written from the same mental model as the
 code, and both were caught within minutes of touching real data:
@@ -443,6 +443,31 @@ code, and both were caught within minutes of touching real data:
   with the log saying "would forward" and the watermark saying "done".
   Recovered by rewinding the watermark; wsprnet's reply ("40 out of 101 spot(s)
   added") confirmed the count exactly.
+
+- **A 15 s HTTP timeout turned a slow reply into a duplicate storm.**
+  wsprnet's own reply measures its speed — *"Processing took 9033
+  milliseconds"* for 101 spots, about **89 ms per spot** — so a full
+  999-spot upload is ~90 s of work on their side.  At 15 s the forwarder
+  abandoned the read, but wsprnet had already ingested the spots; the
+  watermark was held, the next pass re-posted the same batch, the backlog
+  grew, the next POST was bigger and timed out sooner.  Self-reinforcing.
+  It stayed hidden overnight because B4's rate was under the threshold until
+  morning: at ~800 spots/h a window is ~7 s of wsprnet processing, at
+  ~1,750 spots/h it is ~13 s and crosses the limit.  Cost over one night:
+  **61,126 spot-lines transmitted for 14,309 distinct spots — 4.3x** the
+  traffic, on a feature whose entire purpose is to cut traffic.  The timeout
+  is now 180 s, at least 2x the measured worst case, and a test pins it to
+  that measured rate so it cannot be trimmed back.
+- **The success counter read one block of a multi-block reply.**  wsprnet
+  answers a large upload with one *"N out of M spot(s) added"* sentence **per
+  block**, and `_ADDED_RE.search()` took the first.  A 999-spot upload that
+  landed in full read back as `0 of 100` — indistinguishable in the journal
+  from total rejection.  Over the same night the counter claimed 4,868 added
+  against 61,126 sent, while `wspr.rx` — wsprnet's own public record, scraped
+  back — matched wd30 hour for hour to within six spots.  **The log was the
+  only thing that was wrong.**  The verdict now sums every block and, when
+  what wsprnet accounted for differs from what we sent, says so in capitals:
+  silent truncation is the one failure here that nothing else can detect.
 
 **Before widening beyond one station**, two things are relations, not code:
 attribution (we post under operators' callsigns from our IP) and wsprnet's
