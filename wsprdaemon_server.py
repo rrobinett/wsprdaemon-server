@@ -27,7 +27,7 @@ import clickhouse_driver        # native TCP client — used for the hot insert 
 import logging
 
 # Version
-VERSION = "2.28.0"  # station.heartbeat ingestion (status/); gated by WSPRDAEMON_INGEST_STATUS=1
+VERSION = "2.29.0"  # forward_to_wsprnet station switch -> proxy_upload; wsprnet reporter identity
 
 # Default configuration
 DEFAULT_CONFIG = {
