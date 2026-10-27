@@ -48,12 +48,30 @@ LOCK_DIR="/run/lock"
 
 ALL_HOSTS="wd10 wd20 wd30"
 PEERS=""
-TABLES="wspr.rx wsprdaemon.spots wsprdaemon.noise psk.spots pskreporter.rx"
+TABLES="wspr.rx wsprdaemon.spots wsprdaemon.noise psk.spots pskreporter.rx psk.reporter wsprdaemon.wsprnet_reporter"
 LOOKBACK_HOURS=48
 CUTOFF_MINUTES=20
 CHUNK_HOURS=48           # compare/copy at most this many hours per query batch (bounds memory on big tables)
 declare -A TABLE_PEERS
 TABLE_PEERS[pskreporter.rx]="wd10"
+
+# Which column carries the row's time.  Default "time"; the reporter identity
+# tables are keyed on when the declaration was made, not on a spot instant.
+#
+# ⛔ These two tables MUST be synced.  A station declares the identity it
+# merges under once, in routing.json, and it is recorded on whichever server
+# ingested that tar.  The pskreporter/wsprnet forwarders run under an elector,
+# so the server that POSTS is not necessarily the one that INGESTED — an
+# unsynced declaration means the forwarder reports under an identity the
+# operator did not choose.  They are tiny: one row per receiver per distinct
+# declaration, collapsed by ReplacingMergeTree.
+#
+# An active station rewrites its declaration on every flush, so a live site's
+# identity is always inside the lookback window.  A silent station's ages out
+# — which is harmless, because it has no spots to forward either.
+declare -A TABLE_TIME_COL
+TABLE_TIME_COL[psk.reporter]="updated_at"
+TABLE_TIME_COL[wsprdaemon.wsprnet_reporter]="updated_at"
 
 DRY_RUN=0
 VERBOSE=0
@@ -182,8 +200,9 @@ for table in $TABLES; do
         else
             ident="cityHash64(*)"
         fi
-        where_win="time >= toDateTime(${CH_SINCE}) AND time < toDateTime(${CH_UNTIL})"
-        hour_expr="toUnixTimestamp(toStartOfHour(time, 'UTC'))"
+        tcol="${TABLE_TIME_COL[$table]:-time}"
+        where_win="${tcol} >= toDateTime(${CH_SINCE}) AND ${tcol} < toDateTime(${CH_UNTIL})"
+        hour_expr="toUnixTimestamp(toStartOfHour(${tcol}, 'UTC'))"
 
         declare -A lc=() pc=()
         while IFS=$'\t' read -r h c; do [[ -n "$h" ]] && lc[$h]=$c; done < <(ch "SELECT ${hour_expr} AS h, uniqExact(${ident}) AS c FROM ${table} WHERE ${where_win} GROUP BY h FORMAT TSV") || { log "ERROR $table: local hour counts failed"; TOTAL_ERRORS=$((TOTAL_ERRORS+1)); continue; }

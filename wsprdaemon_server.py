@@ -597,6 +597,53 @@ def ensure_spots_ingested_at(admin_client, config: Dict) -> None:
 WSPRNET_REPORTER_TABLE = 'wsprnet_reporter'
 
 
+REPORTER_SORTING_KEY = "key, call, grid"
+
+
+def _reporter_table_layout_ok(admin_client, db: str, table: str) -> None:
+    """Make a reporter table's sorting key one that can REPLICATE a change.
+
+    ⛔ This sorting key is not a performance choice.  `ch-sync-peers`
+    identifies rows on a ReplacingMergeTree by cityHash64 of the peer's
+    SORTING KEY, and pulls only the hashes it does not already hold.
+    Ordered by `key` alone, a site that changes the callsign it merges
+    under keeps the same key, hashes identically, and the new
+    declaration never reaches the other two servers — so whichever
+    server the elector picks would go on reporting the old identity.
+    That is the same blind spot that kept a corrected `rx_loc` from
+    propagating on 2026-10-27 and made three separate ALTERs necessary.
+
+    Ordering by (key, call, grid) makes a CHANGED declaration a new row,
+    so it syncs, while a REPEATED identical one still collapses, so the
+    table does not grow by a row per receiver per flush.
+
+    An empty table with the old layout is rebuilt here.  A populated one
+    is left alone and shouted about: dropping an operator's declarations
+    to fix their storage layout is not a decision this function gets to
+    make unattended on three production servers.
+    """
+    result = admin_client.query(
+        f"SELECT sorting_key FROM system.tables "
+        f"WHERE database = '{db}' AND name = '{table}'")
+    if not result.result_rows:
+        return                      # absent — CREATE TABLE below gets it right
+    current = str(result.result_rows[0][0]).replace(" ", "")
+    if current == REPORTER_SORTING_KEY.replace(" ", ""):
+        return
+    rows = admin_client.query(f"SELECT count() FROM {db}.{table}")
+    n = int(rows.result_rows[0][0]) if rows.result_rows else 0
+    if n:
+        log(f"⚠ {db}.{table} is ordered by ({current}) and holds {n} row(s). "
+            f"A CHANGED declaration in it will NOT replicate to the peer "
+            f"servers.  Rebuild it by hand when convenient: CREATE a copy "
+            f"ORDER BY ({REPORTER_SORTING_KEY}), INSERT SELECT, EXCHANGE "
+            f"TABLES, DROP.", "WARNING")
+        return
+    log(f"Rebuilding empty {db}.{table}: ordered by ({current}), which "
+        f"cannot replicate a changed declaration", "INFO")
+    admin_client.command(f"DROP TABLE {db}.{table}")
+
+
 def setup_wsprnet_reporter_table(admin_client, config: Dict) -> None:
     """Ensure `wsprdaemon.wsprnet_reporter` exists (idempotent).
 
@@ -613,6 +660,7 @@ def setup_wsprnet_reporter_table(admin_client, config: Dict) -> None:
     second would silently post under the wrong callsign.
     """
     db = config['clickhouse_database']
+    _reporter_table_layout_ok(admin_client, db, WSPRNET_REPORTER_TABLE)
     admin_client.command(f"""
     CREATE TABLE IF NOT EXISTS {db}.{WSPRNET_REPORTER_TABLE}
     (
@@ -622,7 +670,7 @@ def setup_wsprnet_reporter_table(admin_client, config: Dict) -> None:
         `updated_at` DateTime  CODEC(Delta(4), ZSTD(3))
     )
     ENGINE = ReplacingMergeTree(updated_at)
-    ORDER BY key
+    ORDER BY (`key`, `call`, grid)
     SETTINGS index_granularity = 8192
     """)
     log(f"Table {db}.{WSPRNET_REPORTER_TABLE} ready", "INFO")
@@ -701,6 +749,7 @@ def setup_psk_reporter_table(admin_client, config: Dict) -> None:
     the second would silently report under a default nobody chose.
     """
     db = config['clickhouse_psk_database']
+    _reporter_table_layout_ok(admin_client, db, PSK_REPORTER_TABLE)
     admin_client.command(f"""
     CREATE TABLE IF NOT EXISTS {db}.{PSK_REPORTER_TABLE}
     (
@@ -710,7 +759,7 @@ def setup_psk_reporter_table(admin_client, config: Dict) -> None:
         `updated_at` DateTime  CODEC(Delta(4), ZSTD(3))
     )
     ENGINE = ReplacingMergeTree(updated_at)
-    ORDER BY key
+    ORDER BY (`key`, `call`, grid)
     SETTINGS index_granularity = 8192
     """)
     log(f"Table {db}.{PSK_REPORTER_TABLE} ready", "INFO")

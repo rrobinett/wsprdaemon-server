@@ -4,7 +4,7 @@
 #PEERS="wd10 wd20"
 #
 # Tables to reconcile (db.table). Tables missing locally or on a peer are skipped.
-#TABLES="wspr.rx wsprdaemon.spots wsprdaemon.noise psk.spots pskreporter.rx"
+#TABLES="wspr.rx wsprdaemon.spots wsprdaemon.noise psk.spots pskreporter.rx psk.reporter wsprdaemon.wsprnet_reporter"
 #
 # Regular-run window in hours (the daily timer passes --lookback 720 explicitly).
 #LOOKBACK_HOURS=48
