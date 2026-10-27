@@ -604,6 +604,18 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
     return 0
 
 
+def _env_flag(name: str) -> bool:
+    """A staging switch readable from the unit's EnvironmentFile.
+
+    ⚠ Only an explicit affirmative turns it on.  An operator who means
+    to disable dry-run writes `=0` or `=false` far more often than they
+    delete the line, and if those read as true the forwarder would keep
+    silently posting nothing long after someone believed it was live.
+    """
+    return (os.environ.get(name) or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--leader-url", default=os.environ.get(
@@ -622,7 +634,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--poll-sec", type=int, default=DEFAULT_POLL_SEC)
     p.add_argument("--batch", type=int, default=DEFAULT_BATCH)
     p.add_argument("--dry-run", action="store_true",
-                   help="read and log, POST nothing")
+                   default=_env_flag("WSPRNET_FORWARDER_DRY_RUN"),
+                   help="read and log, POST nothing "
+                        "(or set WSPRNET_FORWARDER_DRY_RUN=1)")
     p.add_argument("--once", action="store_true")
     p.add_argument("-v", "--verbose", action="count", default=0)
     a = p.parse_args(argv)

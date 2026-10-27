@@ -433,3 +433,18 @@ def test_a_sites_OWN_receivers_still_collapse_to_one():
     assert (posted, failed) == (1, 0)
     assert len(calls) == 1
     assert b" -8 " in calls[0].data, "best SNR survives the collapse"
+
+
+def test_the_dry_run_env_switch_only_accepts_an_explicit_yes():
+    """⚠ An operator turning dry-run OFF writes `=0` or `=false` far more
+    often than they delete the line.  If those read as true, the forwarder
+    keeps silently posting nothing long after someone believes it is live."""
+    import os
+    for on in ("1", "true", "TRUE", "yes", "on", " 1 "):
+        os.environ["X_WF_DRY"] = on
+        assert wf._env_flag("X_WF_DRY") is True, on
+    for off in ("0", "false", "no", "off", "", "  "):
+        os.environ["X_WF_DRY"] = off
+        assert wf._env_flag("X_WF_DRY") is False, repr(off)
+    del os.environ["X_WF_DRY"]
+    assert wf._env_flag("X_WF_DRY") is False
