@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import signal
 import socket
 import sys
@@ -431,6 +432,30 @@ def load_declared_identities(ch_client, *, db: str = "wsprdaemon",
 
 # ── Posting ──────────────────────────────────────────────────────────────────
 
+_ADDED_RE = re.compile(r"(\d+)\s+out of\s+(\d+)\s+spot", re.I)
+
+
+def _wsprnet_verdict(text: str) -> str:
+    """wsprnet's answer, reduced to the one line that means anything.
+
+    It replies with a full HTML page, so logging it raw puts a web page in
+    the journal every cycle and buries the forwarder's own lines.  The
+    sentence that matters is "N out of M spot(s) added": M is what we sent,
+    N is what was new, and M-N is wsprnet de-duplicating against what the
+    station or another receiver already reported.
+
+    ⚠ `added=0` is NOT by itself a failure — re-posting after a watermark
+    rewind legitimately adds nothing.  But a run of `0 out of M` when no
+    one else is posting those spots means we are talking to wsprnet and
+    being ignored, which looks identical to success at the HTTP layer.
+    That is why the numbers are surfaced rather than just "HTTP 200".
+    """
+    m = _ADDED_RE.search(text)
+    if m:
+        return f"{m.group(1)} of {m.group(2)} spots added"
+    return " ".join(text.split())[:160] or "(empty response)"
+
+
 def post_mept(url: str, body: bytes, *, timeout: float,
               opener=None) -> Tuple[bool, str]:
     """POST one multipart body.  Returns (ok, detail)."""
@@ -443,8 +468,8 @@ def post_mept(url: str, body: bytes, *, timeout: float,
         _open = opener or urllib.request.urlopen
         with _open(req, timeout=timeout) as resp:
             code = getattr(resp, "status", None) or resp.getcode()
-            text = resp.read().decode("utf-8", errors="replace")[:200]
-        return (200 <= int(code) < 300), f"HTTP {code}: {text.strip()}"
+            text = resp.read().decode("utf-8", errors="replace")
+        return (200 <= int(code) < 300), f"HTTP {code}: {_wsprnet_verdict(text)}"
     except urllib.error.HTTPError as exc:
         return False, f"HTTP {exc.code}"
     except Exception as exc:                        # noqa: BLE001

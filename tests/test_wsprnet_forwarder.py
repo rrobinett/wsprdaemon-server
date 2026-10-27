@@ -495,3 +495,25 @@ def test_the_two_branches_are_SEPARATE_in_the_source():
     idle = tail.split("elif cfg.dry_run:")[1].split("            else:")[1]
     assert "write_watermark" not in dry
     assert "write_watermark" in idle
+
+
+def test_wsprnets_html_reply_is_reduced_to_the_numbers_that_matter():
+    """wsprnet answers with a whole web page.  Logging it raw puts an HTML
+    document in the journal every cycle and buries the forwarder's own
+    lines — which is how a real POST confirmation got lost on wd30."""
+    real = ("<html>\n<body>\n  <h1>Processing Log Upload</h1><pre>\n"
+            "40 out of 101 spot(s) added<br>\n"
+            "Processing took 9033 milliseconds.<br>\n</body>\n</html>")
+    assert wf._wsprnet_verdict(real) == "40 of 101 spots added"
+
+
+def test_zero_added_is_REPORTED_not_hidden():
+    """⚠ `0 out of M` looks identical to success at the HTTP layer.  A run
+    of it means we are talking to wsprnet and being ignored."""
+    assert wf._wsprnet_verdict("0 out of 99 spot(s) added<br>") == "0 of 99 spots added"
+
+
+def test_an_unrecognised_reply_is_kept_not_swallowed():
+    assert "nope" in wf._wsprnet_verdict("<html><body>nope</body></html>")
+    assert wf._wsprnet_verdict("") == "(empty response)"
+    assert len(wf._wsprnet_verdict("x" * 9000)) <= 160
