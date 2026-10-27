@@ -630,6 +630,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     logging.basicConfig(
         level=logging.DEBUG if a.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+    # -v raises OUR level, not the world's.  clickhouse-driver logs a line
+    # per column per block at DEBUG: on a real batch that is thousands of
+    # lines in which the forwarder's own handful cannot be found, so the
+    # flag meant for diagnosing a problem is what hides it.
+    for noisy in ("clickhouse_driver", "urllib3", "tzlocal"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     cfg = ForwarderConfig(
         this_host=a.this_host, leader_url=a.leader_url,
         pin_leader=a.pin_leader, watermark_path=a.watermark,
