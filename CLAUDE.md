@@ -365,6 +365,45 @@ Tests: `tests/test_wsprnet_forwarder.py` (32) and `tests/test_wsprnet_routing.py
 `tests/test_transport_wsprdaemon.py` that asserts the server reads back
 exactly what the client wrote.  No ClickHouse or network required.
 
-**Before enabling in production**, two things are relations, not code:
-attribution (we would be posting under operators' callsigns from our IP) and
-wsprnet's rate limiting from a single address.
+### Staging state (2026-10-27): LIVE on wd30 for AC0G/B4
+
+There is **no elector**.  gw1 serves neither `wsprnet-leader.txt` nor
+`pskreporter-leader.txt`; the PSKReporter forwarder has never been elected
+either, and `/etc/default/pskreporter-forwarder` says so — "Stage 1: only wd30
+forwards... Stage 2 (later): deploy elector on gw1, remove this pin."
+wsprnet-forwarder stages identically: `WSPRNET_FORWARDER_PIN_LEADER=wd30`.
+**The pin is what stops all three servers posting at once**, so do not enable
+the service on wd10/wd20 without either the pin or a real elector.
+
+`WSPRNET_FORWARDER_DRY_RUN` is an EnvironmentFile switch; only an explicit
+affirmative enables it, so a later `=0` genuinely goes live.
+
+B4 opted in by hand-editing its GENERATED `/etc/hs-uploader/pipelines.toml`
+(`forward_to_wsprnet = true`, `wspr-wsprnet` pipeline deleted).  Any `smd apply`
+reverts that and B4 returns to posting directly — intended, but surprising.
+
+Proven end to end: B4 tar → gw1/gw2 → reflector → wd30 ingest (`proxy_upload=1`)
+→ forwarder → wsprnet.org, confirmed by `wspr.rx` (scraped back **from**
+wsprnet) showing AC0G/B4 unbroken across the cutover.
+
+### Two defects only deployment found
+
+Both were invisible to a test suite written from the same mental model as the
+code, and both were caught within minutes of touching real data:
+
+- **One site's spot deleted every other site's.**  `forward_rows` deduped the
+  whole batch *before* grouping by reporter.  The dedup key has no receiver in
+  it — right on a station, where the duplicates are its own receivers — but
+  this server reads every site's rows at once.  2,752 rows from 55 sites
+  collapsed to 388.  Group first, dedup inside the group.
+- **Dry-run advanced the watermark.**  Idle (non-leader) servers *must*
+  advance so failover is gap-free, but dry-run is the same process that goes
+  live later, and the staging instructions say to run it first.  Flipping to
+  live then skipped exactly what dry-run promised to post: 40 AC0G/B4 spots,
+  with the log saying "would forward" and the watermark saying "done".
+  Recovered by rewinding the watermark; wsprnet's reply ("40 out of 101 spot(s)
+  added") confirmed the count exactly.
+
+**Before widening beyond one station**, two things are relations, not code:
+attribution (we post under operators' callsigns from our IP) and wsprnet's
+rate limiting from a single address.
