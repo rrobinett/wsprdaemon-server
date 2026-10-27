@@ -226,6 +226,19 @@ def fetch_pending(ch_client, *, since: datetime, batch_size: int,
 def dedup_for_wsprnet(rows: List[SpotRow]) -> List[SpotRow]:
     """One row per (date, time, callsign, freq@1e-4 MHz), best SNR wins.
 
+    ⛔⛔ CALL THIS WITH ONE REPORTER'S ROWS ONLY.  The key carries no
+    receiver identity, because on a station there is only one reporter and
+    the duplicates being collapsed are its own receivers hearing one
+    transmission.  Hand it a mixed batch — which is ALL this server ever
+    reads from `wsprdaemon.spots` — and the first site to hear a
+    transmission silences every other site's independent report of it.
+    Measured on wd30, 2026-10-27: 2,752 real rows from 55 sites in one
+    4-minute window collapsed to 388, an 86 % loss of exactly the
+    multi-receiver coverage the network exists to produce, and wsprnet
+    would have shown one receiver per transmission for the whole
+    proxied fleet.  `forward_rows` therefore groups FIRST and dedups
+    inside each group.
+
     ⛔ THIS KEY IS A SHARED CONTRACT, NOT A LOCAL CHOICE.  It is the key
     hs_uploader.transports.wsprnet.dedup_records_for_wsprnet uses, so the
     station's own audit and this server's posting agree on how many spots
@@ -450,8 +463,12 @@ def forward_rows(rows: List[SpotRow], *, url: str, version: str,
     success and drops the tail, so nothing anywhere reports a loss.
     """
     posted = failed = 0
-    for (call, grid), group in group_by_reporter(dedup_for_wsprnet(rows),
-                                                 overrides).items():
+    # ⛔ GROUP FIRST, THEN DEDUP WITHIN THE GROUP.  The dedup key has no
+    # receiver in it (see dedup_for_wsprnet), so deduping the mixed batch
+    # first would let one site's spot delete 54 other sites' independent
+    # reports of the same transmission.
+    for (call, grid), group in group_by_reporter(rows, overrides).items():
+        group = dedup_for_wsprnet(group)
         lines = [ln for ln in (row_to_mept(r) for r in group) if ln]
         if not lines:
             continue

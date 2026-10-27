@@ -389,3 +389,47 @@ def test_the_operator_file_OUTRANKS_the_station_declaration():
     merged = dict(declared)
     merged.update(operator)          # exactly what run_loop does
     assert wf.reporter_for(_row(), merged) == ("AC0G/M", "EM38")
+
+
+def test_ONE_SITES_SPOT_NEVER_DELETES_ANOTHER_SITES():
+    """⛔⛔ THE BUG DEPLOYMENT FOUND (wd30, 2026-10-27).
+
+    The dedup key carries no receiver identity — correct on a station,
+    where the duplicates are its own receivers hearing one transmission.
+    But this server reads EVERY site's rows in one batch, and deduping
+    that batch before grouping let the first site to hear a transmission
+    silence all the others.  On real traffic: 2,752 rows from 55 sites in
+    4 minutes collapsed to 388, and wsprnet would have shown one receiver
+    per transmission for the entire proxied fleet — deleting exactly the
+    multi-receiver coverage the network exists to produce.
+
+    The earlier tests missed it because the two-reporter case used two
+    DIFFERENT transmitters, so nothing ever collided across sites.
+    """
+    calls = []
+    # One transmission, heard by three unrelated sites, same cycle+freq.
+    rows = [_row(rx_sign="AC0G", rx_loc="EM38ww", rx_id="rx1", snr=-10),
+            _row(rx_sign="K3LR", rx_loc="EN91", rx_id="rx1", snr=-14),
+            _row(rx_sign="W2NAF2", rx_loc="FN21", rx_id="rx1", snr=-21)]
+    posted, failed = wf.forward_rows(rows, url="http://x/", version="9.9",
+                                     overrides={}, opener=_ok_opener(calls))
+    assert (posted, failed) == (3, 0), "every site must report its own hearing"
+    assert len(calls) == 3, "one POST per reporter"
+    posted_as = {c.data.split(b'name="call"')[1][:40] for c in calls}
+    assert len(posted_as) == 3, "three distinct reporter identities"
+    for want in (b"AC0G", b"K3LR", b"W2NAF2"):
+        assert any(want in p for p in posted_as), f"{want!r} never reported"
+
+
+def test_a_sites_OWN_receivers_still_collapse_to_one():
+    """The other direction: within one site, three receivers hearing one
+    transmission is still ONE spot to wsprnet, or the site spams it."""
+    calls = []
+    rows = [_row(rx_sign="AC0G", rx_id="rx1", snr=-10),
+            _row(rx_sign="AC0G", rx_id="rx2", snr=-8),
+            _row(rx_sign="AC0G", rx_id="rx3", snr=-14)]
+    posted, failed = wf.forward_rows(rows, url="http://x/", version="9.9",
+                                     overrides={}, opener=_ok_opener(calls))
+    assert (posted, failed) == (1, 0)
+    assert len(calls) == 1
+    assert b" -8 " in calls[0].data, "best SNR survives the collapse"
