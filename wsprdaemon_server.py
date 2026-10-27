@@ -382,6 +382,8 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
         admin_client.command(create_noise_table_sql)
         log(f"Table {config['clickhouse_database']}.{config['clickhouse_noise_table']} ready", "INFO")
 
+        setup_wsprnet_reporter_table(admin_client, config)
+
         if config.get('ingest_psk'):
             setup_psk_tables(admin_client, config)
 
@@ -551,6 +553,96 @@ def insert_status_rows(client, rows: List[Dict], database: str, table: str,
         return False
 
 
+WSPRNET_REPORTER_TABLE = 'wsprnet_reporter'
+
+
+def setup_wsprnet_reporter_table(admin_client, config: Dict) -> None:
+    """Ensure `wsprdaemon.wsprnet_reporter` exists (idempotent).
+
+    One row per receiver that DECLARED a wsprnet identity differing from
+    the callsign it files spots under here.  `key` is spelled exactly as
+    `wsprnet_forwarder.reporter_for()` looks it up, `<rx_sign>/<rx_id>`,
+    so the table is a drop-in alongside the operator's overrides file
+    rather than a second vocabulary to translate between.
+
+    Created unconditionally, not behind an ingest flag: it is empty on
+    every server where no station has declared one, and a forwarder that
+    found the table missing could not tell "nobody declared an identity"
+    from "this server never built the table" — the first is normal, the
+    second would silently post under the wrong callsign.
+    """
+    db = config['clickhouse_database']
+    admin_client.command(f"""
+    CREATE TABLE IF NOT EXISTS {db}.{WSPRNET_REPORTER_TABLE}
+    (
+        `key`        String    CODEC(ZSTD(3)),
+        `call`       String    CODEC(ZSTD(3)),
+        `grid`       String    CODEC(ZSTD(3)),
+        `updated_at` DateTime  CODEC(Delta(4), ZSTD(3))
+    )
+    ENGINE = ReplacingMergeTree(updated_at)
+    ORDER BY key
+    SETTINGS index_granularity = 8192
+    """)
+    log(f"Table {db}.{WSPRNET_REPORTER_TABLE} ready", "INFO")
+
+
+def wsprnet_reporter_rows(spots: List[Dict]) -> List[Dict]:
+    """Deduplicated identity rows from spots stamped by `process_spot_files`.
+
+    One row per receiver, not per spot: a tar carrying 400 spots from one
+    receiver declares one identity, and inserting it 400 times would turn
+    a rarely-changing fact into the busiest write in the flush.
+    """
+    seen: Dict[str, Dict] = {}
+    now = datetime.utcnow()
+    for spot in spots:
+        call = spot.get('_wsprnet_call')
+        if not call:
+            continue
+        rx_sign = spot.get('rx_sign') or ''
+        rx_id   = spot.get('rx_id') or ''
+        if not rx_sign:
+            continue
+        seen[f"{rx_sign}/{rx_id}"] = {
+            'key':        f"{rx_sign}/{rx_id}",
+            'call':       call,
+            'grid':       spot.get('_wsprnet_grid') or '',
+            'updated_at': now,
+        }
+    return list(seen.values())
+
+
+def insert_wsprnet_reporters(client, rows: List[Dict], database: str) -> bool:
+    """Insert declared wsprnet identities.  Never fails the flush.
+
+    ⚠ This is the PASSENGER rule again, in a second place: a station's
+    spots must not be held back because its identity row would not go in.
+    The forwarder's fallback for a missing identity is the row's own
+    rx_sign, which is right for every single-receiver site — so losing
+    this write degrades to the default, while losing the spots would be
+    an outage.
+    """
+    if not rows:
+        return True
+    try:
+        column_names = list(rows[0].keys())
+        # Backticked: `key` and `call` are ordinary identifiers in
+        # ClickHouse today, but both are the kind of word a future
+        # release reserves, and the failure would be a parse error on
+        # every insert at once.
+        cols_sql = ','.join(f'`{c}`' for c in column_names)
+        sql = (f"INSERT INTO {database}.{WSPRNET_REPORTER_TABLE} "
+               f"({cols_sql}) VALUES")
+        client.execute(sql, [tuple(r[c] for c in column_names) for r in rows])
+        log(f"Recorded {len(rows)} wsprnet reporter identities", "DEBUG")
+        return True
+    except Exception as e:
+        log(f"Error inserting wsprnet reporter identities "
+            f"(spots unaffected): {e}", "WARNING")
+        return False
+
+
 def setup_psk_tables(admin_client, config: Dict) -> None:
     """Ensure the `psk` database and `psk.spots` table exist (idempotent).
 
@@ -639,6 +731,57 @@ def _forward_flag(routing: Dict, receiver_key: str) -> bool:
         return bool(per_recv['forward_to_pskreporter'])
     default = routing.get('default') or {}
     return bool(default.get('forward_to_pskreporter', True))
+
+
+WSPRNET_FLAG_KEY     = 'forward_to_wsprnet'
+WSPRNET_REPORTER_KEY = 'wsprnet_reporter'
+
+
+def _wsprnet_flag(routing: Dict, receiver_key: str) -> Optional[bool]:
+    """Did this receiver ask the SERVER to post its WSPR spots to wsprnet?
+
+    ⛔ THREE-VALUED ON PURPOSE, and `None` is the whole point.  `None`
+    means routing.json said nothing, which is NOT the same as `False`.
+    The legacy WsprDaemon client has carried this decision per spot in
+    field 33 of the enhanced line since long before routing.json existed;
+    if silence collapsed to `False`, upgrading a server would switch
+    those stations' proxy uploads off from a file they never shipped, and
+    the symptom would be spots quietly missing from wsprnet.org rather
+    than any error here.  Only an explicit key overrides field 33.
+
+    When the key IS present it governs every spot of that receiver in
+    this tar.  That is the contract rob specified: a single station-level
+    setting, not a per-spot one.
+    """
+    per_recv = routing.get(receiver_key) or {}
+    if WSPRNET_FLAG_KEY in per_recv:
+        return bool(per_recv[WSPRNET_FLAG_KEY])
+    default = routing.get('default') or {}
+    if WSPRNET_FLAG_KEY in default:
+        return bool(default[WSPRNET_FLAG_KEY])
+    return None
+
+
+def _wsprnet_reporter(routing: Dict, receiver_key: str) -> Optional[Tuple[str, str]]:
+    """The (call, grid) this receiver posts to wsprnet UNDER, or None.
+
+    Usually the same as its `rx_sign`, and the forwarder defaults to that
+    — so this is only declared by a site whose wsprnet identity DIFFERS
+    from the callsign it files spots under here (an operator keeping one
+    unbroken wsprnet history across several receivers, say).
+
+    A declaration with no `call` is dropped rather than half-applied: a
+    grid alone cannot name a reporter, and inventing the call from
+    `rx_sign` while honouring the stated grid would post real spots from
+    a location the operator did not claim for that identity.
+    """
+    for src in (routing.get(receiver_key) or {}, routing.get('default') or {}):
+        decl = src.get(WSPRNET_REPORTER_KEY)
+        if isinstance(decl, dict):
+            call = str(decl.get('call') or '').strip()
+            if call:
+                return (call, str(decl.get('grid') or '').strip())
+    return None
 
 
 def process_mode_files(extraction_dir: Path, mode: str,
@@ -1290,7 +1433,8 @@ def decode_rx_site_dir(rx_site_dir: str) -> Tuple[str, str]:
     return rx_site_dir.replace('=', '/'), ''
 
 
-def process_spot_files(extraction_dir: Path, client_version: Optional[str]) -> List[Dict]:
+def process_spot_files(extraction_dir: Path, client_version: Optional[str],
+                       routing: Optional[Dict] = None) -> List[Dict]:
     """Process all spot files inside an extracted tbz and return spot records.
 
     Expected directory structure inside the tbz (either layout accepted):
@@ -1300,6 +1444,14 @@ def process_spot_files(extraction_dir: Path, client_version: Optional[str]) -> L
     rx_sign and rx_loc come directly from the parsed spot line (fields 22 and 21).
     The directory-decoded values are used only as a fallback when those fields
     are absent or empty.
+
+    `routing` is the tar's `routing.json`.  Its `forward_to_wsprnet` key, when
+    present, OVERRIDES field 33 for every spot of that receiver and becomes the
+    `proxy_upload` column the wsprnet forwarder selects on.  Absent, field 33
+    stands untouched (see `_wsprnet_flag`).  A declared `wsprnet_reporter` is
+    stamped onto each spot under `_wsprnet_call` / `_wsprnet_grid`; those keys
+    never reach ClickHouse — `convert_spot_to_clickhouse` builds its row
+    explicitly — they are collected by `wsprnet_reporter_rows`.
     """
     all_spots = []
 
@@ -1342,6 +1494,10 @@ def process_spot_files(extraction_dir: Path, client_version: Optional[str]) -> L
 
         spots = parse_wsprd_output(wsprd_file, client_version)
 
+        receiver_key   = f"{rx_site_dir}/{rx_id}"
+        wsprnet_flag   = _wsprnet_flag(routing or {}, receiver_key)
+        wsprnet_ident  = _wsprnet_reporter(routing or {}, receiver_key)
+
         for spot in spots:
             spot['rx_id']  = rx_id
             spot['band']   = band
@@ -1350,6 +1506,10 @@ def process_spot_files(extraction_dir: Path, client_version: Optional[str]) -> L
             # rx_loc (field 21) is already in spot; use dir value only if blank
             if not spot.get('rx_loc'):
                 spot['rx_loc'] = rx_grid_dir
+            if wsprnet_flag is not None:
+                spot['proxy_upload'] = 1 if wsprnet_flag else 0
+            if wsprnet_ident is not None:
+                spot['_wsprnet_call'], spot['_wsprnet_grid'] = wsprnet_ident
 
         all_spots.extend(spots)
 
@@ -1814,12 +1974,17 @@ def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path,
         maybe_provision_sftp(worker_dir)
 
         client_version, running_jobs, receiver_descriptions = get_client_version(worker_dir)
-        spots = process_spot_files(worker_dir, client_version)
+        # routing.json is read for EVERY tar now, not only psk-bearing ones:
+        # `forward_to_wsprnet` governs WSPR spots, and a WSPR-only station
+        # (no ft8/ft4 subdirs at all) is exactly the kind that proxies its
+        # wsprnet uploads.  Reading it only under `psk_modes` would make the
+        # switch work or not depending on an unrelated mode being enabled.
+        routing = load_routing(worker_dir)
+        spots = process_spot_files(worker_dir, client_version, routing)
         noise_records = process_noise_files(worker_dir, running_jobs, receiver_descriptions)
 
         psk_rows: List[Dict] = []
         if psk_modes:
-            routing = load_routing(worker_dir)
             host_id = extract_host_id(worker_dir)
             for mode in psk_modes:
                 psk_rows.extend(process_mode_files(worker_dir, mode, routing, host_id))
@@ -2101,6 +2266,14 @@ def main():
                         log(f"Spot flush failed after {max_retries} attempts", "ERROR")
                         flush_errors.append("spots")
                         success = False
+                    else:
+                        # Declared wsprnet identities ride along with the spots
+                        # that declared them, deduplicated to one row per
+                        # receiver.  Deliberately NOT retried and never sets
+                        # `success`: see insert_wsprnet_reporters.
+                        insert_wsprnet_reporters(
+                            client, wsprnet_reporter_rows(pending_spots),
+                            config['clickhouse_database'])
 
                 if pending_noise and success:
                     max_retries, retry_delay, ok = 3, 2, False

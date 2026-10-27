@@ -312,6 +312,18 @@ def build_multipart(*, version: str, call: str, grid: str,
 
 # ── Reporter identity ────────────────────────────────────────────────────────
 
+def reporter_key(row: SpotRow) -> str:
+    """The precise key naming ONE receiver: `<rx_sign>/<rx_id>`.
+
+    ⛔ rx_id ALONE IS NOT A KEY.  It is a receiver name local to its
+    station — `KA9Q_DXE`, `rx888-1` — so two unrelated sites routinely
+    carry the same one, and an override filed under a bare rx_id would
+    silently reassign another operator's spots to this site's callsign.
+    Always qualify it with the rx_sign.
+    """
+    return f"{row.rx_sign}/{row.rx_id}"
+
+
 def reporter_for(row: SpotRow, overrides: Dict[str, Dict[str, str]]
                  ) -> Tuple[str, str]:
     """The (call, grid) this site posts to wsprnet UNDER.
@@ -320,13 +332,13 @@ def reporter_for(row: SpotRow, overrides: Dict[str, Dict[str, str]]
     receivers may report them to wsprnet under ONE identity, which can
     differ from any individual receiver's call.  That mapping is the one
     thing a MEPT line cannot be derived from the extended row, so it is
-    carried per site in an overrides file rather than guessed.
+    carried per receiver rather than guessed.
 
     Default — and correct for every single-receiver site — is the row's
-    own rx_sign/rx_loc.  Lookup is by rx_id first (the precise receiver
-    identity) then rx_sign.
+    own rx_sign/rx_loc.  Lookup is by `<rx_sign>/<rx_id>` first (one
+    receiver) then `<rx_sign>` (every receiver at that site).
     """
-    for key in (row.rx_id, row.rx_sign):
+    for key in (reporter_key(row), row.rx_sign):
         if key and key in overrides:
             o = overrides[key]
             return (o.get("call") or row.rx_sign, o.get("grid") or row.rx_loc)
@@ -370,6 +382,38 @@ def load_reporter_overrides(path: Path) -> Dict[str, Dict[str, str]]:
         logger.error("reporter overrides %s is not an object — ignoring", path)
         return {}
     return {k: v for k, v in raw.items() if isinstance(v, dict)}
+
+
+def load_declared_identities(ch_client, *, db: str = "wsprdaemon",
+                             table: str = "wsprnet_reporter"
+                             ) -> Dict[str, Dict[str, str]]:
+    """Identities STATIONS declared, via `routing.json` at ingest.
+
+    This is the normal path: the operator of a station knows which
+    callsign it reports under, and says so once in routing.json; the
+    server records it here.  `load_reporter_overrides` stays as the
+    server operator's manual escape hatch and is layered ON TOP, because
+    a wd admin fixing a misattribution at 02:00 must not be undone by
+    the next tar from the station that caused it.
+
+    A query failure returns {} rather than raising: the fallback is each
+    row's own rx_sign, which is right for every single-receiver site, so
+    the degraded behaviour is correct for most sites and merely wrong in
+    the way it was before anyone declared anything.
+    """
+    sql = (f"SELECT `key`, argMax(`call`, updated_at), "
+           f"argMax(grid, updated_at) FROM {db}.{table} GROUP BY `key`")
+    try:
+        rows = ch_client.execute(sql)
+    except Exception as exc:                        # noqa: BLE001
+        logger.warning("declared identities unreadable (%s) — posting under "
+                       "each spot's own rx_sign", exc)
+        return {}
+    out: Dict[str, Dict[str, str]] = {}
+    for key, call, grid in rows:
+        if key and call:
+            out[str(key)] = {"call": str(call), "grid": str(grid or "")}
+    return out
 
 
 # ── Posting ──────────────────────────────────────────────────────────────────
@@ -515,7 +559,9 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
         if rows:
             high = max(r.ingested_at for r in rows)
             if leader and not cfg.dry_run:
-                overrides = load_reporter_overrides(cfg.reporters_path)
+                # Station declarations first, operator file on top.
+                overrides = load_declared_identities(client)
+                overrides.update(load_reporter_overrides(cfg.reporters_path))
                 posted, failed = forward_rows(
                     rows, url=cfg.url, version=VERSION,
                     overrides=overrides, timeout=cfg.http_timeout)

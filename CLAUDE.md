@@ -247,3 +247,124 @@ Per-spot routing flag (set by psk-recorder Phase 2 PR 3):
 Tests: `python3 tests/test_pskreporter_forwarder.py` — fakes for
 clickhouse-driver, ftlib PskReporter, and the leader URL fetch.
 18 pass; no ClickHouse or network required.
+
+## wsprnet.org forwarder (`wsprnet_forwarder.py`)
+
+A station today sends its WSPR spots **twice** — once inside the .tbz to the
+WD servers, and again, separately, to wsprnet.org.  Same observations, two
+connections, two formats.  Everything a MEPT line needs is already in the
+extended row (`sync_quality`, `dt`, `code` included), so the wsprnet
+submission is **derivable server-side** and the duplicate transmission stops
+existing.  Measured on one small real site, the saving is the whole second
+upload: the spots cross the link once.
+
+Two daemons, mirroring the PSKReporter pair:
+
+* `wsprnet_forwarder.py` — on each wd{10,20,30}.  Polls
+  `wsprdaemon.spots WHERE proxy_upload = 1 AND ingested_at > <watermark>`,
+  collapses multi-receiver duplicates with the client's own dedup key,
+  renders MEPT, POSTs to `http://wsprnet.org/meptspots.php`.  Only the
+  elected leader posts; the others idle but keep their watermark fresh.
+  Unit: `wsprnet-forwarder.service`.
+* `wsprnet_forward_elector.py` (the existing elector, second instance) — on
+  gw1, candidate order **wd20, wd10, wd30** (rob's: wd20 serves fewer public
+  queries), writing `/var/www/html/wsprnet-leader.txt`.  Separate from the
+  PSKReporter leader file on purpose: the orders differ, so the two must be
+  able to elect different leaders.  Unit: `wsprnet-forward-elector.service`.
+
+Four properties carry the weight, and each would be a real incident:
+
+- **The dedup key must match the client's exactly** — `(date, time, callsign,
+  freq rounded to 1e-4 MHz)`, best SNR, ties keep first.  Otherwise the
+  station's own audit and the server's posting disagree on how many spots a
+  cycle yielded and nobody can say which is right.  A test runs the same
+  spots through this code and through hs-uploader's and asserts the MEPT
+  lines are **byte-identical**; once the server posts on a station's behalf
+  there are two implementations of one wire format, and a drift between them
+  is invisible because wsprnet accepts both.
+- **⛔ No leader information means NOT leader.**  Losing the elector is
+  exactly when three servers must not each decide they are in charge —
+  wsprnet would get every spot three times from three addresses.
+- **⛔ A failed POST holds the watermark.**  Advancing past failed spots
+  loses them with no record anywhere; a duplicate is harmless because
+  wsprnet de-duplicates.  Favour the duplicate.
+- **Chunked at 999.**  wsprnet *silently truncates* a larger transaction: it
+  returns success and drops the tail.
+
+**It is inert until a station opts in.**  The selector is `proxy_upload = 1`,
+and across the fleet every row is 0.  So it deploys with no effect, stations
+move one at a time, and `--dry-run` shows what it would post first.
+
+### The station-level switch (`forward_to_wsprnet`)
+
+rob's spec: *"this would be a single setting that would apply to all spots."*
+The station declares it once in `routing.json`; the server turns it into the
+`proxy_upload` column the forwarder selects on.  **No schema migration** —
+that column has existed since the WsprDaemon client first wrote field 33 of
+the enhanced spot line.
+
+```json
+{
+  "default": {
+    "forward_to_pskreporter": true,
+    "forward_to_wsprnet": true,
+    "wsprnet_reporter": {"call": "AC0G", "grid": "EM38ww"}
+  },
+  "AC0G=B4_EM38ww/KA9Q_0": {"forward_to_wsprnet": false}
+}
+```
+
+- **⛔ `forward_to_wsprnet` is THREE-VALUED, and absent ≠ false.**  The legacy
+  WsprDaemon client carries this decision *per spot* in field 33.  If a
+  missing key read as `false`, upgrading a server would switch those
+  stations' proxy uploads off from a file they never shipped — and the
+  symptom would be spots quietly absent from wsprnet.org, not an error here.
+  Only an explicit key overrides field 33; present, it governs **every** spot
+  of that receiver in that tar.
+- `routing.json` is now read for **every** tar, not only psk-bearing ones.
+  A WSPR-only station (no `ft8/`, no `ft4/`) is exactly the kind that proxies
+  its wsprnet uploads; gating the read on `psk_modes` would make the switch
+  work or not depending on an unrelated mode being enabled.
+- hs-uploader writes the switch **both** into `routing.json` and into field 33
+  of every extended line, from one argument, so the two cannot disagree: a
+  server predating the routing key reads field 33, and a tar whose
+  routing.json were lost still carries the intent in the spots.
+- **⚠ Turning it on does not stop the station posting to wsprnet directly.**
+  That is hs-uploader's own `WsprNet` pipeline.  Switch them together or
+  wsprnet gets both.
+
+### Reporter identity (`wsprdaemon.wsprnet_reporter`)
+
+The one thing a MEPT line *cannot* be derived from the extended row is the
+call/grid the site reports to wsprnet **under** — usually its own `rx_sign`,
+but not for an operator keeping one unbroken wsprnet history across several
+receivers.  A station declares it in `routing.json`; ingest records it in
+`wsprdaemon.wsprnet_reporter` (`schema/wsprnet_reporter.sql`), keyed exactly
+as `reporter_for()` looks it up.
+
+Resolution order, most specific last: row's own `rx_sign` → station
+declaration (ClickHouse) → **operator's overrides file**, which wins, because
+a wd admin fixing a misattribution at 02:00 must not be undone by the next
+tar from the station that caused it.
+
+- **⛔ A bare `rx_id` is not a key.**  `KA9Q_0`, `rx888-1` are station-local
+  names that unrelated sites routinely share; an identity filed under one
+  would re-attribute another operator's spots to this site's callsign.  The
+  key is `<rx_sign>/<rx_id>`, or `<rx_sign>` for a whole site.
+- **An identity with no `call` is dropped whole**, never half-applied: a grid
+  alone cannot name a reporter, and honouring the grid while inventing the
+  call from `rx_sign` would post real spots from a location the operator
+  never claimed.
+- The identity insert is a **passenger**, like status: it is not retried and
+  never fails the flush.  Losing it degrades to the row's own `rx_sign`,
+  which is right for every single-receiver site; losing the spots would be an
+  outage.
+
+Tests: `tests/test_wsprnet_forwarder.py` (32) and `tests/test_wsprnet_routing.py`
+(14), plus the cross-repo contract test in hs-uploader's
+`tests/test_transport_wsprdaemon.py` that asserts the server reads back
+exactly what the client wrote.  No ClickHouse or network required.
+
+**Before enabling in production**, two things are relations, not code:
+attribution (we would be posting under operators' callsigns from our IP) and
+wsprnet's rate limiting from a single address.

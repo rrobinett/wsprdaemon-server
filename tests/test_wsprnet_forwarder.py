@@ -124,8 +124,48 @@ def test_a_merged_site_posts_under_its_configured_identity():
     """⛔ The ONE thing a MEPT line cannot derive from the extended row.
     An operator running several receivers may report them to wsprnet under
     one identity that matches no individual receiver's call."""
-    ov = {"KA9Q_0": {"call": "AC0G/M", "grid": "EM38"}}
+    ov = {"AC0G/KA9Q_0": {"call": "AC0G/M", "grid": "EM38"}}
     assert wf.reporter_for(_row(), ov) == ("AC0G/M", "EM38")
+
+
+def test_a_site_wide_override_covers_every_receiver_there():
+    ov = {"AC0G": {"call": "AC0G/M", "grid": "EM38"}}
+    assert wf.reporter_for(_row(rx_id="rx888-1"), ov) == ("AC0G/M", "EM38")
+    assert wf.reporter_for(_row(rx_id="rx888-2"), ov) == ("AC0G/M", "EM38")
+
+
+def test_a_BARE_rx_id_NEVER_matches_another_sites_receiver():
+    """⛔ rx_id is a station-local name: `KA9Q_0`, `rx888-1`.  Two unrelated
+    sites routinely pick the same one.  If a bare rx_id were a lookup key,
+    AC0G declaring an identity for its `KA9Q_0` would silently re-attribute
+    K3LR's `KA9Q_0` spots — real spots posted to a public database under a
+    callsign their operator never chose, with nothing anywhere saying so."""
+    ov = {"KA9Q_0": {"call": "AC0G/M", "grid": "EM38"}}
+    assert wf.reporter_for(_row(rx_sign="K3LR", rx_loc="EN91"), ov) == (
+        "K3LR", "EN91")
+    # ...and it does not match the declaring site either: the key is wrong.
+    assert wf.reporter_for(_row(), ov) == ("AC0G", "EM38ww")
+
+
+def test_declared_identities_load_from_clickhouse_keyed_as_the_lookup():
+    class _CH:
+        def execute(self, sql, *a):
+            assert "wsprdaemon.wsprnet_reporter" in sql
+            return [("AC0G/KA9Q_0", "AC0G/M", "EM38"), ("", "X", "Y"),
+                    ("K3LR/rx1", "", "EN91")]
+    ident = wf.load_declared_identities(_CH())
+    assert ident == {"AC0G/KA9Q_0": {"call": "AC0G/M", "grid": "EM38"}}
+    assert wf.reporter_for(_row(), ident) == ("AC0G/M", "EM38")
+
+
+def test_an_unreadable_identity_table_degrades_to_rx_sign_not_a_crash():
+    """The forwarder must keep posting when the table is missing: the
+    fallback is each row's own rx_sign, which is right for every
+    single-receiver site."""
+    class _CH:
+        def execute(self, sql, *a):
+            raise RuntimeError("no such table")
+    assert wf.load_declared_identities(_CH()) == {}
 
 
 def test_two_reporters_never_share_a_POST():
@@ -338,3 +378,14 @@ def test_an_UNPINNED_host_DOES_probe_the_elector():
             wf._STOP = False
             wf.run_loop(cfg, ch_client_factory=lambda: object())
         probe.assert_called_once()
+
+
+def test_the_operator_file_OUTRANKS_the_station_declaration():
+    """⛔ ORDER MATTERS.  A wd admin fixing a misattribution must not be
+    undone by the next tar from the station that caused it: the station's
+    declaration is the normal path, the file is the override above it."""
+    declared = {"AC0G/KA9Q_0": {"call": "WRONG", "grid": "AA00"}}
+    operator = {"AC0G/KA9Q_0": {"call": "AC0G/M", "grid": "EM38"}}
+    merged = dict(declared)
+    merged.update(operator)          # exactly what run_loop does
+    assert wf.reporter_for(_row(), merged) == ("AC0G/M", "EM38")
