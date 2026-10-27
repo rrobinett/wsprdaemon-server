@@ -233,7 +233,7 @@ def test_over_999_spots_are_chunked():
     rows = [_row(tx_sign=f"W{i:04d}", frequency_mhz=14.0 + i * 0.001)
             for i in range(1500)]
     calls = []
-    posted, failed = wf.forward_rows(rows, url="http://x/", version="1",
+    posted, failed, _cut = wf.forward_rows(rows, url="http://x/", version="1",
                                      overrides={}, opener=_ok_opener(calls))
     assert posted == 1500 and failed == 0
     assert len(calls) == 2, "1500 spots must go as two transactions"
@@ -242,7 +242,7 @@ def test_over_999_spots_are_chunked():
 def test_a_failed_post_is_counted_and_not_silently_dropped():
     def bad(req, timeout=None):
         raise OSError("connection reset")
-    posted, failed = wf.forward_rows([_row()], url="http://x/", version="1",
+    posted, failed, _cut = wf.forward_rows([_row()], url="http://x/", version="1",
                                      overrides={}, opener=bad)
     assert posted == 0 and failed == 1
 
@@ -314,7 +314,7 @@ def _loop_once(tmp, rows, *, leader, forward=None):
                              watermark_path=Path(tmp) / "wm", once=True)
     with mock.patch.object(wf, "fetch_pending", return_value=rows), \
          mock.patch.object(wf, "forward_rows",
-                           side_effect=forward or (lambda *a, **k: (len(rows), 0))), \
+                           side_effect=forward or (lambda *a, **k: (len(rows), 0, None))), \
          mock.patch.object(wf, "load_reporter_overrides", return_value={}):
         wf._STOP = False
         wf.run_loop(cfg, ch_client_factory=lambda: object())
@@ -332,7 +332,7 @@ def test_a_FAILED_post_HOLDS_the_watermark_so_the_spots_retry():
     on its own side — so when in doubt, favour the duplicate."""
     with tempfile.TemporaryDirectory() as tmp:
         wm = _loop_once(tmp, [_row()], leader=True,
-                        forward=lambda *a, **k: (0, 1))
+                        forward=lambda *a, **k: (0, 1, None))
         assert wm is None, "a failed pass must leave the watermark untouched"
 
 
@@ -414,7 +414,7 @@ def test_ONE_SITES_SPOT_NEVER_DELETES_ANOTHER_SITES():
     rows = [_row(rx_sign="AC0G", rx_loc="EM38ww", rx_id="rx1", snr=-10),
             _row(rx_sign="K3LR", rx_loc="EN91", rx_id="rx1", snr=-14),
             _row(rx_sign="W2NAF2", rx_loc="FN21", rx_id="rx1", snr=-21)]
-    posted, failed = wf.forward_rows(rows, url="http://x/", version="9.9",
+    posted, failed, _cut = wf.forward_rows(rows, url="http://x/", version="9.9",
                                      overrides={}, opener=_ok_opener(calls))
     assert (posted, failed) == (3, 0), "every site must report its own hearing"
     assert len(calls) == 3, "one POST per reporter"
@@ -431,7 +431,7 @@ def test_a_sites_OWN_receivers_still_collapse_to_one():
     rows = [_row(rx_sign="AC0G", rx_id="rx1", snr=-10),
             _row(rx_sign="AC0G", rx_id="rx2", snr=-8),
             _row(rx_sign="AC0G", rx_id="rx3", snr=-14)]
-    posted, failed = wf.forward_rows(rows, url="http://x/", version="9.9",
+    posted, failed, _cut = wf.forward_rows(rows, url="http://x/", version="9.9",
                                      overrides={}, opener=_ok_opener(calls))
     assert (posted, failed) == (1, 0)
     assert len(calls) == 1
@@ -551,7 +551,7 @@ def test_two_versions_NEVER_share_a_transaction():
     calls = []
     rows = [_row(version="4.0", tx_sign="W2NAF"),
             _row(version="4.1", tx_sign="K3LR")]
-    posted, failed = wf.forward_rows(rows, url="http://x/", version="9.9",
+    posted, failed, _cut = wf.forward_rows(rows, url="http://x/", version="9.9",
                                      overrides={}, opener=_ok_opener(calls))
     assert (posted, failed) == (2, 0)
     assert len(calls) == 2
@@ -646,7 +646,7 @@ def _windowed(tmp, rows, *, post_interval, passes, batch=20000):
          mock.patch.object(wf, "fetch_pending", return_value=rows), \
          mock.patch.object(wf, "forward_rows",
                            side_effect=lambda *a, **k: (calls.append(1),
-                                                        (len(rows), 0))[1]), \
+                                                        (len(rows), 0, None))[1]), \
          mock.patch.object(wf, "load_reporter_overrides", return_value={}), \
          mock.patch.object(wf, "load_declared_identities", return_value={}):
         wf._STOP = False
@@ -755,8 +755,9 @@ def test_post_mept_tells_the_verdict_how_many_spots_it_SENT():
         seen["timeout"] = timeout
         return _Resp()
 
-    ok, detail = wf.post_mept("http://x/", b"body", timeout=180,
-                              expected=999, opener=_opener)
+    ok, detail, cut = wf.post_mept("http://x/", b"body", timeout=180,
+                                   expected=999, opener=_opener)
+    assert cut is None, "a reply with no limit sentence is not a cutoff"
     assert ok
     assert "SENT" in detail and "999" in detail
     assert seen["timeout"] == 180
@@ -780,3 +781,133 @@ def test_forward_rows_tells_the_verdict_THE_SIZE_OF_EACH_CHUNK_it_sent():
         wf.forward_rows(rows, url="http://x/", version="1",
                         overrides={}, opener=_ok_opener([]))
     assert seen == [999, 501], f"chunk sizes never reached the verdict: {seen}"
+
+
+# ---------- wsprnet's 100-duplicate cutoff ----------
+#
+# Its own reply, captured from wsprnet.org on wd30 2026-10-27 by re-posting
+# 299 already-delivered AC0G/B4 spots:
+#
+#     Upload limit of 1000 spots or 100 dupes reached.<br>
+#     0 out of 100 spot(s) added<br>
+#     Processing took 9881 milliseconds.<br>
+#
+# 999 per transaction is FINE — the limit is 1000 spots.  What bites is the
+# DUPLICATE cutoff: wsprnet abandons the rest of the upload after 100 dupes
+# and still answers HTTP 200.  Advancing the watermark over the part it
+# never read loses those spots silently.
+
+REAL_CUTOFF_REPLY = (
+    "<html>\n<body>\n  <h1>Processing Log Upload</h1><pre>\n"
+    "Upload limit of 1000 spots or 100 dupes reached.<br>"
+    "0 out of 100 spot(s) added<br>\n"
+    "Processing took 9881 milliseconds.<br>\n</body>\n</html>")
+
+
+def test_wsprnets_own_EARLY_STOP_sentence_is_recognised():
+    assert wf._wsprnet_cut(REAL_CUTOFF_REPLY) == 100
+
+
+def test_a_NORMAL_reply_is_not_an_early_stop():
+    """⛔ If an ordinary reply read as a cutoff the watermark would crawl,
+    and the forwarder would re-post the same spots for ever."""
+    assert wf._wsprnet_cut("40 out of 101 spot(s) added<br>") is None
+    assert wf._wsprnet_cut("") is None
+
+
+def test_the_early_stop_is_NAMED_in_the_log_not_left_as_a_bare_number():
+    v = wf._wsprnet_verdict(REAL_CUTOFF_REPLY, expected=999)
+    assert "STOPPED EARLY" in v and "NOT processed" in v
+
+
+def _cut_opener(after):
+    """An opener whose reply says wsprnet stopped after `after` spots."""
+    page = (f"Upload limit of 1000 spots or 100 dupes reached.<br>"
+            f"0 out of {after} spot(s) added<br>")
+
+    def opener(req, timeout=None):
+        class R:
+            status = 200
+            def read(self): return page.encode()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        return R()
+    return opener
+
+
+def test_a_CUT_BATCH_reports_only_as_far_as_wsprnet_actually_READ():
+    """⛔ The whole point: `stopped_at` is the last row wsprnet processed,
+    so the caller can advance the cursor to there and no further."""
+    rows = [_row(tx_sign=f"W{i:04d}", frequency_mhz=14.0 + i * 0.001,
+                 ingested_at=T0 + timedelta(seconds=i))
+            for i in range(300)]
+    posted, failed, stopped_at = wf.forward_rows(
+        rows, url="http://x/", version="1", overrides={},
+        opener=_cut_opener(100))
+    assert posted == 100, "only what wsprnet read counts as posted"
+    assert failed == 0
+    assert stopped_at == rows[99].ingested_at, (
+        "the cursor must stop at the 100th row, not the 300th")
+
+
+def test_a_cut_batch_does_not_keep_POSTING_into_the_same_cutoff():
+    """Later chunks of a group that was just cut would hit the cutoff again
+    and deliver nothing but duplicates — the storm this whole fix exists to
+    end."""
+    rows = [_row(tx_sign=f"W{i:04d}", frequency_mhz=14.0 + i * 0.001,
+                 ingested_at=T0 + timedelta(seconds=i))
+            for i in range(2500)]
+    calls = []
+
+    def counting(req, timeout=None):
+        calls.append(1)
+        return _cut_opener(100)(req, timeout)
+
+    wf.forward_rows(rows, url="http://x/", version="1", overrides={},
+                    opener=counting)
+    assert len(calls) == 1, f"posted {len(calls)} chunks into a known cutoff"
+
+
+def test_wsprnet_reading_NOTHING_holds_the_watermark_outright():
+    """cut == 0 leaves no safe point to advance to, so it must take the
+    already-tested failure path rather than invent one."""
+    rows = [_row(tx_sign=f"W{i:04d}", frequency_mhz=14.0 + i * 0.001)
+            for i in range(50)]
+    posted, failed, stopped_at = wf.forward_rows(
+        rows, url="http://x/", version="1", overrides={},
+        opener=_cut_opener(0))
+    assert posted == 0 and failed == 50 and stopped_at is None
+
+
+def test_the_loop_advances_the_watermark_to_the_CUT_not_to_the_batch_high():
+    """⛔ The silent-loss path this fix closes.  wsprnet answers 200, the
+    batch looks clean, and `high` would mark as done a tail wsprnet never
+    looked at."""
+    rows = [_row(ingested_at=T0), _row(ingested_at=T0 + timedelta(minutes=9))]
+    with tempfile.TemporaryDirectory() as tmp:
+        wm = _loop_once(tmp, rows, leader=True,
+                        forward=lambda *a, **k: (1, 0, T0))
+        assert wm == T0, (
+            "the watermark must stop where wsprnet stopped reading, "
+            "not at the newest row in the batch")
+
+
+def test_the_cursor_takes_the_EARLIEST_cut_across_reporters_not_the_latest():
+    """⛔ One cursor serves every reporter in the batch, so a cut anywhere
+    bounds it everywhere.  Taking the latest cut would mark as done the
+    tails of every OTHER site that was also cut — the same shape as the
+    cross-site dedup bug: correct for one reporter, destructive for many."""
+    early = [_row(rx_sign="AC0G/B4", tx_sign=f"W{i:04d}",
+                  frequency_mhz=14.0 + i * 0.001,
+                  ingested_at=T0 + timedelta(seconds=i))
+             for i in range(300)]
+    late = [_row(rx_sign="W2NAF", rx_loc="FN21ei", tx_sign=f"K{i:04d}",
+                 frequency_mhz=10.0 + i * 0.001,
+                 ingested_at=T0 + timedelta(hours=1, seconds=i))
+            for i in range(300)]
+    _p, _f, stopped_at = wf.forward_rows(
+        early + late, url="http://x/", version="1", overrides={},
+        opener=_cut_opener(100))
+    assert stopped_at == early[99].ingested_at, (
+        "the cursor must stop at the EARLIEST point any reporter was cut; "
+        f"got {stopped_at}, the later site's cut would be {late[99].ingested_at}")

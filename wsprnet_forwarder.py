@@ -497,6 +497,28 @@ def load_declared_identities(ch_client, *, db: str = "wsprdaemon",
 # ── Posting ──────────────────────────────────────────────────────────────────
 
 _ADDED_RE = re.compile(r"(\d+)\s+out of\s+(\d+)\s+spot", re.I)
+# ⛔ wsprnet's OWN words, captured from a real reply on wd30 2026-10-27:
+#     "Upload limit of 1000 spots or 100 dupes reached.<br>
+#      0 out of 100 spot(s) added<br>"
+# It is not a spot cap — 999 per transaction is fine.  It is a DUPLICATE
+# cutoff: after 100 dupes wsprnet abandons the rest of the upload, and the
+# spots it never reached are NOT processed.  It still answers HTTP 200.
+# Advancing the watermark over that tail loses it with no record anywhere,
+# which is the exact failure shape this file has already been bitten by
+# twice (dry-run, and the cross-site dedup).
+_LIMIT_RE = re.compile(r"Upload limit of[^<.]*reached", re.I)
+
+
+def _wsprnet_cut(text: str) -> Optional[int]:
+    """How many spots wsprnet processed before giving up, or None.
+
+    None means it read the whole upload.  A number means it stopped there
+    and the remainder of that chunk was never looked at.
+    """
+    if not _LIMIT_RE.search(text):
+        return None
+    pairs = _ADDED_RE.findall(text)
+    return sum(int(b) for _, b in pairs) if pairs else 0
 
 
 def _wsprnet_verdict(text: str,
@@ -525,9 +547,13 @@ def _wsprnet_verdict(text: str,
     added = sum(int(a) for a, _ in pairs)
     counted = sum(int(b) for _, b in pairs)
     verdict = f"{added} of {counted} spots added"
-    if expected is not None and counted != expected:
-        # The silent-truncation shape: HTTP 200, a cheerful verdict, and a
-        # tail wsprnet never acknowledged.  Nothing downstream can see it.
+    if _LIMIT_RE.search(text):
+        verdict += (f" — \u26a0 wsprnet STOPPED EARLY at {counted}"
+                    + (f" of {expected}" if expected is not None else "")
+                    + " (duplicate cutoff); the rest was NOT processed")
+    elif expected is not None and counted != expected:
+        # HTTP 200, a cheerful verdict, and a tail wsprnet never
+        # acknowledged.  Nothing downstream can see this but us.
         verdict += (f" — \u26a0 SENT {expected}, wsprnet accounted for "
                     f"only {counted}")
     return verdict
@@ -535,7 +561,7 @@ def _wsprnet_verdict(text: str,
 
 def post_mept(url: str, body: bytes, *, timeout: float,
               expected: Optional[int] = None,
-              opener=None) -> Tuple[bool, str]:
+              opener=None) -> Tuple[bool, str, Optional[int]]:
     """POST one multipart body.  Returns (ok, detail)."""
     req = urllib.request.Request(
         url, data=body,
@@ -547,20 +573,26 @@ def post_mept(url: str, body: bytes, *, timeout: float,
         with _open(req, timeout=timeout) as resp:
             code = getattr(resp, "status", None) or resp.getcode()
             text = resp.read().decode("utf-8", errors="replace")
-        return (200 <= int(code) < 300), (
-            f"HTTP {code}: {_wsprnet_verdict(text, expected)}")
+        return ((200 <= int(code) < 300),
+                f"HTTP {code}: {_wsprnet_verdict(text, expected)}",
+                _wsprnet_cut(text))
     except urllib.error.HTTPError as exc:
-        return False, f"HTTP {exc.code}"
+        return False, f"HTTP {exc.code}", None
     except Exception as exc:                        # noqa: BLE001
-        return False, f"{type(exc).__name__}: {exc}"
+        return False, f"{type(exc).__name__}: {exc}", None
 
 
 def forward_rows(rows: List[SpotRow], *, url: str, version: str = "",
                  overrides: Dict[str, Dict[str, str]],
                  timeout: float = DEFAULT_HTTP_TIMEOUT,
                  max_per_upload: int = MAX_SPOTS_PER_UPLOAD,
-                 opener=None) -> Tuple[int, int]:
-    """Dedup, group by reporter, POST.  Returns (posted, failed).
+                 opener=None) -> Tuple[int, int, Optional[datetime]]:
+    """Dedup, group by reporter, POST.
+
+    Returns (posted, failed, stopped_at).  `stopped_at` is None when every
+    chunk was read in full.  Otherwise it is the `ingested_at` of the LAST
+    row wsprnet actually processed — the furthest the watermark may safely
+    advance, because everything after it was never looked at.
 
     ⚠ `version` is NOT what gets POSTed.  Each group reports the
     STATION's own version (see wsprnet_version); this argument is kept
@@ -571,6 +603,7 @@ def forward_rows(rows: List[SpotRow], *, url: str, version: str = "",
     success and drops the tail, so nothing anywhere reports a loss.
     """
     posted = failed = 0
+    stopped_at: Optional[datetime] = None
     # ⛔ GROUP FIRST, THEN DEDUP WITHIN THE GROUP.  The dedup key has no
     # receiver in it (see dedup_for_wsprnet), so deduping the mixed batch
     # first would let one site's spot delete 54 other sites' independent
@@ -585,17 +618,36 @@ def forward_rows(rows: List[SpotRow], *, url: str, version: str = "",
             body = build_multipart(
                 version=ver, call=call, grid=grid,
                 allmept=("\n".join(chunk) + "\n").encode())
-            ok, detail = post_mept(url, body, timeout=timeout,
-                                   expected=len(chunk), opener=opener)
-            if ok:
-                posted += len(chunk)
-                logger.info("posted %d spot(s) as %s/%s (%s) — %s",
-                            len(chunk), call, grid, ver, detail)
-            else:
+            ok, detail, cut = post_mept(url, body, timeout=timeout,
+                                        expected=len(chunk), opener=opener)
+            if not ok:
                 failed += len(chunk)
                 logger.warning("POST failed for %s/%s (%s, %d spots): %s",
                                call, grid, ver, len(chunk), detail)
-    return posted, failed
+                continue
+            posted += len(chunk) if cut is None else cut
+            logger.info("posted %d spot(s) as %s/%s (%s) — %s",
+                        len(chunk), call, grid, ver, detail)
+            if cut is None:
+                continue
+            # ⛔ wsprnet gave up partway.  Everything after row i+cut in
+            # THIS group was never processed, so the watermark must stop
+            # there — and there is no point posting this group's later
+            # chunks, which would hit the same cutoff and add only
+            # duplicates.  Take the EARLIEST such point across groups:
+            # one cursor serves them all, so the safe answer is the most
+            # conservative one.
+            if cut <= 0:
+                # It read none of this chunk.  There is no safe point to
+                # advance to, so say FAILED and let the watermark hold
+                # outright — the existing, already-tested path.
+                failed += len(chunk)
+                break
+            here = group[min(i + cut - 1, len(group) - 1)].ingested_at
+            if stopped_at is None or here < stopped_at:
+                stopped_at = here
+            break
+    return posted, failed, stopped_at
 
 
 # ── Run loop ─────────────────────────────────────────────────────────────────
@@ -711,14 +763,27 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
                 # Station declarations first, operator file on top.
                 overrides = load_declared_identities(client)
                 overrides.update(load_reporter_overrides(cfg.reporters_path))
-                posted, failed = forward_rows(
+                posted, failed, stopped_at = forward_rows(
                     rows, url=cfg.url, version=VERSION,
                     overrides=overrides, timeout=cfg.http_timeout)
                 # ⛔ ADVANCE ONLY ON A CLEAN PASS.  Advancing past spots
                 # that failed to post loses them with no record anywhere;
                 # re-posting a duplicate is harmless, since wsprnet
                 # de-duplicates on its own side.  Favour the duplicate.
-                if failed == 0:
+                if failed == 0 and stopped_at is not None:
+                    # ⛔ wsprnet hit its 100-duplicate cutoff and abandoned
+                    # the rest of the upload — while still answering 200.
+                    # Advance only as far as it actually READ, never to
+                    # `high`: the tail it never looked at must come back
+                    # on the next pass, not be marked done.
+                    since = stopped_at
+                    write_watermark(cfg.watermark_path, since)
+                    logger.warning(
+                        "wsprnet stopped early (duplicate cutoff) — "
+                        "watermark advanced only to %s, not %s, so the "
+                        "unread tail is retried rather than skipped",
+                        stopped_at.isoformat(), high.isoformat())
+                elif failed == 0:
                     since = high
                     write_watermark(cfg.watermark_path, since)
                 else:

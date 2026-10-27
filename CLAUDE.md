@@ -288,8 +288,12 @@ Four properties carry the weight, and each would be a real incident:
 - **⛔ A failed POST holds the watermark.**  Advancing past failed spots
   loses them with no record anywhere; a duplicate is harmless because
   wsprnet de-duplicates.  Favour the duplicate.
-- **Chunked at 999.**  wsprnet *silently truncates* a larger transaction: it
-  returns success and drops the tail.
+- **Chunked at 999, and a 100-DUPLICATE cutoff on top of it.**  wsprnet's own
+  reply states both: *"Upload limit of 1000 spots or 100 dupes reached."*  The
+  1000-spot ceiling is why chunks are 999.  The dupe cutoff is the dangerous
+  one: after 100 duplicates wsprnet abandons the **rest of the upload** and
+  still answers HTTP 200, so the tail it never read looks posted.  The
+  watermark therefore advances only as far as wsprnet says it READ.
 
 **It is inert until a station opts in.**  The selector is `proxy_upload = 1`,
 and across the fleet every row is 0.  So it deploys with no effect, stations
@@ -426,7 +430,7 @@ Proven end to end: B4 tar → gw1/gw2 → reflector → wd30 ingest (`proxy_uplo
 → forwarder → wsprnet.org, confirmed by `wspr.rx` (scraped back **from**
 wsprnet) showing AC0G/B4 unbroken across the cutover.
 
-### Four defects only deployment found
+### Five defects only deployment found
 
 Every one was invisible to a test suite written from the same mental model as
 the code.  The first two surfaced within minutes of touching real data; the
@@ -469,6 +473,27 @@ last two needed a night of it, and the fourth hid the third:
   only thing that was wrong.**  The verdict now sums every block and, when
   what wsprnet accounted for differs from what we sent, says so in capitals:
   silent truncation is the one failure here that nothing else can detect.
+
+- **wsprnet's 100-duplicate cutoff silently discarded the tail of a batch.**
+  Found by the shortfall warning added for the defect above, on its very
+  first POST after deploy: `SENT 999, wsprnet accounted for only 100`.
+  Asking wsprnet directly — re-posting 299 already-delivered spots, which is
+  harmless because it de-duplicates — produced the sentence that explains
+  every "0 of 100" in the journal:
+
+      Upload limit of 1000 spots or 100 dupes reached.
+      0 out of 100 spot(s) added
+      Processing took 9881 milliseconds.
+
+  So 999 per transaction was never the problem.  But once a duplicate storm
+  is under way, **every batch is cut at its first 100 duplicates**, wsprnet
+  answers 200, and the old code advanced the watermark over the ~899 spots it
+  had never looked at.  A duplicate storm therefore converted itself into
+  real loss.  `forward_rows` now returns `stopped_at` — the `ingested_at` of
+  the last row wsprnet actually processed, the EARLIEST such point across
+  reporters, since one cursor serves them all — and `run_loop` advances only
+  to there.  A group that is cut stops posting its later chunks, which would
+  hit the same cutoff and deliver nothing but more duplicates.
 
 **Before widening beyond one station**, two things are relations, not code:
 attribution (we post under operators' callsigns from our IP) and wsprnet's
