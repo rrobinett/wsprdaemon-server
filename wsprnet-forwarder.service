@@ -39,6 +39,10 @@
 #        # connection setup against 74 B per spot, so this is most of the
 #        # server-side saving.  0 posts on every poll (low latency).
 #        #   WSPRNET_FORWARDER_POST_INTERVAL_SEC=300
+#        # Optional — before each POST, skip spots that wspr.rx (wsprnet's
+#        # own record, scraped back) shows wsprnet already holds.  Default
+#        # ON; a failed lookup posts the batch unfiltered.  0 disables.
+#        #   WSPRNET_FORWARDER_SKIP_KNOWN=1
 #   4. systemctl enable --now wsprnet-forwarder
 [Unit]
 Description=wsprnet.org forwarder (wsprdaemon-server)

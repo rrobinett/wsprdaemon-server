@@ -494,6 +494,105 @@ def load_declared_identities(ch_client, *, db: str = "wsprdaemon",
     return out
 
 
+# ── Skip what wsprnet already holds (wspr.rx) ────────────────────────────────
+#
+# ⚡ WHY: a POST that times out on OUR side is usually ingested on wsprnet's
+# anyway.  The watermark then (correctly) holds, and every later pass
+# re-posts those rows.  wsprnet reads 100, finds 100 duplicates, hits its
+# cutoff, and the cursor creeps forward by 100 rows per window.  Measured
+# on wd30 2026-10-30: 9,005 pending rows, 4,102 already on wsprnet, about
+# 7 hours to drain at one window per 5 minutes.  wd30 scrapes wsprnet's
+# own public record into wspr.rx, so the forwarder can ask before posting.
+#
+# ⛔ THE FILTER IS A SAVING, NEVER A GATE.  If the lookup fails, the batch
+# goes out unfiltered, exactly as before.  If the scraper lags, a spot just
+# posted is not found yet and is posted again, as before.  Both cost only
+# a missed saving.  The only way to LOSE a spot is a false match, so the
+# key is exact and errs towards "not found".
+
+# How far wspr.rx's `frequency` may sit from ours and still count as the same
+# spot.  wsprnet keeps 6 decimals of MHz (1 Hz) and the scraper truncates
+# int(mhz * 1e6), so a spot we posted as 14.0971234 comes back as 14097123
+# or 14097122.  10 Hz covers that with margin, stays far below the 100 Hz
+# dedup quantum, and keeps every band apart.
+WSPR_RX_FREQ_TOLERANCE_HZ = 10
+
+
+def _minute_epoch(t: datetime) -> int:
+    """The spot's time as wsprnet stores it: the MEPT line's YYMMDD HHMM."""
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return int(t.replace(second=0, microsecond=0).timestamp())
+
+
+class WsprRxLookup:
+    """Which of a batch's spots wsprnet already holds, per wspr.rx.
+
+    The match key is (reporter call, tx_sign, minute, frequency ±10 Hz):
+
+    * reporter call -- the `call` FORM FIELD we post under (after any
+      override), because that is what wsprnet stores as Reporter.  The
+      row's own rx_sign would look under a name wsprnet never saw.
+    * tx_sign -- compared VERBATIM.  The scraper stores wsprnet's Reporter
+      and CallSign as given, with no upper() and no suffix strip, so any
+      normalisation here could only manufacture matches.  A bracketed
+      "<CALL>" never matches, since wsprnet strips the brackets; that
+      costs a duplicate, never a spot.
+    * minute -- the YYMMDD HHMM the MEPT line carried, compared as epoch
+      seconds so neither side's timezone setting can shift it.
+    * frequency -- stands in for band.  wspr.rx's `band` is wsprnet's own
+      code and wsprdaemon.spots' is metres, with no shared mapping in this
+      repo; a 10 Hz window is tighter than any band and implies it.
+
+    The query uses wspr.rx's sorting key prefix (rx_sign IN ...) and its
+    partition column (time BETWEEN the batch's own first and last minute),
+    so it reads only those reporters' granules in those months.
+
+    A failure returns None and warns once per failure streak; the caller
+    then posts unfiltered.
+    """
+
+    def __init__(self, ch_client, *, db: str = "wspr", table: str = "rx",
+                 tolerance_hz: int = WSPR_RX_FREQ_TOLERANCE_HZ):
+        self.ch = ch_client
+        self.db, self.table = db, table
+        self.tolerance_hz = tolerance_hz
+        self.failing = False
+
+    def __call__(self, probes: List[Tuple[str, SpotRow]]
+                 ) -> Optional[List[bool]]:
+        if not probes:
+            return []
+        minutes = [_minute_epoch(r.time) for _c, r in probes]
+        sql = (f"SELECT rx_sign, tx_sign, toUnixTimestamp(time), frequency "
+               f"FROM {self.db}.{self.table} "
+               f"WHERE rx_sign IN %(calls)s "
+               f"AND time BETWEEN toDateTime(%(t0)s) AND toDateTime(%(t1)s)")
+        params = {"calls": tuple(sorted({c for c, _r in probes})),
+                  "t0": min(minutes), "t1": max(minutes)}
+        try:
+            held: Dict[Tuple[str, str, int], List[int]] = {}
+            for rxs, txs, epoch, freq in self.ch.execute(sql, params):
+                held.setdefault((str(rxs), str(txs), int(epoch)),
+                                []).append(int(freq))
+        except Exception as exc:                    # noqa: BLE001
+            if not self.failing:
+                logger.warning("wspr.rx lookup failed (%s) — posting every "
+                               "batch unfiltered until it recovers", exc)
+            self.failing = True
+            return None
+        if self.failing:
+            logger.info("wspr.rx lookup recovered — skipping spots wsprnet "
+                        "already holds again")
+            self.failing = False
+        out = []
+        for (call, row), minute in zip(probes, minutes):
+            hz = round(row.frequency_mhz * 1e6)
+            out.append(any(abs(f - hz) <= self.tolerance_hz
+                           for f in held.get((call, row.tx_sign, minute), ())))
+        return out
+
+
 # ── Posting ──────────────────────────────────────────────────────────────────
 
 _ADDED_RE = re.compile(r"(\d+)\s+out of\s+(\d+)\s+spot", re.I)
@@ -586,7 +685,8 @@ def forward_rows(rows: List[SpotRow], *, url: str, version: str = "",
                  overrides: Dict[str, Dict[str, str]],
                  timeout: float = DEFAULT_HTTP_TIMEOUT,
                  max_per_upload: int = MAX_SPOTS_PER_UPLOAD,
-                 opener=None) -> Tuple[int, int, Optional[datetime]]:
+                 opener=None,
+                 on_wsprnet=None) -> Tuple[int, int, Optional[datetime]]:
     """Dedup, group by reporter, POST.
 
     Returns (posted, failed, stopped_at).  `stopped_at` is None when every
@@ -601,6 +701,11 @@ def forward_rows(rows: List[SpotRow], *, url: str, version: str = "",
     ⛔ CHUNKED AT max_per_upload.  wsprnet SILENTLY TRUNCATES a larger
     transaction, which is the worst failure shape available: it returns
     success and drops the tail, so nothing anywhere reports a loss.
+
+    `on_wsprnet`, when given, is a WsprRxLookup.  Spots it finds already on
+    wsprnet are not posted and count as delivered: they raise neither
+    `posted` nor `failed`, so the caller's watermark passes over them as
+    over accepted spots.  It returning None (lookup failed) posts all.
     """
     posted = failed = 0
     stopped_at: Optional[datetime] = None
@@ -608,11 +713,31 @@ def forward_rows(rows: List[SpotRow], *, url: str, version: str = "",
     # receiver in it (see dedup_for_wsprnet), so deduping the mixed batch
     # first would let one site's spot delete 54 other sites' independent
     # reports of the same transmission.
+    #
+    # Each row stays paired with its line, so a cut at line k names row k:
+    # the rows posted, not the rows fetched, are what wsprnet counted.
+    prepared = []
     for (call, grid, ver), group in group_by_reporter(rows, overrides).items():
-        group = dedup_for_wsprnet(group)
-        lines = [ln for ln in (row_to_mept(r) for r in group) if ln]
-        if not lines:
+        pairs = [(r, ln) for r in dedup_for_wsprnet(group)
+                 for ln in (row_to_mept(r),) if ln]
+        if pairs:
+            prepared.append((call, grid, ver, pairs))
+
+    if on_wsprnet is not None and prepared:
+        probes = [(call, r) for call, _g, _v, pairs in prepared
+                  for r, _ln in pairs]
+        known = on_wsprnet(probes)
+        if known is not None:
+            flags = iter(known)
+            prepared = [(c, g, v, [p for p in pairs if not next(flags)])
+                        for c, g, v, pairs in prepared]
+            logger.info("%d of %d already on wsprnet (wspr.rx); posting "
+                        "the rest", sum(known), len(probes))
+
+    for call, grid, ver, pairs in prepared:
+        if not pairs:
             continue
+        lines = [ln for _r, ln in pairs]
         for i in range(0, len(lines), max_per_upload):
             chunk = lines[i:i + max_per_upload]
             body = build_multipart(
@@ -643,7 +768,7 @@ def forward_rows(rows: List[SpotRow], *, url: str, version: str = "",
                 # outright — the existing, already-tested path.
                 failed += len(chunk)
                 break
-            here = group[min(i + cut - 1, len(group) - 1)].ingested_at
+            here = pairs[min(i + cut - 1, len(pairs) - 1)][0].ingested_at
             if stopped_at is None or here < stopped_at:
                 stopped_at = here
             break
@@ -671,6 +796,8 @@ class ForwarderConfig:
     http_timeout: float = DEFAULT_HTTP_TIMEOUT
     dry_run: bool = False
     once: bool = False
+    # Skip spots wspr.rx shows wsprnet already holds (see WsprRxLookup).
+    skip_known: bool = True
 
 
 def _interruptible_sleep(seconds: float) -> None:
@@ -697,6 +824,11 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
 
     client = ch_client_factory()
     state = LeaderState()
+    # One instance for the life of the loop, so a failing lookup warns once
+    # per failure streak rather than once per pass.
+    on_wsprnet = WsprRxLookup(client) if cfg.skip_known else None
+    logger.info("skip spots already on wsprnet (wspr.rx): %s",
+                "ON" if on_wsprnet else "OFF")
     since = read_watermark(cfg.watermark_path)
     if since is None:
         since = datetime.now(timezone.utc) - timedelta(
@@ -765,7 +897,8 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
                 overrides.update(load_reporter_overrides(cfg.reporters_path))
                 posted, failed, stopped_at = forward_rows(
                     rows, url=cfg.url, version=VERSION,
-                    overrides=overrides, timeout=cfg.http_timeout)
+                    overrides=overrides, timeout=cfg.http_timeout,
+                    on_wsprnet=on_wsprnet)
                 # ⛔ ADVANCE ONLY ON A CLEAN PASS.  Advancing past spots
                 # that failed to post loses them with no record anywhere;
                 # re-posting a duplicate is harmless, since wsprnet
@@ -833,6 +966,17 @@ def _env_flag(name: str) -> bool:
         "1", "true", "yes", "on")
 
 
+def _env_flag_default_on(name: str) -> bool:
+    """A switch that is ON unless the EnvironmentFile explicitly says no.
+
+    The mirror of _env_flag, for a setting whose safe default is on: only
+    `0`, `false`, `no` or `off` disables it, so a blank or garbled line
+    leaves the default in place.
+    """
+    return (os.environ.get(name) or "").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--leader-url", default=os.environ.get(
@@ -861,6 +1005,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                    default=_env_flag("WSPRNET_FORWARDER_DRY_RUN"),
                    help="read and log, POST nothing "
                         "(or set WSPRNET_FORWARDER_DRY_RUN=1)")
+    p.add_argument("--skip-known", action=argparse.BooleanOptionalAction,
+                   default=_env_flag_default_on("WSPRNET_FORWARDER_SKIP_KNOWN"),
+                   help="before each POST, drop spots wspr.rx shows wsprnet "
+                        "already holds (default on; "
+                        "WSPRNET_FORWARDER_SKIP_KNOWN=0 disables)")
     p.add_argument("--once", action="store_true")
     p.add_argument("-v", "--verbose", action="count", default=0)
     a = p.parse_args(argv)
@@ -882,7 +1031,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         db_password=a.clickhouse_password, url=a.url,
         poll_sec=a.poll_sec, batch=a.batch,
         post_interval_sec=max(0, a.post_interval_sec),
-        dry_run=a.dry_run, once=a.once)
+        dry_run=a.dry_run, once=a.once, skip_known=a.skip_known)
     logger.info("wsprnet_forwarder %s on %s → %s (leader: %s)",
                 VERSION, cfg.this_host, cfg.url,
                 cfg.pin_leader or cfg.leader_url)

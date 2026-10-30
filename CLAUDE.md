@@ -413,7 +413,7 @@ tar from the station that caused it.
   which is right for every single-receiver site; losing the spots would be an
   outage.
 
-Tests: `tests/test_wsprnet_forwarder.py` (32) and `tests/test_wsprnet_routing.py`
+Tests: `tests/test_wsprnet_forwarder.py` (78) and `tests/test_wsprnet_routing.py`
 (14), plus the cross-repo contract test in hs-uploader's
 `tests/test_transport_wsprdaemon.py` that asserts the server reads back
 exactly what the client wrote.  No ClickHouse or network required.
@@ -543,6 +543,26 @@ last two needed a night of it, and the fourth hid the third:
   reporters, since one cursor serves them all — and `run_loop` advances only
   to there.  A group that is cut stops posting its later chunks, which would
   hit the same cutoff and deliver nothing but more duplicates.
+
+### Skipping what wsprnet already holds (`WSPRNET_FORWARDER_SKIP_KNOWN`, default on)
+
+A POST that times out on our side usually lands on wsprnet anyway.  The
+watermark then holds, and each later pass re-posts those spots until
+wsprnet's 100-duplicate cutoff stops it: the cursor crept 100 rows per
+5-minute window on wd30 on 2026-10-30.  So before each POST the forwarder
+asks `wspr.rx` (wsprnet's own record, scraped back) which spots it already
+holds, drops them, and counts them as delivered.
+
+- **The match is exact and errs towards "not found".**  Key: the posted
+  reporter `call` (after overrides), `tx_sign` verbatim (the scraper does
+  not normalise either call), the MEPT minute, and frequency within 10 Hz
+  (stands in for band: wspr.rx's `band` is wsprnet's code, spots' is metres).
+  A missed match costs a duplicate; a false match would lose a spot.
+- **One query per batch**, on wspr.rx's sorting-key prefix (`rx_sign IN`)
+  and partition column (`time BETWEEN` the batch's first and last minute).
+- **A saving, never a gate.**  A failed lookup warns once per failure
+  streak and posts the batch unfiltered.  Scraper lag only means a just-posted
+  spot gets posted again, as before.
 
 **Before widening beyond one station**, two things are relations, not code:
 attribution (we post under operators' callsigns from our IP) and wsprnet's

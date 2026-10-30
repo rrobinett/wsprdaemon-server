@@ -911,3 +911,264 @@ def test_the_cursor_takes_the_EARLIEST_cut_across_reporters_not_the_latest():
     assert stopped_at == early[99].ingested_at, (
         "the cursor must stop at the EARLIEST point any reporter was cut; "
         f"got {stopped_at}, the later site's cut would be {late[99].ingested_at}")
+
+
+# ---------- skip what wsprnet already holds (wspr.rx) ----------
+#
+# wd30, 2026-10-30.  Several POSTs timed out client-side around 19:12Z
+# while wsprnet ingested them anyway.  62150af then (correctly) held the
+# watermark, so every pass re-posted them: wsprnet read 100, found 100
+# duplicates, hit its cutoff, and the watermark crept ~3 s per 5-minute
+# pass -- a 7-hour drain for 9,005 rows, 4,102 of which wsprnet already
+# had.  wd30 scrapes wsprnet's own record into wspr.rx, so the forwarder
+# can ask before it posts.
+
+def _epoch(dt):
+    return int(dt.timestamp())
+
+
+class _FakeRx:
+    """A wspr.rx that honours the forwarder's WHERE: rx_sign IN and the
+    time window, as epoch seconds.  Rows are (rx_sign, tx_sign, time,
+    frequency_hz) as the scraper stores them -- verbatim from wsprnet."""
+    def __init__(self, rows, *, fail=None):
+        self.rows, self.fail, self.queries = rows, fail, []
+
+    def execute(self, sql, params=None):
+        self.queries.append((sql, params))
+        if "wspr.rx" not in sql:
+            return []
+        if self.fail is not None:
+            raise self.fail
+        calls = set(params["calls"])
+        return [(rx, tx, _epoch(t), f) for (rx, tx, t, f) in self.rows
+                if rx in calls and params["t0"] <= _epoch(t) <= params["t1"]]
+
+    def rx_queries(self):
+        return [q for q in self.queries if "wspr.rx" in q[0]]
+
+
+def _spots(n, **kw):
+    return [_row(tx_sign=f"W{i:04d}", frequency_mhz=14.0971 + i * 0.0002,
+                 ingested_at=T0 + timedelta(seconds=i), **kw)
+            for i in range(n)]
+
+
+def _rx_of(row, call="AC0G"):
+    """The wspr.rx row wsprnet would hold for this spot."""
+    return (call, row.tx_sign, row.time, int(round(row.frequency_mhz * 1e6)))
+
+
+def _posted_calls(calls):
+    out = []
+    for c in calls:
+        body = c.data.split(b'filename="spots.txt"')[1]
+        out += [ln.split()[6].decode() for ln in body.splitlines()
+                if ln[:6].isdigit()]
+    return out
+
+
+def test_rows_ALREADY_ON_WSPRNET_are_not_posted_and_the_rest_are():
+    rows = _spots(10)
+    rx = _FakeRx([_rx_of(r) for r in rows[:4]])
+    calls = []
+    posted, failed, stopped_at = wf.forward_rows(
+        rows, url="http://x/", overrides={}, opener=_ok_opener(calls),
+        on_wsprnet=wf.WsprRxLookup(rx))
+    assert _posted_calls(calls) == [r.tx_sign for r in rows[4:]]
+    assert (posted, failed, stopped_at) == (6, 0, None)
+    assert len(rx.rx_queries()) == 1, "one lookup per batch"
+
+
+def test_a_PARTLY_known_batch_advances_the_watermark_over_BOTH():
+    """The known rows are the NEWEST here, so a watermark at the batch
+    high proves it advanced over them, not just over what was posted."""
+    rows = _spots(10)
+    rx = _FakeRx([_rx_of(r) for r in rows[6:]])
+    calls = []
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = wf.ForwarderConfig(this_host="wd20", pin_leader="wd20",
+                                 watermark_path=Path(tmp) / "wm", once=True)
+        with mock.patch.object(wf, "fetch_pending", return_value=rows), \
+             mock.patch.object(wf, "load_reporter_overrides", return_value={}), \
+             mock.patch.object(wf.urllib.request, "urlopen", _ok_opener(calls)):
+            wf._STOP = False
+            wf.run_loop(cfg, ch_client_factory=lambda: rx)
+        assert _posted_calls(calls) == [r.tx_sign for r in rows[:6]]
+        assert wf.read_watermark(Path(tmp) / "wm") == rows[-1].ingested_at
+
+
+def test_an_ENTIRELY_known_batch_posts_NOTHING_and_advances_to_the_end():
+    rows = _spots(10)
+    rx = _FakeRx([_rx_of(r) for r in rows])
+    calls = []
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = wf.ForwarderConfig(this_host="wd20", pin_leader="wd20",
+                                 watermark_path=Path(tmp) / "wm", once=True)
+        with mock.patch.object(wf, "fetch_pending", return_value=rows), \
+             mock.patch.object(wf, "load_reporter_overrides", return_value={}), \
+             mock.patch.object(wf.urllib.request, "urlopen", _ok_opener(calls)):
+            wf._STOP = False
+            wf.run_loop(cfg, ch_client_factory=lambda: rx)
+        assert calls == [], "nothing new for wsprnet, so nothing to POST"
+        assert wf.read_watermark(Path(tmp) / "wm") == rows[-1].ingested_at
+
+
+def test_a_CUT_after_skipping_counts_from_the_rows_actually_POSTED():
+    """⛔ 62150af's rule survives the filter: the cursor stops at the last
+    row wsprnet READ.  With the first 50 rows skipped, wsprnet's 100th row
+    is our 150th -- indexing the unfiltered list would stop at row 99 and
+    re-post 50 rows for nothing, or worse, index past what was read."""
+    rows = _spots(300)
+    rx = _FakeRx([_rx_of(r) for r in rows[:50]])
+    posted, failed, stopped_at = wf.forward_rows(
+        rows, url="http://x/", overrides={}, opener=_cut_opener(100),
+        on_wsprnet=wf.WsprRxLookup(rx))
+    assert (posted, failed) == (100, 0)
+    assert stopped_at == rows[149].ingested_at
+
+
+def test_the_lookup_logs_ONE_info_line_per_batch():
+    rows = _spots(10)
+    rx = _FakeRx([_rx_of(r) for r in rows[:4]])
+    with mock.patch.object(wf.logger, "info") as info:
+        wf.forward_rows(rows, url="http://x/", overrides={},
+                        opener=_ok_opener([]), on_wsprnet=wf.WsprRxLookup(rx))
+    lines = [c.args[0] % c.args[1:] for c in info.call_args_list
+             if "already on wsprnet" in c.args[0]]
+    assert lines == ["4 of 10 already on wsprnet (wspr.rx); posting the rest"]
+
+
+def test_a_FAILED_lookup_posts_UNFILTERED_and_warns_ONCE_per_streak():
+    """⛔ The filter is a saving, never a gate.  A missing table or a
+    ClickHouse hiccup must leave delivery exactly as it was before."""
+    rows = _spots(10)
+    rx = _FakeRx([_rx_of(r) for r in rows], fail=RuntimeError("no wspr.rx"))
+    look = wf.WsprRxLookup(rx)
+    for attempt in (1, 2):
+        calls = []
+        with mock.patch.object(wf.logger, "warning") as warn:
+            posted, failed, _cut = wf.forward_rows(
+                rows, url="http://x/", overrides={},
+                opener=_ok_opener(calls), on_wsprnet=look)
+        assert _posted_calls(calls) == [r.tx_sign for r in rows]
+        assert (posted, failed) == (10, 0)
+        assert warn.call_count == (1 if attempt == 1 else 0), attempt
+    # ...and a recovery re-arms the warning for the next streak.
+    rx.fail = None
+    look(([("AC0G", rows[0])]))
+    rx.fail = RuntimeError("again")
+    with mock.patch.object(wf.logger, "warning") as warn:
+        assert look([("AC0G", rows[0])]) is None
+    assert warn.call_count == 1
+
+
+def test_the_switch_OFF_runs_no_lookup_and_posts_everything():
+    rows = _spots(10)
+    rx = _FakeRx([_rx_of(r) for r in rows])
+    calls = []
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = wf.ForwarderConfig(this_host="wd20", pin_leader="wd20",
+                                 watermark_path=Path(tmp) / "wm", once=True,
+                                 skip_known=False)
+        with mock.patch.object(wf, "fetch_pending", return_value=rows), \
+             mock.patch.object(wf, "load_reporter_overrides", return_value={}), \
+             mock.patch.object(wf.urllib.request, "urlopen", _ok_opener(calls)):
+            wf._STOP = False
+            wf.run_loop(cfg, ch_client_factory=lambda: rx)
+    assert rx.rx_queries() == [], "switched off means not even asked"
+    assert _posted_calls(calls) == [r.tx_sign for r in rows]
+
+
+def test_the_switch_defaults_ON_and_only_an_explicit_no_turns_it_off():
+    import os
+    os.environ.pop("X_WF_SKIP", None)
+    assert wf._env_flag_default_on("X_WF_SKIP") is True
+    for on in ("1", "true", "yes", "on", "", "  "):
+        os.environ["X_WF_SKIP"] = on
+        assert wf._env_flag_default_on("X_WF_SKIP") is True, repr(on)
+    for off in ("0", "false", "FALSE", "no", "off", " 0 "):
+        os.environ["X_WF_SKIP"] = off
+        assert wf._env_flag_default_on("X_WF_SKIP") is False, repr(off)
+    del os.environ["X_WF_SKIP"]
+    assert wf.ForwarderConfig(this_host="x").skip_known is True
+
+
+def test_a_callsign_differing_ONLY_in_case_or_suffix_is_NOT_dropped():
+    """⛔ The scraper stores wsprnet's Reporter and CallSign VERBATIM (no
+    upper(), no suffix strip), so the match is exact.  A near match is a
+    different station, or at least not provably the same spot: post it,
+    and let wsprnet's own dedup decide.  A missed saving, never a loss."""
+    r = _spots(1)[0]
+    for tx in ("w0000", "W0000/P", "W0000/QRP", "<W0000>"):
+        rx = _FakeRx([("AC0G", tx, r.time, int(round(r.frequency_mhz * 1e6)))])
+        calls = []
+        wf.forward_rows([r], url="http://x/", overrides={},
+                        opener=_ok_opener(calls), on_wsprnet=wf.WsprRxLookup(rx))
+        assert _posted_calls(calls) == ["W0000"], tx
+    for rxs in ("ac0g", "AC0G/P"):
+        rx = _FakeRx([(rxs, r.tx_sign, r.time, int(round(r.frequency_mhz * 1e6)))])
+        calls = []
+        wf.forward_rows([r], url="http://x/", overrides={},
+                        opener=_ok_opener(calls), on_wsprnet=wf.WsprRxLookup(rx))
+        assert _posted_calls(calls) == ["W0000"], rxs
+
+
+def test_another_BAND_or_CYCLE_of_the_same_pair_is_NOT_a_match():
+    """Same reporter, same transmitter, same minute on 40 m is a different
+    spot from 20 m; so is the same frequency one cycle later."""
+    r = _spots(1)[0]
+    hz = int(round(r.frequency_mhz * 1e6))
+    for t, f in ((r.time, 7040100), (r.time, hz + 50),
+                 (r.time + timedelta(minutes=2), hz)):
+        rx = _FakeRx([("AC0G", r.tx_sign, t, f)])
+        calls = []
+        wf.forward_rows([r], url="http://x/", overrides={},
+                        opener=_ok_opener(calls), on_wsprnet=wf.WsprRxLookup(rx))
+        assert _posted_calls(calls) == ["W0000"], (t, f)
+
+
+def test_wsprnets_frequency_ROUNDING_still_matches():
+    """wsprnet keeps 1 Hz (6 decimals of MHz) and the scraper truncates
+    int(mhz*1e6), so our 14.0971234 comes back as 14097123 or 14097122."""
+    r = _row(frequency_mhz=14.0971234)
+    for f in (14097123, 14097122, 14097124):
+        rx = _FakeRx([("AC0G", r.tx_sign, r.time, f)])
+        calls = []
+        wf.forward_rows([r], url="http://x/", overrides={},
+                        opener=_ok_opener(calls), on_wsprnet=wf.WsprRxLookup(rx))
+        assert calls == [], f
+
+
+def test_the_match_uses_the_POSTED_reporter_call_not_the_rows_rx_sign():
+    """wsprnet's Reporter is the `call` form field, which an override can
+    make differ from rx_sign.  Matching on rx_sign would look for the
+    spot under a name wsprnet never saw."""
+    r = _spots(1)[0]
+    ov = {"AC0G": {"call": "AC0G/M", "grid": "EM38"}}
+    rx = _FakeRx([_rx_of(r, call="AC0G/M")])
+    calls = []
+    wf.forward_rows([r], url="http://x/", overrides=ov,
+                    opener=_ok_opener(calls), on_wsprnet=wf.WsprRxLookup(rx))
+    assert calls == []
+    rx = _FakeRx([_rx_of(r, call="AC0G")])
+    wf.forward_rows([r], url="http://x/", overrides=ov,
+                    opener=_ok_opener(calls), on_wsprnet=wf.WsprRxLookup(rx))
+    assert len(calls) == 1
+
+
+def test_the_lookup_is_BOUNDED_by_the_sorting_key_and_the_batch_window():
+    """⛔ wspr.rx is billions of rows, ORDER BY (rx_sign, band, time, id),
+    PARTITION BY toYYYYMM(time).  The query must name the reporters and
+    the batch's own time span, or it scans the table every pass."""
+    rows = [_row(time=T0 + timedelta(minutes=2 * i), tx_sign=f"W{i}AA",
+                 rx_sign=("AC0G" if i % 2 else "K3LR"), rx_loc="EN91")
+            for i in range(5)]
+    rx = _FakeRx([])
+    wf.forward_rows(rows, url="http://x/", overrides={},
+                    opener=_ok_opener([]), on_wsprnet=wf.WsprRxLookup(rx))
+    (sql, params), = rx.rx_queries()
+    assert "rx_sign IN" in sql and "time BETWEEN" in sql
+    assert sorted(params["calls"]) == ["AC0G", "K3LR"]
+    assert params["t0"] == _epoch(T0)
+    assert params["t1"] == _epoch(T0 + timedelta(minutes=8))
