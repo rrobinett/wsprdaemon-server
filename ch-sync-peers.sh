@@ -40,7 +40,7 @@
 
 set -uo pipefail
 
-VERSION="1.0.3"
+VERSION="1.0.4"
 CONF="/etc/wsprdaemon/ch-sync-peers.conf"
 CH_CONF="/etc/wsprdaemon/clickhouse.conf"
 LOG="/var/log/wsprdaemon/ch-sync-peers.log"
@@ -69,6 +69,29 @@ TABLE_PEERS[pskreporter.rx]="wd10"
 # An active station rewrites its declaration on every flush, so a live site's
 # identity is always inside the lookback window.  A silent station's ages out
 # — which is harmless, because it has no spots to forward either.
+# ⛔ Tables whose copied rows take THIS host's ingest time.  The wsprnet
+# forwarder selects `proxy_upload = 1 AND ingested_at > watermark`, so
+# ingested_at means "when this host received the row".  A peer's value is
+# the PEER's receipt time -- or 0 on a peer whose ingest never sets it
+# (wd10) -- and a row copied with it falls below the forwarder's
+# watermark forever.  Live on wd30 2026-10-30: every AC0G/B4 spot after
+# 14:00Z arrived only through this copy, carried ingested_at = 1970, and
+# never reached wsprnet.  psk.spots is deliberately NOT listed: its rows
+# reach this host from wd10's pskreporter loader too, and stamping them
+# would hand the pskreporter forwarder rows it must never re-send.
+STAMP_INGESTED_AT_TABLES="wsprdaemon.spots"
+
+# select_cols <table> <cols>: the column list for the SELECT side of a
+# copy.  For a table in STAMP_INGESTED_AT_TABLES, ingested_at becomes now().
+select_cols() {
+    local table="$1" cols="$2"
+    case " ${STAMP_INGESTED_AT_TABLES} " in
+        *" ${table} "*)
+            echo "$cols" | sed -E 's/(^|, )ingested_at(, |$)/\1now() AS ingested_at\2/' ;;
+        *) echo "$cols" ;;
+    esac
+}
+
 declare -A TABLE_TIME_COL
 TABLE_TIME_COL[psk.reporter]="updated_at"
 TABLE_TIME_COL[wsprdaemon.wsprnet_reporter]="updated_at"
@@ -180,6 +203,7 @@ for table in $TABLES; do
         vlog "SKIP $table: not present locally"; continue
     fi
     cols=$(ch "SELECT arrayStringConcat(groupArray(name), ', ') FROM (SELECT name FROM system.columns WHERE database = '$(sql_str "$db")' AND table = '$(sql_str "$tbl")' AND default_kind NOT IN ('ALIAS','MATERIALIZED') ORDER BY position)") || { TOTAL_ERRORS=$((TOTAL_ERRORS+1)); continue; }
+    scols=$(select_cols "$table" "$cols")
     (( CHUNK_NO == 1 )) && TOTAL_TABLES=$((TOTAL_TABLES+1))
 
     peers_for_table="${TABLE_PEERS[$table]:-$PEERS}"
@@ -223,7 +247,7 @@ for table in $TABLES; do
                 n_copy=$n_hours; n_rows=$p_total
             else
                 t1=$(date +%s)
-                if ch "INSERT INTO ${table} (${cols}) SELECT ${cols} FROM $(rem "$peer" "$table") WHERE ${where_win}" >/dev/null 2>/tmp/ch-sync-peers.err.$$; then
+                if ch "INSERT INTO ${table} (${cols}) SELECT ${scols} FROM $(rem "$peer" "$table") WHERE ${where_win}" >/dev/null 2>/tmp/ch-sync-peers.err.$$; then
                     after=$(ch "SELECT count() FROM ${table} WHERE ${where_win}" 2>/dev/null || echo "?")
                     log "COPY $table <- $peer whole chunk $chunk_txt local=0 peer=$p_total now=$after ($(( $(date +%s) - t1 ))s)"
                     n_copy=$n_hours; [[ "$after" =~ ^[0-9]+$ ]] && n_rows=$after
@@ -252,9 +276,9 @@ for table in $TABLES; do
                 continue
             fi
             if (( l == 0 )); then
-                q="INSERT INTO ${table} (${cols}) SELECT ${cols} FROM $(rem "$peer" "$table") WHERE ${where_hour}"
+                q="INSERT INTO ${table} (${cols}) SELECT ${scols} FROM $(rem "$peer" "$table") WHERE ${where_hour}"
             else
-                q="INSERT INTO ${table} (${cols}) SELECT ${cols} FROM $(rem "$peer" "$table") WHERE ${where_hour} AND ${ident} GLOBAL NOT IN (SELECT ${ident} FROM ${table} WHERE ${where_hour})"
+                q="INSERT INTO ${table} (${cols}) SELECT ${scols} FROM $(rem "$peer" "$table") WHERE ${where_hour} AND ${ident} GLOBAL NOT IN (SELECT ${ident} FROM ${table} WHERE ${where_hour})"
             fi
             t1=$(date +%s)
             if ch "$q" >/dev/null 2>/tmp/ch-sync-peers.err.$$; then
