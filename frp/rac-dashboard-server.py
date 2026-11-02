@@ -224,11 +224,17 @@ SCRIPT = ("<script>function cp(el,t){var a=document.createElement('textarea');"
           # What a click copies: log in with the key; failing that, drop the
           # stale host key for this [host]:port and install the key, then log
           # in (the reasons are at the ssh cell in render_main).
-          "function sshfull(el){var p=el.dataset.port,u=el.dataset.user,g=window.GW;"
-          "return 'ssh -p '+p+' -o BatchMode=yes -o ConnectTimeout=5 '+u+'@'+g+' true '"
-          "+\"2>/dev/null || { ssh-keygen -R '[\"+g+']:'+p+\"' >/dev/null 2>&1; \""
-          "+'ssh-copy-id -p '+p+' -o StrictHostKeyChecking=accept-new '+u+'@'+g+'; }; '"
-          "+sshcmd(el);}"
+          # Every command in it names the SAME known_hosts file,
+          # ~/.ssh/known_hosts.rac: an operator whose ~/.ssh/config sends RAC
+          # ports to their own file kept the stale key there, so a bare
+          # ssh-keygen -R was a no-op (2026-10-31).  CheckHostIP=no because
+          # every station is this one gateway IP on a different port.
+          "function sshfull(el){var p=el.dataset.port,u=el.dataset.user,g=window.GW,"
+          "k='~/.ssh/known_hosts.rac',o=' -o UserKnownHostsFile='+k+' -o CheckHostIP=no';"
+          "return 'ssh -p '+p+o+' -o BatchMode=yes -o ConnectTimeout=5 '+u+'@'+g+' true '"
+          "+\"2>/dev/null || { ssh-keygen -f \"+k+\" -R '[\"+g+']:'+p+\"' >/dev/null 2>&1; \""
+          "+'ssh-copy-id -p '+p+o+' -o StrictHostKeyChecking=accept-new '+u+'@'+g+'; }; '"
+          "+'ssh -p '+p+o+' '+u+'@'+g;}"
           "function fg(el){var n=el.dataset.n;"
           "if(!confirm('Remove '+n+' from this list? Its connection history goes too. '"
           "+'If the station connects again it comes back.'))return;"
