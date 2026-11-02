@@ -204,7 +204,9 @@ STYLE = (
     'code{background:#f4f4f4;padding:.1rem .35rem;border-radius:4px;font-size:.82rem;color:#555}'
     '.dot{color:#ccc}.on{color:#28a745;font-weight:600}.off-row td{opacity:.5}'
     '.ago{color:#999;font-size:.85rem}tr:hover td{background:#fafafa}'
-    '.act{text-decoration:underline;cursor:pointer}')
+    '.act{text-decoration:underline;cursor:pointer}'
+    '.forget{margin-left:.5rem;font-size:.75rem;padding:0 .35rem;cursor:pointer;'
+    'color:#a33;background:#fff;border:1px solid #dbb;border-radius:3px}')
 
 # Clipboard copy that works over plain HTTP (navigator.clipboard needs HTTPS):
 # a transient textarea + execCommand, with a brief "copied" confirmation.
@@ -215,7 +217,14 @@ SCRIPT = ("<script>function cp(el,t){var a=document.createElement('textarea');"
           "var o=el.textContent;el.textContent='copied';"
           "setTimeout(function(){el.textContent=o;},900);}"
           "function sshcmd(el){return 'ssh -p '+el.dataset.port+' '"
-          "+el.dataset.user+'@'+window.GW;}</script>")
+          "+el.dataset.user+'@'+window.GW;}"
+          "function fg(el){var n=el.dataset.n;"
+          "if(!confirm('Remove '+n+' from this list? Its connection history goes too. '"
+          "+'If the station connects again it comes back.'))return;"
+          "fetch('/forget',{method:'POST',headers:{'X-RAC-Forget':'1',"
+          "'Content-Type':'application/x-www-form-urlencoded'},"
+          "body:'n='+encodeURIComponent(n)}).then(function(r){return r.text().then("
+          "function(t){if(!r.ok)alert(t);location.reload();});});}</script>")
 
 # Client-side VPN detection (admin tiers only): probe each candidate
 # gateway address via GET /ping and rewrite the ssh/web links to the first
@@ -320,6 +329,23 @@ def status_map():
     con.close()
     return {r[0]: {'active': bool(r[1]), 'last_seen': r[2],
                    'first_seen': r[3], 'sessions': r[4], 'rac': r[5]} for r in rows}
+
+
+def forget(name):
+    """Drop every session row of a client that is not connected now, so a
+    station gone for good stops being listed (rob, 2026-11-02: zombie rows
+    unseen for days, removed by hand from the page rather than by a timer).
+    Returns (ok, message).  A client that is connected is refused: the poller
+    would only list it again 30 s later, and its history is still live."""
+    if name in live_services()[0]:
+        return False, f'{name} is connected now; it can only be removed while offline'
+    con = db()
+    n = con.execute('DELETE FROM sessions WHERE name=?', (name,)).rowcount
+    con.commit()
+    con.close()
+    if not n:
+        return False, f'{name} is not in the history'
+    return True, f'removed {name} ({n} session(s))'
 
 
 def history(name):
@@ -582,6 +608,9 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
         rowcls = '' if active else ' class="off-row"'
         st = '<span class="on">&#9679; active</span>' if active else (
             f'<span class="ago">last seen {ago(ls, now)}</span>' if ls else '&mdash;')
+        if not active and tier == 'mesh' and name in stat:
+            st += (f'<button class="forget" data-n="{html.escape(name)}" '
+                   'onclick="fg(this)" title="remove this offline entry">remove</button>')
         b.append(f'<tr{rowcls}><td class="name">'
                  f'<a href="?h={html.escape(name)}">{html.escape(name)}</a></td>'
                  f'<td class="name">{rac if rac is not None else "&mdash;"}</td>'
@@ -810,6 +839,42 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(page_b)))
         self.end_headers()
         self.wfile.write(page_b)
+
+    def do_POST(self):
+        """POST /forget n=<name>: the page's "remove" button.  Full-trust
+        mesh tier only, and only with the X-RAC-Forget header the page's
+        script sends: a form on another site cannot set a custom header, so
+        it cannot remove anything through a viewer's browser."""
+        local = self.connection.getsockname()[0]
+        u = urlparse(self.path)
+        def reply(code, text):
+            b = text.encode()
+            self.send_response(code)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        if ADMIN_NETS.get(local) != 'mesh':
+            return reply(403, 'forbidden: mesh tier only')
+        if u.path != '/forget':
+            return reply(404, 'unknown')
+        if self.headers.get('X-RAC-Forget') != '1':
+            return reply(403, 'forbidden: use the button on the page')
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            n = 0
+        if not 0 < n <= 4096:
+            return reply(400, 'no station named')
+        name = (parse_qs(self.rfile.read(n).decode('utf-8', 'replace')).get('n') or [''])[0]
+        if not name:
+            return reply(400, 'no station named')
+        try:
+            ok, msg = forget(name)
+        except Exception as exc:
+            return reply(502, 'error: %s' % exc)
+        reply(200 if ok else 409, msg)
 
     def log_message(self, *a):
         pass
