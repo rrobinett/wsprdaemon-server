@@ -22,5 +22,11 @@
         "rac-hamsci-master.conf.enc"
     ],
     "station_account": "hamsci",
-    "host_label": "hs0"
+    "host_label": "vpn1",
+    "gateway_addrs": [
+        [
+            "10.3.2.1",
+            "hamsci"
+        ]
+    ]
 }

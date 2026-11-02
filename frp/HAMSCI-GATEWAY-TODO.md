@@ -62,5 +62,7 @@ clients have today. Today the HamSCI side has one gateway; WsprDaemon has two.
 
 - WsprDaemon dual-gateway client: `wd-rac-client` (`wd-remote-access@gw1/@gw2`).
 - TOFU plugin: `frp/frps-tofu-plugin.py` (v1.0.0, running on hs0).
-- Dashboards: `frp/rac-dashboard-server.py` (gw2) and
-  `frp/rac-dashboard-server-hamsci.py` (hs0).
+- Dashboard: `frp/rac-dashboard-server.py` runs on both gateways (rob,
+  2026-11-02: the HamSCI page, on vpn1 (formerly hs0), works the same as
+  gw2's). Each gateway's differences live in `dashboard.conf` beside the
+  script: `frp/rac-dashboard.conf.gw2` and `frp/rac-dashboard.conf.hamsci`.
