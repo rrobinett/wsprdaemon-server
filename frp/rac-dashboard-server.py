@@ -734,6 +734,9 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
         arrow = (' &#9660;' if desc else ' &#9650;') if sort == col else ''
         return f'<th><a href="?s={col}{d}">{label}</a>{arrow}</th>'
     b.append('<table><tr>' + th('name', 'Name') + th('rac', 'RAC') + th('status', 'Status'))
+    show_host = any(host_of(clients.get(n, {}))[0] for n in names)
+    if show_host:
+        b.append('<th>PM host</th>')
     if tier == 'mesh':
         b.append('<th>Login</th>')
     for h, _ls, _k in present:
@@ -754,15 +757,20 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
         if not active and tier == 'mesh' and name in stat:
             st += (f'<button class="forget" data-n="{html.escape(name)}" '
                    'onclick="fg(this)" title="remove this offline entry">remove</button>')
-        _vh, _vhr = host_of(clients.get(name, {}))
-        via = ('' if not _vh else
-               ' <span class="ago" title="channels forwarded by this Proxmox host">'
-               'on %s%s</span>' % (html.escape(_vh),
-                                   ' (%s)' % html.escape(str(_vhr)) if _vhr else ''))
         b.append(f'<tr{rowcls}><td class="name">'
-                 f'<a href="?h={html.escape(name)}">{html.escape(name)}</a>{via}</td>'
+                 f'<a href="?h={html.escape(name)}">{html.escape(name)}</a></td>'
                  f'<td class="name">{rac if rac is not None else "&mdash;"}</td>'
                  f'<td>{st}</td>')
+        if show_host:
+            ### PM host: the Proxmox box whose frpc forwards this VM's
+            ### channels (rob, 2026-11-03: "both rows could have a column to
+            ### their pm host").  Blank for a host itself and for stations
+            ### that run their own frpc.
+            _vh, _vhr = host_of(clients.get(name, {}))
+            b.append('<td class="name">%s</td>' % (
+                '<span class="dot">&middot;</span>' if not _vh else
+                html.escape(_vh) + (' <span class="ago">%s</span>' % html.escape(str(_vhr))
+                                    if _vhr else '')))
         ### The Login account is the operator's own record of who to log in as,
         ### and rob treats it as authoritative: "unless the login column says
         ### something different ... in which case that's the correct one"
