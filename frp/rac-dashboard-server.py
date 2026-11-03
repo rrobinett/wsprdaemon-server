@@ -259,7 +259,7 @@ STYLE = (
     'code{background:#f4f4f4;padding:.1rem .35rem;border-radius:4px;font-size:.82rem;color:#555}'
     '.dot{color:#ccc}.on{color:#28a745;font-weight:600}.off-row td{opacity:.5}'
     '.ago{color:#999;font-size:.85rem}tr:hover td{background:#fafafa}'
-    '.act{text-decoration:underline;cursor:pointer}.dead{color:#b0b0b0;cursor:not-allowed}'
+    '.act{text-decoration:underline;cursor:pointer}.dead{color:#b0b0b0;cursor:not-allowed}tr:target td{background:#fff6c8}'
     '.ed{margin-left:.3rem;font-size:.75rem;color:#888;text-decoration:none;cursor:pointer}'
     '.forget{margin-left:.5rem;font-size:.75rem;padding:0 .35rem;cursor:pointer;'
     'color:#a33;background:#fff;border:1px solid #dbb;border-radius:3px}')
@@ -735,6 +735,14 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
         return f'<th><a href="?s={col}{d}">{label}</a>{arrow}</th>'
     b.append('<table><tr>' + th('name', 'Name') + th('rac', 'RAC') + th('status', 'Status'))
     show_host = any(host_of(clients.get(n, {}))[0] for n in names)
+    ### host row name -> [(vm row name, rac)], for the host's own PM host cell
+    vms_of = {}
+    for n in names:
+        _h = host_of(clients.get(n, {}))[0]
+        if _h:
+            vms_of.setdefault(_h, []).append((n, row_facts(n)[0]))
+    def row_link(n, label=None):
+        return '<a href="#row-%s">%s</a>' % (html.escape(n, quote=True), html.escape(label or n))
     if show_host:
         b.append('<th>PM host</th>')
     if tier == 'mesh':
@@ -757,20 +765,27 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
         if not active and tier == 'mesh' and name in stat:
             st += (f'<button class="forget" data-n="{html.escape(name)}" '
                    'onclick="fg(this)" title="remove this offline entry">remove</button>')
-        b.append(f'<tr{rowcls}><td class="name">'
+        b.append(f'<tr{rowcls} id="row-{html.escape(name, quote=True)}"><td class="name">'
                  f'<a href="?h={html.escape(name)}">{html.escape(name)}</a></td>'
                  f'<td class="name">{rac if rac is not None else "&mdash;"}</td>'
                  f'<td>{st}</td>')
         if show_host:
-            ### PM host: the Proxmox box whose frpc forwards this VM's
-            ### channels (rob, 2026-11-03: "both rows could have a column to
-            ### their pm host").  Blank for a host itself and for stations
-            ### that run their own frpc.
+            ### PM host: a VM row links up to the Proxmox box whose frpc
+            ### forwards its channels; that host's row links down to each of
+            ### its VMs (rob, 2026-11-03: "both rows could have a column to
+            ### their pm host" ... the PM host line "should have links to its
+            ### VM RAC lines").  A dot for stations that run their own frpc.
             _vh, _vhr = host_of(clients.get(name, {}))
-            b.append('<td class="name">%s</td>' % (
-                '<span class="dot">&middot;</span>' if not _vh else
-                html.escape(_vh) + (' <span class="ago">%s</span>' % html.escape(str(_vhr))
-                                    if _vhr else '')))
+            if _vh:
+                cell = row_link(_vh) + (' <span class="ago">%s</span>' % html.escape(str(_vhr))
+                                        if _vhr else '')
+            elif name in vms_of:
+                cell = ('<span class="ago">VMs:</span> ' + ', '.join(
+                    row_link(v) + (' <span class="ago">%s</span>' % r if r is not None else '')
+                    for v, r in sorted(vms_of[name], key=lambda x: x[0].lower())))
+            else:
+                cell = '<span class="dot">&middot;</span>'
+            b.append('<td class="name">%s</td>' % cell)
         ### The Login account is the operator's own record of who to log in as,
         ### and rob treats it as authoritative: "unless the login column says
         ### something different ... in which case that's the correct one"
