@@ -745,8 +745,6 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
         return '<a href="#row-%s">%s</a>' % (html.escape(n, quote=True), html.escape(label or n))
     if show_host:
         b.append('<th>PM host</th>')
-    if tier == 'mesh':
-        b.append('<th>Login</th>')
     for h, _ls, _k in present:
         b.append(f'<th class="svc">{h}</th>')
     b.append('</tr>')
@@ -786,34 +784,21 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
             else:
                 cell = '<span class="dot">&middot;</span>'
             b.append('<td class="name">%s</td>' % cell)
-        ### The Login account is the operator's own record of who to log in as,
-        ### and rob treats it as authoritative: "unless the login column says
-        ### something different ... in which case that's the correct one"
-        ### (2026-09-30).  Hoisted out of the Login cell because the SSH cells
-        ### below need it too -- previously they could offer `root@` while the
-        ### very same row displayed a real account two columns to the left.
-        ### Non-mesh tiers do not load creds, so this is '' there and the
-        ### per-column default applies, exactly as before.
+        ### The admin's rac-creds.json account for this RAC.  There is no Login
+        ### column any more (rob, 2026-11-03: "i don't see the purpose of the
+        ### login column.  also, it doesn't match the login name in the ssh
+        ### links"): the ssh link IS the login, and the pencil changes it.
+        ### The creds account still feeds the link's default for WsprDaemon
+        ### stations, but not for Sigmond ones: those entries are left over
+        ### from the WD box a Sigmond appliance replaced (RAC 8 and 83 both
+        ### offered `rob` to a VM that only has sigmond).
+        ### Non-mesh tiers do not load creds, so this is '' there.
         c = creds.get(str(rac)) if rac is not None else None
-        login_acct = (c or {}).get('account') or ''
-        if tier == 'mesh':
-            ### Login: real account + a click-to-copy password (password passed
-            ### via a data- attribute, never inlined into the JS string).
-            acct = login_acct
-            pw = (c or {}).get('password') or ''
-            if pw:
-                cell = ('%s / <a class="act" href="#" data-pw="%s" '
-                        'onclick="cp(this,this.dataset.pw);return false" '
-                        'title="copy password">pw</a>'
-                        % (html.escape(acct) or '&mdash;', html.escape(pw)))
-            elif acct:
-                cell = html.escape(acct)
-            else:
-                cell = '<span class="dot">&middot;</span>'
-            b.append(f'<td>{cell}</td>')
         svcs = vis.get(name, {})
         saved = logins.get(str(rac), {}) if rac is not None else {}
         is_sigmond = bool(host_of(clients.get(name, {}))[0]) or any(m in clients.get(name, {}) for m in SIGMOND_MARKERS)
+        login_acct = '' if is_sigmond else ((c or {}).get('account') or '')
+        login_pw = (c or {}).get('password') or ''
         for _h, labels, kind in present:
             svc = next((svcs[l] for l in labels if l in svcs), None)
             if not svc:
@@ -833,7 +818,7 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
             else:
                 ### Precedence, most to least authoritative:
                 ###   0. the login saved with this cell's pencil (per RAC)
-                ###   1. the Login column, when the operator has recorded one
+                ###   1. the admin's rac-creds account (WsprDaemon stations only)
                 ###   2. the station's own advertised metadatas.user
                 ###   3. this column's default (wsprdaemon for a receiver /
                 ###      the VM, root for the Proxmox host, wsprsonde for a
@@ -899,7 +884,13 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
                              % (html.escape(name), rac, slot,
                                 'Proxmox host' if slot == 'host' else 'VM',
                                 html.escape(user)))
-                            if tier == 'mesh' and rac is not None else ''))
+                            if tier == 'mesh' and rac is not None else '')
+                         + (' <a class="act" href="#" data-pw="%s" '
+                            'onclick="cp(this,this.dataset.pw);return false" '
+                            'title="copy the password on record for %s">pw</a>'
+                            % (html.escape(login_pw), html.escape(user))
+                            if tier == 'mesh' and login_pw and c
+                            and c.get('account') == user else ''))
         b.append('</tr>')
     b.append('</table>')
     # window.GW is what sshcmd()/cp() compose the command from; the probe
@@ -942,11 +933,13 @@ def render_api(tier):
         ### the gateway default. The table also supplies password + port_fwd
         ### (mesh tier only) regardless of where the account came from.
         c = creds.get(str(rac)) if rac is not None else None
-        if not from_meta and c and c.get('account'):
-            account = c['account']
-        elif not from_meta and (host_of(clients.get(name, {}))[0]
-                                or any(m in clients.get(name, {}) for m in SIGMOND_MARKERS)):
+        # Sigmond first: their rac-creds entries are left over from the WD box
+        # the appliance replaced (same rule as the page's ssh links).
+        if not from_meta and (host_of(clients.get(name, {}))[0]
+                              or any(m in clients.get(name, {}) for m in SIGMOND_MARKERS)):
             account = SIGMOND_ACCOUNT
+        elif not from_meta and c and c.get('account'):
+            account = c['account']
         saved = logins.get(str(rac), {}).get('vm') if rac is not None else None
         if saved:
             account = saved
