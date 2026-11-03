@@ -14,6 +14,7 @@ import base64
 import html
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -160,6 +161,57 @@ COLUMNS = [
 # above is explicit that per-gateway differences live in dashboard.conf.
 # Falls back to default_account so a gateway that sets neither keeps working.
 STATION_ACCOUNT = CFG.get('station_account', DEFAULT_ACCOUNT)
+# A Sigmond appliance (it has a Proxmox host channel) is entered as sigmond
+# in its decoder VM, not as the WsprDaemon station account.  rob, 2026-11-03:
+# "These are Sigmond systems ... the VM default user should be sigmond";
+# the Proxmox host stays root.
+SIGMOND_ACCOUNT = CFG.get('sigmond_account', 'sigmond')
+SIGMOND_MARKERS = ('host SSH', 'Proxmox UI')
+
+# Per-RAC login names the operator saved with the pencil next to an ssh link:
+# {"<rac>": {"vm": "<user>", "host": "<user>"}}.  They win over everything
+# else, so a station whose account is not the default is fixed once and stays
+# fixed (rob, 2026-11-03: "a way to edit it so it's remembered by the RAC").
+LOGINS_FILE = CFG.get('logins_file',
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rac-logins.json'))
+_LOGINS_LOCK = threading.Lock()
+_LOGIN_RE = re.compile(r'^[a-z_][a-z0-9_.-]{0,31}$')
+
+
+def load_logins():
+    try:
+        with open(LOGINS_FILE) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_login(rac, which, user):
+    """Set (or with user '' clear) the saved login for one RAC's VM or host."""
+    with _LOGINS_LOCK:
+        d = load_logins()
+        ent = d.get(str(rac)) or {}
+        if user:
+            ent[which] = user
+        else:
+            ent.pop(which, None)
+        if ent:
+            d[str(rac)] = ent
+        else:
+            d.pop(str(rac), None)
+        tmp = LOGINS_FILE + '.tmp'
+        with open(tmp, 'w') as fh:
+            json.dump(d, fh, indent=1, sort_keys=True)
+            fh.write('\n')
+        os.replace(tmp, LOGINS_FILE)
+
+
+def login_slot(label):
+    """Which saved login an SSH column uses: the Proxmox host's or the station's."""
+    return 'host' if label == 'host SSH' else 'vm'
+
+
 SSH_DEFAULT_USER = {
     'VM SSH':    STATION_ACCOUNT,
     'SSH':       STATION_ACCOUNT,
@@ -208,6 +260,7 @@ STYLE = (
     '.dot{color:#ccc}.on{color:#28a745;font-weight:600}.off-row td{opacity:.5}'
     '.ago{color:#999;font-size:.85rem}tr:hover td{background:#fafafa}'
     '.act{text-decoration:underline;cursor:pointer}.dead{color:#b0b0b0;cursor:not-allowed}'
+    '.ed{margin-left:.3rem;font-size:.75rem;color:#888;text-decoration:none;cursor:pointer}'
     '.forget{margin-left:.5rem;font-size:.75rem;padding:0 .35rem;cursor:pointer;'
     'color:#a33;background:#fff;border:1px solid #dbb;border-radius:3px}')
 
@@ -235,6 +288,16 @@ SCRIPT = ("<script>function cp(el,t){var a=document.createElement('textarea');"
           "+\"2>/dev/null || { ssh-keygen -f \"+k+\" -R '[\"+g+']:'+p+\"' >/dev/null 2>&1; \""
           "+'ssh-copy-id -p '+p+o+' -o StrictHostKeyChecking=accept-new '+u+'@'+g+'; }; '"
           "+'ssh -p '+p+o+' '+u+'@'+g;}"
+          # The pencil beside an ssh link: save this RAC's login name on the
+          # gateway (blank = back to the default).
+          "function ed(el){var d=el.dataset,u=prompt('Login name for '+d.n+' ('+d.w+'), '"
+          "+'remembered for RAC '+d.rac+'. Leave blank for the default.',d.user);"
+          "if(u===null)return;"
+          "fetch('/login',{method:'POST',headers:{'X-RAC-Login':'1',"
+          "'Content-Type':'application/x-www-form-urlencoded'},"
+          "body:'rac='+encodeURIComponent(d.rac)+'&w='+encodeURIComponent(d.slot)"
+          "+'&u='+encodeURIComponent(u.trim())}).then(function(r){return r.text().then("
+          "function(t){if(!r.ok)alert(t);location.reload();});});}"
           "function fg(el){var n=el.dataset.n;"
           "if(!confirm('Remove '+n+' from this list? Its connection history goes too. '"
           "+'If the station connects again it comes back.'))return;"
@@ -578,6 +641,7 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
     clients, _online = live_services()
     stat = status_map()
     creds = load_creds() if tier == 'mesh' else {}   # passwords: mesh tier only
+    logins = load_logins()
     # tier-filter live services
     vis = {}
     for name, svcs in clients.items():
@@ -701,6 +765,8 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
                 cell = '<span class="dot">&middot;</span>'
             b.append(f'<td>{cell}</td>')
         svcs = vis.get(name, {})
+        saved = logins.get(str(rac), {}) if rac is not None else {}
+        is_sigmond = any(m in clients.get(name, {}) for m in SIGMOND_MARKERS)
         for _h, labels, kind in present:
             svc = next((svcs[l] for l in labels if l in svcs), None)
             if not svc:
@@ -719,6 +785,7 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
                              '%s yet">down</span></td>' % svc['port'])
             else:
                 ### Precedence, most to least authoritative:
+                ###   0. the login saved with this cell's pencil (per RAC)
                 ###   1. the Login column, when the operator has recorded one
                 ###   2. the station's own advertised metadatas.user
                 ###   3. this column's default (wsprdaemon for a receiver /
@@ -730,7 +797,11 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
                                 else SSH_DEFAULT_USER.get(svc['label'],
                                                           DEFAULT_ACCOUNT))
                 _host_login = svc['label'] in ('host SSH',)
-                user = ((not _host_login and login_acct)
+                slot = login_slot(svc['label'])
+                if is_sigmond and not _host_login and svc['tier'] != 'sonde':
+                    default_user = SIGMOND_ACCOUNT
+                user = (saved.get(slot)
+                        or (not _host_login and login_acct)
                         or svc.get('user')
                         or default_user)
                 cmd = 'ssh -p %s %s@%s' % (svc['port'], user, link_ip)
@@ -772,8 +843,16 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
                 # SCRIPT), from the address the VPN probe settled on.
                 b.append('<td class="svc"><a class="act ssh" href="#" title="%s" '
                          'data-port="%s" data-user="%s" '
-                         'onclick="cp(this,sshfull(this));return false">ssh</a></td>'
-                         % (cmd, svc['port'], user))
+                         'onclick="cp(this,sshfull(this));return false">ssh</a>%s</td>'
+                         % (cmd, svc['port'], user,
+                            ('<a class="ed" href="#" title="change the login name '
+                             '(remembered for this RAC)" data-n="%s" data-rac="%s" '
+                             'data-slot="%s" data-w="%s" data-user="%s" '
+                             'onclick="ed(this);return false">&#9998;</a>'
+                             % (html.escape(name), rac, slot,
+                                'Proxmox host' if slot == 'host' else 'VM',
+                                html.escape(user)))
+                            if tier == 'mesh' and rac is not None else ''))
         b.append('</tr>')
     b.append('</table>')
     # window.GW is what sshcmd()/cp() compose the command from; the probe
@@ -793,6 +872,7 @@ def render_api(tier):
     clients, _online = live_services()
     stat = status_map()
     creds = load_creds()
+    logins = load_logins()
     out = []
 
     def rac_for(name):
@@ -817,6 +897,11 @@ def render_api(tier):
         c = creds.get(str(rac)) if rac is not None else None
         if not from_meta and c and c.get('account'):
             account = c['account']
+        elif not from_meta and any(m in clients.get(name, {}) for m in SIGMOND_MARKERS):
+            account = SIGMOND_ACCOUNT
+        saved = logins.get(str(rac), {}).get('vm') if rac is not None else None
+        if saved:
+            account = saved
         station = {
             'name': name,
             'rac': rac,
@@ -961,6 +1046,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b)
         if ADMIN_NETS.get(local) != 'mesh':
             return reply(403, 'forbidden: mesh tier only')
+        if u.path == '/login':
+            return self._post_login(reply)
         if u.path != '/forget':
             return reply(404, 'unknown')
         if self.headers.get('X-RAC-Forget') != '1':
@@ -979,6 +1066,32 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             return reply(502, 'error: %s' % exc)
         reply(200 if ok else 409, msg)
+
+    def _post_login(self, reply):
+        """POST /login rac=<n>&w=vm|host&u=<user>: the pencil beside an ssh
+        link.  Same guard as /forget: mesh tier (checked by the caller) plus
+        a custom header no cross-site form can send."""
+        if self.headers.get('X-RAC-Login') != '1':
+            return reply(403, 'forbidden: use the pencil on the page')
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            n = 0
+        if not 0 < n <= 1024:
+            return reply(400, 'empty request')
+        q = parse_qs(self.rfile.read(n).decode('utf-8', 'replace'), keep_blank_values=True)
+        rac = (q.get('rac') or [''])[0]
+        which = (q.get('w') or [''])[0]
+        user = (q.get('u') or [''])[0].strip()
+        if not rac.isdigit() or which not in ('vm', 'host'):
+            return reply(400, 'bad RAC or slot')
+        if user and not _LOGIN_RE.match(user):
+            return reply(400, 'not a valid login name: %r' % user)
+        try:
+            save_login(int(rac), which, user)
+        except Exception as exc:
+            return reply(502, 'error: %s' % exc)
+        reply(200, 'saved')
 
     def log_message(self, *a):
         pass
