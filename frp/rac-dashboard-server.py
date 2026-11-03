@@ -525,6 +525,15 @@ def rac_of(svcs):
     return None
 
 
+def host_of(svcs):
+    """(host site, host RAC) a VM's channels are forwarded through, or
+    (None, None) for a station that runs its own frpc."""
+    for s in svcs.values():
+        if s.get('host'):
+            return s['host'], s.get('host_rac')
+    return None, None
+
+
 def is_sonde(rac):
     return rac is not None and 2000 <= rac <= 2099
 
@@ -584,10 +593,20 @@ def live_services():
         if port is None:
             port = conf.get('remote_port')
         meta = conf.get('metadatas') or conf.get('meta_datas') or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        ### A Proxmox host's frpc carries its VMs' channels too.  Each VM's
+        ### proxies are named after the VM's own site, on that VM's own RAC
+        ### ports, so the VM already lands in a row of its own; per-proxy
+        ### metadatas.host (the host's site) says which box forwards it
+        ### (rob, 2026-11-03: "the host owns the RAC setups ... it needs to
+        ### communicate that it forwards RAC connections to each of the VMs").
         clients.setdefault(client, {})[label] = {
             'kind': kind, 'proto': proto, 'tier': tier, 'label': label,
             'port': port,
-            'user': meta.get('user') if isinstance(meta, dict) else None}
+            'user': meta.get('user'),
+            'host': meta.get('host') or None,
+            'host_rac': meta.get('host_rac') or None}
     online = {c: rac_of(svcs) for c, svcs in clients.items()}
     return clients, online
 
@@ -735,8 +754,13 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
         if not active and tier == 'mesh' and name in stat:
             st += (f'<button class="forget" data-n="{html.escape(name)}" '
                    'onclick="fg(this)" title="remove this offline entry">remove</button>')
+        _vh, _vhr = host_of(clients.get(name, {}))
+        via = ('' if not _vh else
+               ' <span class="ago" title="channels forwarded by this Proxmox host">'
+               'on %s%s</span>' % (html.escape(_vh),
+                                   ' (%s)' % html.escape(str(_vhr)) if _vhr else ''))
         b.append(f'<tr{rowcls}><td class="name">'
-                 f'<a href="?h={html.escape(name)}">{html.escape(name)}</a></td>'
+                 f'<a href="?h={html.escape(name)}">{html.escape(name)}</a>{via}</td>'
                  f'<td class="name">{rac if rac is not None else "&mdash;"}</td>'
                  f'<td>{st}</td>')
         ### The Login account is the operator's own record of who to log in as,
@@ -766,7 +790,7 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
             b.append(f'<td>{cell}</td>')
         svcs = vis.get(name, {})
         saved = logins.get(str(rac), {}) if rac is not None else {}
-        is_sigmond = any(m in clients.get(name, {}) for m in SIGMOND_MARKERS)
+        is_sigmond = bool(host_of(clients.get(name, {}))[0]) or any(m in clients.get(name, {}) for m in SIGMOND_MARKERS)
         for _h, labels, kind in present:
             svc = next((svcs[l] for l in labels if l in svcs), None)
             if not svc:
@@ -897,7 +921,8 @@ def render_api(tier):
         c = creds.get(str(rac)) if rac is not None else None
         if not from_meta and c and c.get('account'):
             account = c['account']
-        elif not from_meta and any(m in clients.get(name, {}) for m in SIGMOND_MARKERS):
+        elif not from_meta and (host_of(clients.get(name, {}))[0]
+                                or any(m in clients.get(name, {}) for m in SIGMOND_MARKERS)):
             account = SIGMOND_ACCOUNT
         saved = logins.get(str(rac), {}).get('vm') if rac is not None else None
         if saved:
@@ -910,6 +935,7 @@ def render_api(tier):
             'legacy': name.endswith(' [legacy]'),
             'active': bool(stat.get(name, {}).get('active') or name in clients),
             'last_seen': stat.get(name, {}).get('last_seen'),
+            'host': host_of(clients.get(name, {}))[0],
             'services': {lab: {'port': s['port'], 'proto': s['proto'],
                                'kind': s['kind'], 'tier': s['tier']}
                          for lab, s in svcs.items()},
