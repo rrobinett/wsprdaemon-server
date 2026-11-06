@@ -875,7 +875,7 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
                 # SCRIPT), from the address the VPN probe settled on.
                 b.append('<td class="svc"><a class="act ssh" href="#" title="%s" '
                          'data-port="%s" data-user="%s" '
-                         'onclick="cp(this,sshfull(this));return false">ssh</a>%s</td>'
+                         'onclick="cp(this,sshfull(this));return false">ssh</a>%s%s</td>'
                          % (cmd, svc['port'], user,
                             ('<a class="ed" href="#" title="change the login name '
                              '(remembered for this RAC)" data-n="%s" data-rac="%s" '
@@ -884,13 +884,16 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
                              % (html.escape(name), rac, slot,
                                 'Proxmox host' if slot == 'host' else 'VM',
                                 html.escape(user)))
-                            if tier == 'mesh' and rac is not None else '')
-                         + (' <a class="act" href="#" data-pw="%s" '
+                            if tier == 'mesh' and rac is not None else '',
+                            # Inside the cell: appended after </td> it became
+                            # stray table content, which browsers hoist above
+                            # the table as a row of "pwpwpw" (rob, 2026-11-06).
+                            (' <a class="act" href="#" data-pw="%s" '
                             'onclick="cp(this,this.dataset.pw);return false" '
                             'title="copy the password on record for %s">pw</a>'
                             % (html.escape(login_pw), html.escape(user))
                             if tier == 'mesh' and login_pw and c
-                            and c.get('account') == user else ''))
+                            and c.get('account') == user else '')))
         b.append('</tr>')
     b.append('</table>')
     # window.GW is what sshcmd()/cp() compose the command from; the probe
