@@ -24,6 +24,7 @@ sys.path.insert(0, str(HERE.parent))
 
 class _FakeFtlibPskReporter:
     instances: list = []
+    interval = 180          # ftlib's own default
     def __init__(self, *, callsign, grid, antenna, dummy=False, tcp=False):
         self.callsign = callsign
         self.grid = grid
@@ -42,6 +43,7 @@ class _FakeFtlibPskReporter:
 def _install_fake_pskreporter():
     """Make `from pskreporter import PskReporter` resolve to our fake."""
     _FakeFtlibPskReporter.instances = []
+    _FakeFtlibPskReporter.interval = 180
     mod = _types.ModuleType("pskreporter")
     mod.PskReporter = _FakeFtlibPskReporter
     sys.modules["pskreporter"] = mod
@@ -428,3 +430,41 @@ class TestLoadDeclaredIdentities(unittest.TestCase):
             pf.reporter_for(_psk_row("AC0G/ND", "EN16ov"),
                             pf.load_declared_identities(_Boom())),
             ("AC0G/ND", "EN16ov"))
+
+
+class TestUploadInterval(unittest.TestCase):
+    """Uploads no more than once per five minutes (PSKReporter's rule)."""
+
+    ROW = dict(time=datetime(2026, 11, 6, 23, 0, tzinfo=UTC),
+               ingested_at=datetime(2026, 11, 6, 23, 0, 5, tzinfo=UTC),
+               mode="ft8", rx_sign="KFS/SE", rx_loc="CM87tj",
+               tx_call="K1ABC", grid="FN42",
+               frequency=14_074_580, snr_db=-12, dt=0.27)
+
+    def setUp(self):
+        _install_fake_pskreporter()
+        self._saved = os.environ.pop("PSKREPORTER_FORWARDER_UPLOAD_SEC", None)
+
+    def tearDown(self):
+        os.environ.pop("PSKREPORTER_FORWARDER_UPLOAD_SEC", None)
+        if self._saved is not None:
+            os.environ["PSKREPORTER_FORWARDER_UPLOAD_SEC"] = self._saved
+
+    def _interval_after_forward(self):
+        pf.forward_rows([pf.PskRow(**self.ROW)], psk_cache={})
+        return _FakeFtlibPskReporter.interval
+
+    def test_default_is_five_minutes(self):
+        self.assertEqual(self._interval_after_forward(), 300)
+
+    def test_env_can_lengthen(self):
+        os.environ["PSKREPORTER_FORWARDER_UPLOAD_SEC"] = "600"
+        self.assertEqual(self._interval_after_forward(), 600)
+
+    def test_env_cannot_go_under_five_minutes(self):
+        os.environ["PSKREPORTER_FORWARDER_UPLOAD_SEC"] = "60"
+        self.assertEqual(self._interval_after_forward(), 300)
+
+    def test_garbage_env_falls_back_to_default(self):
+        os.environ["PSKREPORTER_FORWARDER_UPLOAD_SEC"] = "soon"
+        self.assertEqual(self._interval_after_forward(), 300)

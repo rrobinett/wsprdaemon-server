@@ -79,6 +79,34 @@ DEFAULT_HTTP_TIMEOUT = 5
 # back-flooding PSKReporter with day-old spots from a stale db.
 COLD_START_LOOKBACK_SEC = 300
 
+# ⛔ PSKReporter's rule (pskreporter.info/pskdev.html, Philip Gladstone):
+# "The datagrams should be sent at a rate of no more than one every five
+# minutes (unless the packet becomes full)."  ftlib's PskReporter uploads
+# every 180 s (+0..15 s jitter) and hard-codes that in a CLASS attribute,
+# so the forwarder sets it.  PSKREPORTER_FORWARDER_UPLOAD_SEC may lengthen
+# it; anything shorter than five minutes is raised to five minutes.
+MIN_UPLOAD_SEC = 300
+DEFAULT_UPLOAD_SEC = 300
+
+
+def upload_interval_sec() -> int:
+    """Seconds between PSKReporter uploads per reporter: env, floored at 300."""
+    raw = os.environ.get("PSKREPORTER_FORWARDER_UPLOAD_SEC", "").strip()
+    if not raw:
+        return DEFAULT_UPLOAD_SEC
+    try:
+        val = int(float(raw))
+    except ValueError:
+        logger.warning("PSKREPORTER_FORWARDER_UPLOAD_SEC=%r is not a number "
+                       "— using %d s", raw, DEFAULT_UPLOAD_SEC)
+        return DEFAULT_UPLOAD_SEC
+    if val < MIN_UPLOAD_SEC:
+        logger.warning("PSKREPORTER_FORWARDER_UPLOAD_SEC=%d is under "
+                       "PSKReporter's five-minute minimum — using %d s",
+                       val, MIN_UPLOAD_SEC)
+        return MIN_UPLOAD_SEC
+    return val
+
 
 # Mode normalization: psk.spots stores lowercase "ft8"/"ft4"; PSKReporter
 # expects uppercase mode tags. Anything we don't recognize is logged + skipped.
@@ -347,6 +375,7 @@ def _pskreporter_for_station(
     inst = cache.get(key)
     if inst is None:
         from pskreporter import PskReporter   # ftlib-pskreporter
+        PskReporter.interval = upload_interval_sec()
         inst = PskReporter(
             callsign=rx_sign,
             grid=rx_loc,
