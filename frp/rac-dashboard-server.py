@@ -119,6 +119,13 @@ SUFFIXES = [
     # phantom machine (rob, 2026-09-21).  Bands avoid 46800/47800 above.
     ('-vm-station', 'web', 'http', 'shareable', 'Station web'),   # 48800+rac
     ('-vm-gmag',   'web', 'http', 'shareable', 'Magnetometer'),  # 49800+rac  # WD 3.4.6+ carrier strip charts, 40800+rac
+    # A station can also publish its own web page beside the standard ones:
+    # DASI-006 (W3USR_06) carries the W2NAF FRC contest dashboard as
+    # <name>-vm-contest on 47000+rac (frpc-host.toml, added 2026-10-22).
+    # Without this suffix parse() fell through to its ssh default and the
+    # page showed a phantom "DASI-006.W3USR_06-vm-contest" machine whose ssh
+    # link was refused (rob, 2026-11-08).
+    ('-vm-contest', 'web', 'http', 'shareable', 'Contest'),
     ('-ssh',      'ssh', 'ssh',   'mesh-only', 'SSH'),        # receiver (smd)
     ('-web',      'web', 'http',  'shareable', 'ka9q-web'),   # receiver (smd)
 ]
@@ -144,6 +151,11 @@ COLUMNS = [
     # --- rare: only a few stations have these ---
     ('VM Station',      ['Station web'],             'web'),
     ('VM Magneto&shy;meter', ['Magnetometer'],       'web'),  # &shy;: lets the narrow header hyphenate
+    # rob, 2026-11-08: a station's own extra web page (so far DASI-006's
+    # contest dashboard) gets its own column, last of the VM ones and before
+    # the Proxmox host.  Like every web cell it is probed, so it reads
+    # "open" only when the page actually answers.
+    ('VM Contest',      ['Contest'],                 'web'),
     # --- the Proxmox host underneath it ---
     ('Proxmox UI',      ['Proxmox UI'],              'web'),
     ('Proxmox box SSH', ['host SSH'],                'ssh'),
