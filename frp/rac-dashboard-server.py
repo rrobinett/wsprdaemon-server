@@ -111,6 +111,7 @@ SUFFIXES = [
     ('-vm-web',   'web', 'http',  'shareable', 'VM ka9q-web'),
     ('-vm-web2',  'web', 'http',  'shareable', 'VM ka9q-web #2'),  # 2nd RX888's ka9q-web, 46800+rac
     ('-vm-web3',  'web', 'http',  'shareable', 'VM ka9q-web #3'),  # 3rd RX888's ka9q-web, 47800+rac
+    ('-vm-web4',  'web', 'http',  'shareable', 'VM ka9q-web #4'),  # 4th radiod's ka9q-web (no band yet: parse only)
     ('-vm-grape', 'web', 'http',  'shareable', 'GRAPE charts'),
     # The sigmond decoder VM serves THREE web UIs, not one.  Without these
     # two suffixes parse() falls through to its default and renders each
@@ -132,12 +133,16 @@ SUFFIXES = [
 COLUMNS = [
     # --- the decoder VM, the columns most stations have ---
     ('VM SSH',          ['VM SSH', 'SSH'],           'ssh'),
-    ('VM Web',          ['VM ka9q-web', 'ka9q-web'], 'web'),
+    # rob, 2026-11-08: a VM that runs several radiods (KFS-SE-NW, KFS-OMNI-SW)
+    # shows ALL of its ka9q-web pages in ONE cell, first on the left and the
+    # 2nd/3rd/4th to its right when they are up -- not one far-right column
+    # per extra page.  The link text is the radiod name when the station's
+    # frpc says it (metadatas.radiod), else 'open' / '2' / '3'.
+    ('VM Web',          ['VM ka9q-web', 'ka9q-web', 'VM ka9q-web #2',
+                         'VM ka9q-web #3', 'VM ka9q-web #4'], 'web'),
     ('VM GRAPE',        ['GRAPE charts'],            'web'),
     # --- rare: only a few stations have these ---
     ('VM Station',      ['Station web'],             'web'),
-    ('VM Web #2',       ['VM ka9q-web #2'],          'web'),
-    ('VM Web #3',       ['VM ka9q-web #3'],          'web'),
     ('VM Magneto&shy;meter', ['Magnetometer'],       'web'),  # &shy;: lets the narrow header hyphenate
     # --- the Proxmox host underneath it ---
     ('Proxmox UI',      ['Proxmox UI'],              'web'),
@@ -244,8 +249,9 @@ STYLE = (
     'table{border-collapse:collapse;width:auto;font-size:.92rem}'
     'th,td{text-align:left;padding:.3rem .55rem;border-bottom:1px solid #ececec;white-space:nowrap}'
     'th{font-size:.7rem;text-transform:uppercase;letter-spacing:.03em;color:#999;'
-    'border-bottom:2px solid #ddd;vertical-align:bottom}th.svc,td.svc{text-align:center}'
+    'border-bottom:2px solid #ddd;vertical-align:bottom}th.svc,td.svc{text-align:left}'
     'th.svc{white-space:normal;line-height:1.15;width:4.5em;max-width:6.5em}'
+    'th.web{min-width:11em;max-width:none}'
     # Column headers stay pinned at the top while the station rows scroll
     # (rob, 2026-10-24).  A sticky cell loses its collapsed border, so the
     # rule under the headers is drawn with an inset shadow instead.
@@ -261,7 +267,7 @@ STYLE = (
     '.ago{color:#999;font-size:.85rem}tr:hover td{background:#fafafa}'
     '.act{text-decoration:underline;cursor:pointer}.dead{color:#b0b0b0;cursor:not-allowed}tr:target td{background:#fff6c8}'
     '.ed{margin-left:.3rem;font-size:.75rem;color:#888;text-decoration:none;cursor:pointer}'
-    '.forget{margin-left:.5rem;font-size:.75rem;padding:0 .35rem;cursor:pointer;'
+    '.forget{margin-left:.4rem;font-size:.8rem;line-height:1;padding:0 .25rem;cursor:pointer;'
     'color:#a33;background:#fff;border:1px solid #dbb;border-radius:3px}')
 
 # Clipboard copy that works over plain HTTP (navigator.clipboard needs HTTPS):
@@ -605,6 +611,7 @@ def live_services():
             'kind': kind, 'proto': proto, 'tier': tier, 'label': label,
             'port': port,
             'user': meta.get('user'),
+            'radiod': meta.get('radiod') or None,   # which radiod this ka9q-web shows (multi-radiod VMs)
             'host': meta.get('host') or None,
             'host_rac': meta.get('host_rac') or None}
     online = {c: rac_of(svcs) for c, svcs in clients.items()}
@@ -746,7 +753,7 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
     if show_host:
         b.append('<th>PM host</th>')
     for h, _ls, _k in present:
-        b.append(f'<th class="svc">{h}</th>')
+        b.append('<th class="svc%s">%s</th>' % (' web' if h == 'VM Web' else '', h))
     b.append('</tr>')
     # One concurrent reachability sweep for the whole page, not a probe per
     # cell: a registered tunnel is not a running service, and rendering a
@@ -762,7 +769,7 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
             f'<span class="ago">last seen {ago(ls, now)}</span>' if ls else '&mdash;')
         if not active and tier == 'mesh' and name in stat:
             st += (f'<button class="forget" data-n="{html.escape(name)}" '
-                   'onclick="fg(this)" title="remove this offline entry">remove</button>')
+                   'onclick="fg(this)" title="remove this offline entry">&times;</button>')
         b.append(f'<tr{rowcls} id="row-{html.escape(name, quote=True)}"><td class="name">'
                  f'<a href="?h={html.escape(name)}">{html.escape(name)}</a></td>'
                  f'<td class="name">{rac if rac is not None else "&mdash;"}</td>'
@@ -800,21 +807,29 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
         login_acct = '' if is_sigmond else ((c or {}).get('account') or '')
         login_pw = (c or {}).get('password') or ''
         for _h, labels, kind in present:
-            svc = next((svcs[l] for l in labels if l in svcs), None)
+            found = [svcs[l] for l in labels if l in svcs]   # column order = labels order
+            svc = found[0] if found else None
             if not svc:
                 b.append('<td class="svc"><span class="dot">&middot;</span></td>')
             elif kind == 'web':
                 # "open" means something answered behind the tunnel, not
                 # merely that it is registered.  A dead one is shown greyed
                 # and unclickable, so the row still says the channel exists.
-                if _ALIVE.get(svc['port'], True):
-                    b.append('<td class="svc"><a class="act web" target="_blank" '
-                             'data-proto="%s" data-port="%s" href="%s://%s:%s/">open</a></td>'
-                             % (svc['proto'], svc['port'], svc['proto'], link_ip, svc['port']))
-                else:
-                    b.append('<td class="svc"><span class="dead" '
-                             'title="tunnel up, but nothing is listening on '
-                             '%s yet">down</span></td>' % svc['port'])
+                # A multi-radiod VM lists each ka9q-web left to right (rob,
+                # 2026-11-08), named after its radiod when the station says.
+                parts = []
+                for i, sv in enumerate(found):
+                    lab = html.escape(sv.get('radiod') or ('open' if len(found) == 1 else str(i + 1)))
+                    if _ALIVE.get(sv['port'], True):
+                        parts.append('<a class="act web" target="_blank" title="port %s" '
+                                     'data-proto="%s" data-port="%s" href="%s://%s:%s/">%s</a>'
+                                     % (sv['port'], sv['proto'], sv['port'], sv['proto'],
+                                        link_ip, sv['port'], lab))
+                    else:
+                        parts.append('<span class="dead" title="tunnel up, but nothing is '
+                                     'listening on %s yet">%s</span>'
+                                     % (sv['port'], 'down' if lab == 'open' else lab + ' down'))
+                b.append('<td class="svc">' + ' &middot; '.join(parts) + '</td>')
             else:
                 ### Precedence, most to least authoritative:
                 ###   0. the login saved with this cell's pencil (per RAC)
