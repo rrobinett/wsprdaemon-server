@@ -126,7 +126,7 @@ a. K3LR 42.557 ms missing at 20 us. Cause found. The solver's gate has two tests
    (it differs only at the edges; 11-07 alone loses K3LR 29.496 too). At 40 us the 11-07 run finds all 11 again.
    Next step: decide whether the median-gap test should use a tolerance of its own, scaled to the night count (four night
    arrivals give a noisy median), instead of reusing `max_sd_ns`. That is a solver design call for Michael and Rob.
-b. Nine capture rows collapse on the dedup key (2838 to 2829). A pass over proof/rows/capture.*.jsonl found 9 key pairs.
+b. RESOLVED at e9507f4. Nine capture rows collapsed on the dedup key (2838 to 2829). A pass over proof/rows/capture.*.jsonl found 9 key pairs.
    All are HFDL rows for AC0G/ND at 13276 kHz, 2026-11-03 to 11-07 at 15:00Z and 19:00Z. Each pair holds two distinct
    summaries: ground station 1 (San Francisco) and ground station 4 (Riverhead) heard in the same hour on the same
    frequency, with different `expected`, `n_expected`, `n_found` and `engineering`. They are not duplicates. The capture key
@@ -139,3 +139,14 @@ c. ND 13.4750 -99.26 cluster at 497.341 ms (40 us run, 8 arrivals). A delay of 4
    into two clusters that never merge. Next step: cluster on a circular delay (delay modulo the sweep period, split at the
    largest empty gap), and check whether a matching cluster near 0-3 ms exists for the same group; then merge or
    discard. Only the 13 MHz clusters are at risk, since their period is 500 ms; 4.463 MHz clusters sit well inside theirs.
+
+   Resolution: e9507f4 writes one HFDL capture per frequency and hour, with every ground station in `expected`.
+   The regenerated capture.hfdl.jsonl (1519 rows, 1519 distinct keys) loaded alone into `sigmondb.capture` on wd30
+   (package replaced first). Results:
+   - `SELECT count(), uniqExact(reporter_id, centre_hz, rate_hz_per_s, time, detector_version) FROM sigmondb.capture FINAL`
+     gives 2829 and 2829. This equals 1310 codar + 1519 hfdl, so no key collides now.
+   - Two formerly collided AC0G/ND 13276 kHz hours, read FINAL, hold both stations:
+     2026-11-04 15:00Z `{'hfdl:1': 0.556, 'hfdl:4': 0.9375}` (n_expected 100, n_found 80);
+     2026-11-07 19:00Z `{'hfdl:1': 0.0, 'hfdl:4': 1.0}` (n_expected 51, n_found 40).
+   - The total stays 2829 because the earlier load kept one row of each collided pair; the new row replaced it (later
+     ingested_at) and now carries both stations. Other tables unchanged (arrival 91611, solution 19).
