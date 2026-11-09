@@ -2,7 +2,8 @@
 import logging
 import os
 import sys
-from datetime import date
+import shutil
+from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -70,7 +71,7 @@ def test_hfrnet_rows_carry_every_column():
 
 
 def test_systable_riverhead():
-    tx, wf = parse_systable(FX / "systable.conf")
+    tx, wf = parse_systable(FX / "systable.conf", SNAP)
     t = _by(tx, "tx_id", "hfdl:4")
     assert t["lat"] == 40.881922 and t["kind"] == "hfdl" and t["network"] == "hfdl"
     rv = [w for w in wf if w["tx_id"] == "hfdl:4"]
@@ -83,7 +84,7 @@ def test_systable_riverhead():
 
 
 def test_systable_unkeyed_station_has_null_keying():
-    _, wf = parse_systable(FX / "systable.conf", keying={})
+    _, wf = parse_systable(FX / "systable.conf", SNAP, keying={})
     assert all(w["keying_step_ns"] is None for w in wf)
 
 
@@ -99,3 +100,29 @@ def test_receivers_seed_has_six():
     assert all(r["lat"] is not None and r["lon"] is not None for r in rows)
     assert all(set(r) == set(ddl.COLUMNS["receiver"]) for r in rows)
     assert all(r["pos_source"] == "typed_grid" for r in rows)
+
+
+def test_systable_valid_from_is_snapshot_not_mtime(tmp_path):
+    f = tmp_path / "systable.conf"
+    shutil.copy(FX / "systable.conf", f)
+    a = parse_systable(f, SNAP)
+    os.utime(f, (1_000_000_000, 1_000_000_000))
+    b = parse_systable(f, SNAP)
+    assert a == b
+    assert all(r["valid_from"] == datetime(2026, 11, 9) for r in a[0] + a[1])
+
+
+def test_systable_transmitter_keys_match_columns():
+    tx, _ = parse_systable(FX / "systable.conf", SNAP)
+    assert tx and all(set(r) == set(ddl.COLUMNS["transmitter"]) for r in tx)
+
+
+def test_systable_incomplete_block_warns_once(tmp_path, caplog):
+    f = tmp_path / "s.conf"
+    f.write_text('stations = ( { id = 9; lat = 1.0; name = "Nolon"; frequencies = ( 5000.0 ); }, '
+                 '{ id = 8; lat = 1.0; lon = 2.0; name = "Ok"; frequencies = ( 5000.0 ); } );')
+    with caplog.at_level(logging.WARNING):
+        tx, _ = parse_systable(f, SNAP)
+    assert [r["tx_id"] for r in tx] == ["hfdl:8"]
+    w = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(w) == 1 and "Nolon" in w[0].getMessage()
