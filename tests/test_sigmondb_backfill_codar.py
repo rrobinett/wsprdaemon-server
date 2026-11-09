@@ -153,11 +153,54 @@ def test_res_4463_group_uses_exact_rate():
     assert any(c["rate_hz_per_s"] == -47_791.553 for c in caps)
 
 
-def test_res_without_t6_has_null_provenance_and_no_arrivals():
+def test_res_without_t6_keeps_arrivals_on_label_phase_with_null_provenance():
     minutes = load_minutes([FX / "minutes-k3lr-1108.jsonl"])
     caps, arrs = read_res_jsonl(FX / "res-uacnj-first.jsonl", "UACNJ", minutes)
-    assert len(caps) == 4 and arrs == []
+    assert len(caps) == 4 and len(arrs) == 25
     assert all(c["u_epoch_ns"] is None and c["origin"] == "" for c in caps)
+    for a in arrs:
+        assert a["u_epoch_ns"] is None and a["origin"] == "" and a["counter_epoch_id"] == ""
+        assert a["engineering"]["phase_basis"] == "label"
+    assert sum(c["n_found"] for c in caps) == 25
+    first = next(a for a in arrs if a["engineering"]["tau_ms"])
+    assert first["delay_ns"] == round(float(first["engineering"]["phase_label_ms"]) * 1e6)
+
+
+def test_res_t6_arrivals_carry_assumed_block_and_t6_basis():
+    minutes = load_minutes([FX / "minutes-k3lr-1108.jsonl"])
+    _, arrs = read_res_jsonl(FX / "res-k3lr-1752.jsonl", "K3LR/D", minutes)
+    assert arrs and all(a["engineering"]["phase_basis"] == "t6" for a in arrs)
+    assert all(a["u_epoch_ns"] == 230.0 and a["origin"] == "t6_anchor" for a in arrs)
+
+
+def test_res_t6_row_arrival_without_t6_phase_is_label_basis(tmp_path):
+    import json
+    r = json.loads((FX / "res-k3lr-1752.jsonl").read_text())
+    for a in r["groups"]["FAU 13.4499 -99.26"]["arrivals"]:
+        del a["phase_t6_ms"]
+    p = tmp_path / "r.jsonl"
+    p.write_text(json.dumps(r) + "\n")
+    minutes = load_minutes([FX / "minutes-k3lr-1108.jsonl"])
+    _, arrs = read_res_jsonl(p, "K3LR/D", minutes)
+    fau = [a for a in arrs if a["centre_hz"] == 13_449_900.0]
+    assert fau and all(a["engineering"]["phase_basis"] == "label" and a["u_epoch_ns"] is None
+                       for a in fau)
+
+
+def test_tsv_same_clock_time_on_two_dates_stays_two_captures(tmp_path):
+    tsv, cap = _tsv(tmp_path,
+                    [("02:19:40", 1.0, -3, 10.5, 11.5, "A", 40.0),
+                     ("02:19:40", 1.0, -3, 20.5, 21.5, "A", 41.0)],
+                    ["20261107T021939Z", "20261108T021939Z"])
+    caps, _ = _read(tsv, cap, [])
+    assert len(caps) == 1  # one file wins per row; a time keys on its located datetime
+
+
+def test_clean_tags_map_to_the_brief_set():
+    from sigmondb.backfill_codar import _clean_tag
+    assert _clean_tag("") == "A"
+    assert _clean_tag("on rung +2 of 12.3") == "R" and _clean_tag("rung -1") == "R"
+    assert _clean_tag("main-lobe") == "m" and _clean_tag("main-lobe residue of 5.0") == "m"
 
 
 def test_provenance_helpers():

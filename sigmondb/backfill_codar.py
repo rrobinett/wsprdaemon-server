@@ -86,9 +86,17 @@ def _epoch(dt):
 
 
 def _clean_tag(tag):
+    """CLEAN's tag text -> A arrival, R rung, m merged.
+
+    clean.py emits "" (arrival), "on rung +n of T" (rung), "main-lobe residue of T"; clean13.py
+    emits "", "rung +n", "main-lobe".  A main-lobe residue is a leftover of an existing
+    component, which relabel.py also files under m (any non-empty, non-rung tag).
+    """
     if not tag:
         return "A"
-    return "R" if "rung" in tag else "m"
+    if "rung" in tag:
+        return "R"
+    return "m"
 
 
 def _capture(**kw):
@@ -157,14 +165,13 @@ def read_t6_tsv(tsv, capture_dir, reporter_id, centre_hz, rate_hz_per_s, period_
             f = dict(zip(header, line.rstrip("\n").split("\t")))
             if not f.get("time") or f["time"] == "time":
                 continue
-            if f["time"] not in by_time:
-                loc = _locate(stamps, f["time"])
-                if loc is None:
-                    log.warning("%s: no capture file within %s s of %s", tsv, STAMP_TOLERANCE_S,
-                                f["time"])
-                    by_time[f["time"]] = None
-                    continue
-                t, name = loc
+            loc = _locate(stamps, f["time"])
+            if loc is None:
+                log.warning("%s: no capture file within %s s of %s", tsv, STAMP_TOLERANCE_S,
+                            f["time"])
+                continue
+            t, name = loc
+            if t not in by_time:
                 age = float(f["anchor_age_s"])
                 if minutes:
                     prov = provenance_at(minutes, _epoch(t))
@@ -178,11 +185,9 @@ def read_t6_tsv(tsv, capture_dir, reporter_id, centre_hz, rate_hz_per_s, period_
                     engineering={"label_minus_t6_ms": f["label_minus_t6_ms"],
                                  "anchor_age_s": f["anchor_age_s"], "source": "relabel-tsv"},
                     **prov)
-                by_time[f["time"]] = cap
+                by_time[t] = cap
                 caps.append(cap)
-            cap = by_time[f["time"]]
-            if cap is None:
-                continue
+            cap = by_time[t]
             cap["n_found"] += 1
             arrs.append(_arrival(
                 time=cap["time"], reporter_id=reporter_id, group_key=gkey, centre_hz=centre_hz,
@@ -209,8 +214,9 @@ def _parse_group(name):
 def read_res_jsonl(path, reporter_id, minutes):
     """(captures, arrivals) from an analyze.py results file: one capture per row per group.
 
-    Only arrivals with phase_t6_ms become rows (a capture with no T6 label has none).  Provenance
-    comes from `minutes` for rows whose T6 label held, the null block otherwise.
+    Every arrival becomes a row: it takes phase_t6_ms when the row has a T6 label, else
+    phase_label_ms (counts for hearing, never for offsets).  Provenance from `minutes` only for
+    arrivals placed on T6; null block otherwise.  The capture row keeps the row-level provenance.
     """
     caps, arrs = [], []
     with open(Path(path)) as fh:
@@ -230,7 +236,8 @@ def read_res_jsonl(path, reporter_id, minutes):
                 period = PERIOD_13MHZ_S if centre > 1e7 else PERIOD_4463_S
                 period_ns = round(period * 1e9)
                 margin = g["peak_db"] - g["null_max"]
-                found = [a for a in g.get("arrivals", []) if "phase_t6_ms" in a]
+                found = [a for a in g.get("arrivals", [])
+                         if "phase_t6_ms" in a or "phase_label_ms" in a]
                 eng = {"tier": str(r.get("tier_label", "")), "t6": str(r.get("t6", "")),
                        "band": str(r.get("band", "")), "group": gname,
                        "anchor_age_s": str(r.get("anchor_age_s", "")),
@@ -244,16 +251,19 @@ def read_res_jsonl(path, reporter_id, minutes):
                     null_max_db=g["null_max"], null_median_db=g["null_med"], n_expected=1,
                     n_found=len(found), ring_ref=r["file"], engineering=eng, **prov))
                 for a in found:
+                    t6_basis = on_t6 and "phase_t6_ms" in a
+                    phase_ms = a["phase_t6_ms"] if t6_basis else a["phase_label_ms"]
                     arrs.append(_arrival(
                         time=second, reporter_id=reporter_id, group_key=_group_key(centre, rate),
                         centre_hz=centre, rate_hz_per_s=rate,
-                        delay_ns=round(a["phase_t6_ms"] * 1e6) % period_ns,
+                        delay_ns=round(phase_ms * 1e6) % period_ns,
                         level_db=a["db"], margin_db=a["db"] - g["null_max"],
                         half_band_db=(a["halves"][0] - a["halves"][1]) if a.get("halves") else None,
                         clean_tag=_clean_tag(a.get("tag", "")),
                         engineering={"tau_ms": str(a.get("tau_ms", "")),
                                      "phase_label_ms": str(a.get("phase_label_ms", "")),
                                      "full": str(a.get("full", "")), "tier": eng["tier"],
-                                     "ring_ref": r["file"], "tag": a.get("tag", "")},
-                        **prov))
+                                     "ring_ref": r["file"], "tag": a.get("tag", ""),
+                                     "phase_basis": "t6" if t6_basis else "label"},
+                        **(prov if t6_basis else null_provenance())))
     return caps, arrs
