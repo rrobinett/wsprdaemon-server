@@ -217,8 +217,10 @@ _HEADER = """-- sigmondb: registry of chirp (CODAR) and HFDL receptions.
 -- Regenerate: python3 -m sigmondb.ddl > schema/sigmondb.sql
 --
 -- Dedup keys: ReplacingMergeTree(ingested_at) collapses a re-ingested row
--- onto its key.  arrival keys on delay to the microsecond, so a re-run of
--- the detector at the same version replaces rather than doubles.
+-- onto its key.  arrival keys on delay to the microsecond (intDiv(delay_ns, 1000)),
+-- so a re-run of the detector at the same version replaces rather than doubles
+-- only while each delay lands in the same 1 us bin; a delay that moves across a
+-- bin edge between runs leaves two rows.
 -- `heard` is a materialized view into heard_state; read it with
 -- maxMerge(last_time) and argMaxMerge(last_level_db).
 """

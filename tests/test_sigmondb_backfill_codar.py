@@ -187,13 +187,19 @@ def test_res_t6_row_arrival_without_t6_phase_is_label_basis(tmp_path):
                        for a in fau)
 
 
-def test_tsv_same_clock_time_on_two_dates_stays_two_captures(tmp_path):
+def test_tsv_same_clock_time_on_two_dates_locates_to_one_capture(tmp_path):
+    # A tsv row carries a clock time and no date.  When capture files on two dates match it
+    # equally, the first file in date order wins for every such row, so both rows land on
+    # one capture.  (Known limit: the 11-08 row is filed under 11-07.)
     tsv, cap = _tsv(tmp_path,
                     [("02:19:40", 1.0, -3, 10.5, 11.5, "A", 40.0),
                      ("02:19:40", 1.0, -3, 20.5, 21.5, "A", 41.0)],
                     ["20261107T021939Z", "20261108T021939Z"])
-    caps, _ = _read(tsv, cap, [])
-    assert len(caps) == 1  # one file wins per row; a time keys on its located datetime
+    caps, arrs = _read(tsv, cap, [])
+    assert len(caps) == 1 and caps[0]["n_found"] == 2
+    assert caps[0]["time"] == datetime(2026, 11, 7, 2, 19, 40)
+    assert caps[0]["ring_ref"] == "K3LR-4463000-20261107T021939Z.npy"
+    assert [a["time"] for a in arrs] == [caps[0]["time"]] * 2
 
 
 def test_clean_tags_map_to_the_brief_set():

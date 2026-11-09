@@ -131,9 +131,9 @@ b. RESOLVED at e9507f4. Nine capture rows collapsed on the dedup key (2838 to 28
    summaries: ground station 1 (San Francisco) and ground station 4 (Riverhead) heard in the same hour on the same
    frequency, with different `expected`, `n_expected`, `n_found` and `engineering`. They are not duplicates. The capture key
    (reporter_id, centre_hz, rate_hz_per_s, time, detector_version) carries no ground station, so ReplacingMergeTree keeps one
-   and drops the other. The 9 dropped summaries are lost data. Next step: add the ground station to the capture key
-   (or fold it into `detector_version` or `rate_hz_per_s`), reload, and expect 2838 capture rows. This goes back to
-   Task 1 (DDL) and Task 6 (HFDL rows). The arrival rows are unaffected, since each carries its own `tx_id` and delay.
+   and drops the other. The 9 dropped summaries were lost data. e9507f4 fixed it by writing one HFDL capture per
+   frequency-hour with all ground stations merged. The arrival rows were never affected, since each carries its own
+   `tx_id` and delay.
 c. ND 13.4750 -99.26 cluster at 497.341 ms (40 us run, 8 arrivals). A delay of 497 ms sits 2.7 ms below the 500 ms sweep
    period, and the clustering sorts delays as plain numbers with no wrap. An arrival near 0 or near 500 ms then splits
    into two clusters that never merge. Next step: cluster on a circular delay (delay modulo the sweep period, split at the
