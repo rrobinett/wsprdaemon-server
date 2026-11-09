@@ -6,7 +6,7 @@ No verb takes a password.  clickhouse_connect is imported only where a verb need
 import argparse
 import re
 import sys
-from datetime import date
+from datetime import date, timezone
 from pathlib import Path
 
 from sigmondb import ddl
@@ -15,7 +15,7 @@ from sigmondb.load import insert_file
 from sigmondb.rows import read_rows, write_rows
 
 DEFAULT_CONF = "/etc/wsprdaemon/clickhouse.conf"
-SOLVER_VERSION = "groundwave-1"
+SOLVER_VERSION = "groundwave-2"
 _LINE = re.compile(r'^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.*?)\s*$')
 
 
@@ -130,18 +130,59 @@ def cmd_load(a):
     return 0
 
 
+def _latest_detector(arr):
+    """Keep, per (reporter_id, group_key), only the rows of the latest detector_version.
+    "Latest" is the largest version string in lexical order: right for the dated names in use
+    (offline-2026-11 < offline-2026-12), wrong for names that do not sort by date."""
+    best = {}
+    for r in arr:
+        k = (r["reporter_id"], r["group_key"])
+        if k not in best or r["detector_version"] > best[k]:
+            best[k] = r["detector_version"]
+    return [r for r in arr if r["detector_version"] == best[(r["reporter_id"], r["group_key"])]]
+
+
+def _utc_naive(t):
+    """The solver works in naive UTC.  A tz-aware value is converted, never relabelled."""
+    if t is not None and t.tzinfo is not None:
+        return t.astimezone(timezone.utc).replace(tzinfo=None)
+    return t
+
+
 def _from_db(a):
+    """(arrivals, transmitters, receivers) from the registry, every table read FINAL so a
+    re-ingested row counts once.  Arrivals: anchored only; by default the latest
+    detector_version per (reporter_id, group_key); --detector-version picks one instead."""
     client = connect(a.conf)
-    def fetch(table, where=""):
+
+    def fetch(table, where="", params=None):
         cols = list(ddl.COLUMNS[table])
-        res = client.query("SELECT %s FROM %s.%s %s" % (", ".join(cols), ddl.DATABASE, table,
-                                                       where))
-        return [dict(zip(cols, r)) for r in res.result_rows]
-    arr = fetch("arrival", "WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000")
-    for r in arr:  # clickhouse returns tz-aware UTC datetimes; the solver uses naive UTC
-        if r["time"].tzinfo is not None:
-            r["time"] = r["time"].replace(tzinfo=None)
+        sql = "SELECT %s FROM %s.%s FINAL %s" % (", ".join(cols), ddl.DATABASE, table, where)
+        try:
+            res = client.query(sql, parameters=params, query_tz="UTC")
+        except TypeError:   # clickhouse-connect without query_tz: the conversion below still holds
+            res = client.query(sql, parameters=params)
+        out = [dict(zip(cols, r)) for r in res.result_rows]
+        for r in out:
+            for c in ("time", "valid_from", "window_from", "window_to"):
+                if c in r:
+                    r[c] = _utc_naive(r[c])
+        return out
+
+    where = "WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000"
+    if a.detector_version:
+        arr = fetch("arrival", where + " AND detector_version = {dv:String}",
+                    {"dv": a.detector_version})
+    else:
+        arr = _latest_detector(fetch("arrival", where))
     return arr, fetch("transmitter"), fetch("receiver")
+
+
+def _read_receivers(path):
+    if str(path).endswith(".toml"):
+        from sigmondb.receivers import load_receivers
+        return load_receivers(path)
+    return read_rows(path)
 
 
 def cmd_solve(a):
@@ -150,8 +191,13 @@ def cmd_solve(a):
     else:
         arr = read_rows(a.arrivals)
         tx = read_rows(a.transmitters) if a.transmitters else []
-        rx = read_rows(a.receivers) if a.receivers else []
-    sols = ground_wave_solutions(fixed_clusters(arr, max_sd_ns=a.max_sd_us * 1000.0), tx, rx, SOLVER_VERSION)
+        rx = _read_receivers(a.receivers) if a.receivers else []
+    aside = {}
+    clusters = fixed_clusters(arr, rx, max_sd_ns=a.max_sd_us * 1000.0, set_aside=aside)
+    for rid, why in sorted(aside.items()):
+        print("set aside %s: %s" % (rid, why), file=sys.stderr)
+    sols = ground_wave_solutions(clusters, tx, rx, SOLVER_VERSION,
+                                 max_ground_km=a.max_ground_km)
     n = write_rows(a.out, sols)
     print("solution: %d rows" % n)
     return 0
@@ -185,9 +231,16 @@ def build_parser():
     g.add_argument("--from-db", action="store_true")
     g.add_argument("--arrivals")
     s.add_argument("--transmitters", help="with --arrivals: transmitter.jsonl")
-    s.add_argument("--receivers", help="with --arrivals: receiver.jsonl")
+    s.add_argument("--receivers",
+                   help="with --arrivals: receiver.jsonl, or the seed receivers.toml")
     s.add_argument("--max-sd-us", type=float, default=20.0,
                    help="largest delay sd, in microseconds, a fixed cluster may have (default 20)")
+    s.add_argument("--max-ground-km", type=float, default=300.0,
+                   help="farthest transmitter, in km, whose fixed cluster may give an offset "
+                        "as a ground wave (default 300)")
+    s.add_argument("--detector-version",
+                   help="with --from-db: use only this detector_version (default: the latest, "
+                        "in lexical order, per reporter and group)")
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_solve)
     return p

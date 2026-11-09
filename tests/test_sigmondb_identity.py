@@ -126,3 +126,19 @@ def test_systable_incomplete_block_warns_once(tmp_path, caplog):
     assert [r["tx_id"] for r in tx] == ["hfdl:8"]
     w = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(w) == 1 and "Nolon" in w[0].getMessage()
+
+
+def test_grid_cell_half_diagonal():
+    # half the cell diagonal on a sphere of radius 6371008.8 m, east-west width at the
+    # cell centre's latitude: 0.5 * hypot(R*dlat, R*cos(lat)*dlon)
+    from sigmondb.receivers import grid_pos_sigma_m
+    assert abs(grid_pos_sigma_m("EN91se") - 4186.11) < 0.01     # 1/24 x 2/24 deg at 41.1875 N
+    assert abs(grid_pos_sigma_m("EN91") - 100133.29) < 0.01     # 1 x 2 deg at 41.5 N
+    assert abs(grid_pos_sigma_m("EN") - 962977.64) < 0.01       # 10 x 20 deg at 45 N
+    assert abs(grid_pos_sigma_m("EN91se11") - 418.68) < 0.01     # 1/240 x 1/120 deg at 41.1729 N
+
+
+def test_receivers_seed_carries_grid_sigma():
+    rows = {r["reporter_id"]: r for r in load_receivers(SEED)}
+    assert abs(rows["K3LR/D"]["pos_sigma_m"] - 4186.11) < 0.01
+    assert all(r["pos_sigma_m"] and r["pos_sigma_m"] > 0 for r in rows.values())

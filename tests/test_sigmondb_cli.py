@@ -74,10 +74,12 @@ def test_load_order_follows_tables(tmp_path, monkeypatch):
 
 
 def test_solve_from_files(tmp_path):
-    from test_sigmondb_groundwave import _arrivals
+    from test_sigmondb_groundwave import _arrivals, K3LR
     rows.write_rows(tmp_path / "a.jsonl", _arrivals(1_000_000))
+    rows.write_rows(tmp_path / "r.jsonl", [valid_row("receiver", **K3LR)])
     out = tmp_path / "sol.jsonl"
-    assert cli.main(["solve", "--arrivals", str(tmp_path / "a.jsonl"), "--out", str(out)]) == 0
+    assert cli.main(["solve", "--arrivals", str(tmp_path / "a.jsonl"),
+                     "--receivers", str(tmp_path / "r.jsonl"), "--out", str(out)]) == 0
     got = rows.read_rows(out)
     assert len(got) == 1 and got[0]["method"] == "ground_wave"
 
@@ -105,9 +107,9 @@ def test_solve_max_sd_us(tmp_path):
     seen = []
     real = cli.fixed_clusters
 
-    def spy(arr, **kw):
+    def spy(arr, rx, **kw):
         seen.append(kw)
-        return real(arr, **kw)
+        return real(arr, rx, **kw)
 
     cli.fixed_clusters = spy
     try:
@@ -145,3 +147,104 @@ def test_two_backfills_into_one_dir_both_load(tmp_path, monkeypatch):
     assert seen["client"].inserts == [
         ("sigmondb.capture", 1), ("sigmondb.capture", 3),
         ("sigmondb.arrival", 2), ("sigmondb.arrival", 4), ("sigmondb.arrival", 1)]
+
+
+# --- solve --from-db --------------------------------------------------------------------------
+from datetime import timedelta, timezone  # noqa: E402
+
+
+class _Result:
+    def __init__(self, rows):
+        self.result_rows = rows
+
+
+class QueryClient:
+    """Records each query; returns `tables[name]` (dicts) as rows in COLUMNS order."""
+
+    def __init__(self, tables, tz_kw=True):
+        self.tables, self.calls, self.tz_kw = tables, [], tz_kw
+
+    def query(self, sql, parameters=None, **kw):
+        if "query_tz" in kw and not self.tz_kw:
+            raise TypeError("query() got an unexpected keyword argument 'query_tz'")
+        self.calls.append(dict(sql=sql, parameters=parameters, **kw))
+        name = sql.split(" FROM %s." % ddl.DATABASE)[1].split()[0]
+        cols = ddl.COLUMNS[name]
+        return _Result([tuple(r.get(c) for c in cols) for r in self.tables.get(name, [])])
+
+
+def _db(monkeypatch, tables, tz_kw=True):
+    client = QueryClient(tables, tz_kw)
+    monkeypatch.setattr(cli, "connect", lambda conf: client)
+    return client
+
+
+def _arr(rid, gkey, dv, t=datetime(2026, 11, 7, 3, tzinfo=timezone.utc), delay=1):
+    return dict(time=t, reporter_id=rid, group_key=gkey, detector_version=dv, delay_ns=delay,
+                u_epoch_ns=230.0, rate_hz_per_s=-25_733.913, tx_id="")
+
+
+def _ns(*extra):
+    return cli.build_parser().parse_args(["solve", "--from-db", "--out", "x"] + list(extra))
+
+
+def test_from_db_reads_final_and_keeps_latest_detector_version(monkeypatch):
+    c = _db(monkeypatch, {"arrival": [
+        _arr("K3LR/D", "4.4630 -25.73", "offline-2026-11", delay=1),
+        _arr("K3LR/D", "4.4630 -25.73", "offline-2026-12", delay=2),
+        _arr("K3LR/D", "13.4750 -99.26", "offline-2026-11", delay=3),
+        _arr("W2NAF", "4.4630 -25.73", "offline-2026-10", delay=4)]})
+    arr, _, _ = cli._from_db(_ns())
+    assert sorted(r["delay_ns"] for r in arr) == [2, 3, 4]
+    for call in c.calls:
+        assert " FINAL" in call["sql"]
+    asql = [k["sql"] for k in c.calls if ".arrival" in k["sql"]][0]
+    assert "FROM sigmondb.arrival FINAL" in asql and "detector_version =" not in asql
+
+
+def test_from_db_detector_version_overrides(monkeypatch):
+    c = _db(monkeypatch, {"arrival": [
+        _arr("K3LR/D", "4.4630 -25.73", "offline-2026-11", delay=1),
+        _arr("W2NAF", "4.4630 -25.73", "offline-2026-11", delay=4)]})
+    arr, _, _ = cli._from_db(_ns("--detector-version", "offline-2026-11"))
+    assert sorted(r["delay_ns"] for r in arr) == [1, 4]
+    call = [k for k in c.calls if ".arrival" in k["sql"]][0]
+    assert "detector_version = {dv:String}" in call["sql"]
+    assert call["parameters"] == {"dv": "offline-2026-11"}
+
+
+def test_from_db_converts_times_to_naive_utc(monkeypatch):
+    cdt = timezone(timedelta(hours=-5))                  # 22:00 CDT on 11-06 = 03:00Z 11-07
+    c = _db(monkeypatch, {"arrival": [
+        _arr("K3LR/D", "g", "v", t=datetime(2026, 11, 6, 22, 0, tzinfo=cdt))]})
+    arr, _, _ = cli._from_db(_ns())
+    assert arr[0]["time"] == datetime(2026, 11, 7, 3, 0) and arr[0]["time"].tzinfo is None
+    assert all(k.get("query_tz") == "UTC" for k in c.calls)
+
+
+def test_from_db_works_without_query_tz_support(monkeypatch):
+    cdt = timezone(timedelta(hours=-5))
+    _db(monkeypatch, {"arrival": [
+        _arr("K3LR/D", "g", "v", t=datetime(2026, 11, 6, 22, 0, tzinfo=cdt))]}, tz_kw=False)
+    arr, _, _ = cli._from_db(_ns())
+    assert arr[0]["time"] == datetime(2026, 11, 7, 3, 0)
+
+
+def test_solve_max_ground_km_and_toml_receivers(tmp_path, monkeypatch):
+    from test_sigmondb_groundwave import _arrivals
+    seen = {}
+    real = cli.ground_wave_solutions
+
+    def spy(cl, tx, rx, v, **kw):
+        seen["kw"], seen["rx"] = kw, rx
+        return real(cl, tx, rx, v, **kw)
+
+    monkeypatch.setattr(cli, "ground_wave_solutions", spy)
+    rows.write_rows(tmp_path / "a.jsonl", _arrivals(1_000_000))
+    here = os.path.dirname(os.path.abspath(__file__))
+    toml = os.path.join(os.path.dirname(here), "sigmondb", "seed", "receivers.toml")
+    assert cli.main(["solve", "--arrivals", str(tmp_path / "a.jsonl"), "--receivers", toml,
+                     "--max-ground-km", "150", "--out", str(tmp_path / "s.jsonl")]) == 0
+    assert seen["kw"] == {"max_ground_km": 150.0}
+    assert {r["reporter_id"] for r in seen["rx"]} >= {"K3LR/D", "WB6CXC/7"}
+    assert len(rows.read_rows(tmp_path / "s.jsonl")) == 1
