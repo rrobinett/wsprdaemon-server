@@ -62,6 +62,8 @@ def test_unfound_and_excluded_count_but_write_nothing():
     assert set(c) == {k for k in ddl.COLUMNS["capture"]}
     assert c["n_expected"] == 5 and c["n_found"] == 2
     assert c["expected"] == {"hfdl:" + _rows("t6-group.csv")[0]["gs_id"]: 0.4}
+    gs = _rows("t6-group.csv")[0]["gs_id"]
+    assert c["engineering"][f"n_rows:hfdl:{gs}"] == "5" and c["engineering"][f"n_found:hfdl:{gs}"] == "2"
     assert c["duration_s"] == 3600 and c["rate_hz_per_s"] == 0
     assert c["time"].minute == 0 and c["time"].second == 0 and c["time"].microsecond == 0
     assert c["time"] <= arrs[0]["time"]
@@ -136,3 +138,43 @@ def test_row_without_time_is_skipped_and_logged(tmp_path, caplog):
 def test_sets_name_five_stations():
     assert sorted(s["station"] for s in SETS) == ["ac0g-nd", "b4", "k3lr", "uacnj", "wb6cxc"]
     assert all(s["reporter_id"] for s in SETS)
+
+
+def _two_gs(tmp_path):
+    rows = _rows("t6-group.csv")
+    for r in rows:
+        r["freq_khz"] = "13276"
+    for r in rows[:2]:
+        r["gs_id"], r["gs_name"] = "1", "San Francisco, California"
+    for r in rows[2:]:
+        r["gs_id"], r["gs_name"] = "4", "Riverhead, New York"
+    return rows, _write(tmp_path, rows)
+
+
+def test_two_ground_stations_on_one_frequency_make_one_capture(tmp_path):
+    rows, p = _two_gs(tmp_path)
+    caps, arrs = read_squitters(p, REP)
+    assert len(caps) == 1
+    c = caps[0]
+    found = lambda rs: sum(r["found"] == "True" and not r["excluded"] for r in rs)
+    assert c["expected"] == {"hfdl:1": found(rows[:2]) / 2, "hfdl:4": found(rows[2:]) / 3}
+    assert c["n_expected"] == 5 and c["n_found"] == found(rows) == len(arrs)
+    e = c["engineering"]
+    assert e["n_rows"] == "5" and e["n_anchored"] == "5"
+    assert (e["n_rows:hfdl:1"], e["n_rows:hfdl:4"]) == ("2", "3")
+    assert int(e["n_found:hfdl:1"]) + int(e["n_found:hfdl:4"]) == c["n_found"]
+    assert c["origin"] == "t6_anchor"
+    assert {a["tx_id"] for a in arrs} <= {"hfdl:1", "hfdl:4"}
+
+
+def test_real_nd_captures_have_unique_table_keys():
+    root = Path(__file__).resolve().parents[3]
+    path = next(s["path"] for s in SETS if s["station"] == "ac0g-nd")
+    csv_path = root / path
+    if not csv_path.exists():
+        import pytest
+        pytest.skip("no AC0G/ND squitter file")
+    caps, _ = read_squitters(csv_path, "AC0G-ND")
+    keys = [(c["reporter_id"], c["centre_hz"], c["rate_hz_per_s"], c["time"], c["detector_version"])
+            for c in caps]
+    assert caps and len(keys) == len(set(keys))

@@ -2,8 +2,10 @@
 
 One arrival per kept, found squitter with a delay: delay_counter_s when present (basis
 "counter"), else delay_s (basis "label", null provenance); a row with neither writes nothing and
-is logged.  One capture per (ground station, frequency, UTC hour, analyzer version): n_expected
-counts every row, n_found the arrivals written.  A row with no nominal_utc (a batch error) has
+is logged.  One capture per (frequency, UTC hour, analyzer version): two ground stations can share a
+frequency, and the table key carries no ground station.  expected maps "hfdl:<gs>" to that
+station's found fraction; n_expected counts every row, n_found the arrivals written, both
+summed over the ground stations.  A row with no nominal_utc (a batch error) has
 no time; it is skipped and logged once per file.  Rows are dicts with exactly the keys of
 ddl.COLUMNS[table].  Datetimes are naive UTC.  The package imports nothing from tasks/.
 """
@@ -94,7 +96,7 @@ def read_squitters(csv_path, reporter_id):
     A capture takes the assumed provenance block when any of its rows is T6 with a counter_map
     (the first such row names the counter epoch); each arrival takes its own row's block.
     """
-    caps, arrs, by_key = [], [], {}
+    caps, arrs, by_key, per_gs = [], [], {}, {}
     no_time, no_delay = [], 0
     with open(Path(csv_path), newline="") as fh:
         for r in csv.DictReader(fh):
@@ -105,18 +107,22 @@ def read_squitters(csv_path, reporter_id):
             hour = _utc(t // HOUR_S * HOUR_S)
             version = f"hfdl-analyzer-{r['analyzer_version']}"
             centre = float(r["freq_khz"]) * 1e3
-            key = (r["gs_id"], r["freq_khz"], hour, version)
+            key = (r["freq_khz"], hour, version)
             cap = by_key.get(key)
             if cap is None:
                 cap = _capture(time=hour, reporter_id=reporter_id, centre_hz=centre,
                                detector_version=version,
-                               engineering={"gs_id": r["gs_id"], "gs_name": r["gs_name"],
-                                            "source": "squitter-part1", "n_rows": "0",
+                               engineering={"source": "squitter-part1", "n_rows": "0",
                                             "n_anchored": "0"})
                 by_key[key] = cap
+                per_gs[id(cap)] = {}
                 caps.append(cap)
+            gs = r["gs_id"]
+            counts = per_gs[id(cap)].setdefault(gs, [0, 0])
+            counts[0] += 1
             cap["n_expected"] += 1
             cap["engineering"]["n_rows"] = str(cap["n_expected"])
+            cap["engineering"][f"n_rows:hfdl:{gs}"] = str(counts[0])
             prov = _provenance(r)
             if prov["origin"]:
                 cap["engineering"]["n_anchored"] = str(int(cap["engineering"]["n_anchored"]) + 1)
@@ -132,6 +138,7 @@ def read_squitters(csv_path, reporter_id):
             if not counter:
                 prov = null_provenance()
             cap["n_found"] += 1
+            counts[1] += 1
             arrs.append(_arrival(
                 time=_utc(t), reporter_id=reporter_id, tx_id=f"hfdl:{r['gs_id']}",
                 group_key=f"hfdl {r['freq_khz']} kHz", centre_hz=centre, rate_hz_per_s=0,
@@ -150,8 +157,10 @@ def read_squitters(csv_path, reporter_id):
         log.warning("%s: %d found rows with neither delay_counter_s nor delay_s skipped",
                     csv_path, no_delay)
     for cap in caps:
-        gs = cap["engineering"]["gs_id"]
-        cap["expected"] = {f"hfdl:{gs}": cap["n_found"] / cap["n_expected"]}
+        cap["expected"] = {}
+        for gs, (n, found) in per_gs[id(cap)].items():
+            cap["expected"][f"hfdl:{gs}"] = found / n
+            cap["engineering"][f"n_found:hfdl:{gs}"] = str(found)
     return caps, arrs
 
 
