@@ -150,3 +150,32 @@ c. ND 13.4750 -99.26 cluster at 497.341 ms (40 us run, 8 arrivals). A delay of 4
      2026-11-07 19:00Z `{'hfdl:1': 0.0, 'hfdl:4': 1.0}` (n_expected 51, n_found 40).
    - The total stays 2829 because the earlier load kept one row of each collided pair; the new row replaced it (later
      ingested_at) and now carries both stations. Other tables unchanged (arrival 91611, solution 19).
+
+## Solver v2 (groundwave-2)
+
+The final review changed the solver (c32bc10, 725c72f). Day and night now come from solar elevation at the receiver
+(night below -12 deg, day above +12 deg). Only swept signals count, ground wave applies within 300 km of a named
+transmitter, `--from-db` reads FINAL and the latest detector version, and receivers carry `pos_sigma_m`.
+
+Devbox re-solve of the CODAR arrivals (from final-fix-report.md): 20 us gives 10 rows (the old run gave 19), 40 us gives
+18 (old 49). ND and WB6CXC drop to 0 clusters, as intended: their 13 MHz afternoon clusters came from the old fixed UTC
+windows. K3LR at 20 us holds 8 clusters (16.706, 21.460, 29.495, 33.886, 42.556, 46.852, 51.317, 60.800); W2NAF holds 2
+(12.572, 50.939). Against the 11 stage2 rows: 20 us finds K3LR 7 of 8 (misses 25.161, pooled SD 25.3 us) and W2NAF 2 of 3
+(misses 46.336, pooled SD 21.7 us); 40 us finds all 11. K3LR 42.556 now passes at 20 us.
+
+wd30 reload (sigmondb only, no sudo, no services):
+- Receiver rows reseeded and loaded: `receiver` FINAL has 6 rows, all with `pos_sigma_m` set (3847 to 4284 m).
+- `TRUNCATE TABLE sigmondb.solution` (controller ruling; its rows came only from this build), then
+  `python -m sigmondb solve --from-db --out solrows2/solution.jsonl` at the default 20 us, then `load`.
+- Result: 10 rows in `solution`: K3LR/D 8, W2NAF 2, all `groundwave-2`. The file matches the devbox's
+  proof/solution-v2-20.jsonl (same 10 cluster keys and delays, same inputs digests). A 40 us run on wd30 gives 18 rows
+  (not loaded; proof/wd30-solution-v2-40.jsonl).
+- `--from-db` works on wd30. clickhouse-connect 2.3.5 accepts `query_tz`, so the query_tz path ran, not the TypeError
+  fallback.
+
+Parked items, from the final review:
+1. K3LR 60.8 ms is a false positive. Its 4 night arrivals come from 11-04 and its 8 day arrivals from 11-07; the solver
+   pools days, so one night pairs with another day. Stage 2 shows 60.798 ms as day-only on 11-07. A 11-07-only run does not
+   find it. Needs a rule such as day and night parts from the same day, or at least two distinct nights.
+2. The 3-per-part minimum counts arrivals, not captures. K3LR 13.525 MHz 56.601 ms (40 us run) passes on 3 night
+   arrivals from one capture. Counting distinct captures per part would close it.
