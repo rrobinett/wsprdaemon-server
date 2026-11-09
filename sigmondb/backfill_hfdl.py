@@ -1,9 +1,10 @@
 """HFDL back-fill: tasks/hfdl-timing/<station>/squitter-part1.csv -> capture and arrival rows.
 
-One arrival per kept, found squitter with a delay.  One capture per (ground station, frequency,
-UTC hour, analyzer version): n_expected counts every row, n_found the arrivals written.  A found
-row with an empty delay_counter_s writes no arrival and counts in n_expected only; a row with no
-nominal_utc (a batch error) has no time and is skipped.  Rows are dicts with exactly the keys of
+One arrival per kept, found squitter with a delay: delay_counter_s when present (basis
+"counter"), else delay_s (basis "label", null provenance); a row with neither writes nothing and
+is logged.  One capture per (ground station, frequency, UTC hour, analyzer version): n_expected
+counts every row, n_found the arrivals written.  A row with no nominal_utc (a batch error) has
+no time; it is skipped and logged once per file.  Rows are dicts with exactly the keys of
 ddl.COLUMNS[table].  Datetimes are naive UTC.  The package imports nothing from tasks/.
 """
 import csv
@@ -55,10 +56,14 @@ def _counter_map(text):
 
 
 def _provenance(row):
-    """Assumed block for a T6 row with a counter_map; the epoch id comes from the map."""
+    """Assumed block for a T6 row with a counter_map, else null.
+
+    The epoch id derives from the map's input_epoch_gps_s, as hf-timestd's minute rows name it.
+    """
     cm = _counter_map(row["counter_map"])
     if row["t_level_active"] == "T6" and cm is not None:
-        return assumed_provenance(str(cm.get("counter_epoch_id") or ""))
+        g = cm.get("input_epoch_gps_s")
+        return assumed_provenance(f"ep-{int(float(g))}" if g not in (None, "") else "")
     return null_provenance()
 
 
@@ -90,9 +95,11 @@ def read_squitters(csv_path, reporter_id):
     (the first such row names the counter epoch); each arrival takes its own row's block.
     """
     caps, arrs, by_key = [], [], {}
+    no_time, no_delay = [], 0
     with open(Path(csv_path), newline="") as fh:
         for r in csv.DictReader(fh):
             if not r["nominal_utc"]:
+                no_time.append(r["window_file"])
                 continue
             t = float(r["nominal_utc"])
             hour = _utc(t // HOUR_S * HOUR_S)
@@ -104,26 +111,44 @@ def read_squitters(csv_path, reporter_id):
                 cap = _capture(time=hour, reporter_id=reporter_id, centre_hz=centre,
                                detector_version=version,
                                engineering={"gs_id": r["gs_id"], "gs_name": r["gs_name"],
-                                            "source": "squitter-part1"})
+                                            "source": "squitter-part1", "n_rows": "0",
+                                            "n_anchored": "0"})
                 by_key[key] = cap
                 caps.append(cap)
             cap["n_expected"] += 1
+            cap["engineering"]["n_rows"] = str(cap["n_expected"])
             prov = _provenance(r)
-            if prov["origin"] and not cap["origin"]:
-                cap.update(prov)
-            if r["found"] != "True" or r["excluded"] or not r["delay_counter_s"]:
+            if prov["origin"]:
+                cap["engineering"]["n_anchored"] = str(int(cap["engineering"]["n_anchored"]) + 1)
+                if not cap["origin"]:
+                    cap.update(prov)
+            if r["found"] != "True" or r["excluded"]:
                 continue
+            counter = bool(r["delay_counter_s"])
+            delay_s = r["delay_counter_s"] if counter else r["delay_s"]
+            if not delay_s:
+                no_delay += 1
+                continue
+            if not counter:
+                prov = null_provenance()
             cap["n_found"] += 1
             arrs.append(_arrival(
                 time=_utc(t), reporter_id=reporter_id, tx_id=f"hfdl:{r['gs_id']}",
                 group_key=f"hfdl {r['freq_khz']} kHz", centre_hz=centre, rate_hz_per_s=0,
-                delay_ns=round(float(r["delay_counter_s"]) * 1e9), level_db=float(r["snr_db"]),
+                delay_ns=round(float(delay_s) * 1e9), level_db=float(r["snr_db"]),
                 clean_tag="squitter", doppler_hz=_float(r["doppler_hz"]),
                 detector_version=version,
                 engineering={"frame_index": r["frame_index"], "flags": r["flags"],
                              "second_peak_ratio": r["second_peak_ratio"],
-                             "t_level_active": r["t_level_active"]},
+                             "t_level_active": r["t_level_active"],
+                             "delay_basis": "counter" if counter else "label"},
                 **prov))
+    if no_time:
+        log.warning("%s: %d rows without nominal_utc skipped (e.g. %s)", csv_path, len(no_time),
+                    no_time[0])
+    if no_delay:
+        log.warning("%s: %d found rows with neither delay_counter_s nor delay_s skipped",
+                    csv_path, no_delay)
     for cap in caps:
         gs = cap["engineering"]["gs_id"]
         cap["expected"] = {f"hfdl:{gs}": cap["n_found"] / cap["n_expected"]}
