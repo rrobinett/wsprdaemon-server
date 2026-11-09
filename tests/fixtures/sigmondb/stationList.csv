@@ -1,0 +1,5 @@
+Station,"Station Name",Network,Frequency,Bandwidth,SweepRate,"Date Added","Last Radial File",Latitude,Longitude,Manufacturer
+ACI1,"Anacapa Island",UCSB,13.47500,47.79155300,2.00000000,2024-02-29,2026-11-07,34.015800,-119.359333,"CODAR Ocean Sensors. SeaSonde"
+AGL1,"Pt. Arguello, CA",SLO,4.45050,-25.73391300,1.00000000,2010-07-21,2026-11-08,34.576883,-120.649083,"CODAR Ocean Sensors. SeaSonde"
+ANGL,"Angel Island, CA",CODAR,41.34000,-600.00085400,4.00000000,2017-01-01,2026-11-08,37.853317,-122.419200,"CODAR Ocean Sensors. SeaSonde"
+BLNK,"Blank Row",TEST,12.00000,10.0,1.0,2020-01-01,2026-11-08,,,"x"

@@ -1,0 +1,57 @@
+# Receiver identity seed.  Positions are typed grids (pos_source = typed_grid).
+# antenna, receiver_chain and coherence_group stay empty until an analyst fills them.
+# reporter_id and host_id come from ops/fleet.toml (heartbeat_station, host key).
+
+[[receiver]]
+reporter_id = "AC0G/ND"
+host_id = "ac0g-nd"
+radiod_id = "AC0G-ND-status.local"
+grid = "EN16ov"
+antenna = ""
+receiver_chain = ""
+coherence_group = ""
+
+[[receiver]]
+reporter_id = "AC0G/B4"
+host_id = "b4"
+radiod_id = "AC0G-B4-status.local"
+grid = "EM38ww"
+antenna = ""
+receiver_chain = ""
+coherence_group = ""
+
+[[receiver]]
+reporter_id = "K3LR/D"
+host_id = "k3lr"
+radiod_id = "K3LR-status.local"
+grid = "EN91se"
+antenna = ""
+receiver_chain = ""
+coherence_group = ""
+
+[[receiver]]
+reporter_id = "W2NAF"
+host_id = "w2naf"
+radiod_id = "W2NAF-status.local"
+grid = "FN21ei"
+antenna = ""
+receiver_chain = ""
+coherence_group = ""
+
+[[receiver]]
+reporter_id = "UACNJ"
+host_id = "uacnj"
+radiod_id = "UACNJ-status.local"
+grid = "FN20mv"
+antenna = ""
+receiver_chain = ""
+coherence_group = ""
+
+[[receiver]]
+reporter_id = "WB6CXC/7"
+host_id = "wb6cxc"
+radiod_id = "WB6CXC-7-status.local"
+grid = "CN88ll"
+antenna = ""
+receiver_chain = ""
+coherence_group = ""
