@@ -12,7 +12,7 @@ from pathlib import Path
 from sigmondb import ddl
 
 DATETIME_KEYS = frozenset(
-    n for s in ddl._SPEC.values() for n, t in s["cols"] if t.startswith("DateTime"))
+    n for cols in ddl.COLUMN_TYPES.values() for n, t in cols.items() if t.startswith("DateTime"))
 
 
 def _enc(o):

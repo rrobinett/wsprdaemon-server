@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS sigmondb.arrival
     `delay_ns` Int64 CODEC(ZSTD(3)),
     `delay_sigma_ns` Nullable(Float32) CODEC(ZSTD(3)),
     `level_db` Float32 CODEC(ZSTD(3)),
-    `margin_db` Float32 CODEC(ZSTD(3)),
+    `margin_db` Nullable(Float32) CODEC(ZSTD(3)),
     `half_band_db` Nullable(Float32) CODEC(ZSTD(3)),
     `clean_tag` LowCardinality(String) CODEC(ZSTD(3)),
     `doppler_hz` Nullable(Float32) CODEC(ZSTD(3)),

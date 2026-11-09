@@ -46,9 +46,11 @@ def _out_dir(p):
     return d
 
 
-def _write(d, table, rows):
-    n = write_rows(d / (table + ".jsonl"), rows)
-    print("%s: %d rows" % (table, n))
+def _write(d, table, rows, source=None):
+    """seed writes <table>.jsonl; a back-fill writes <table>.<source>.jsonl."""
+    name = table + ("." + source if source else "") + ".jsonl"
+    n = write_rows(d / name, rows)
+    print("%s: %d rows" % (name, n))
 
 
 def cmd_ddl(a):
@@ -94,8 +96,8 @@ def cmd_backfill_codar(a):
         caps += c
         arrs += r
     d = _out_dir(a.out)
-    _write(d, "capture", caps)
-    _write(d, "arrival", arrs)
+    _write(d, "capture", caps, "codar")
+    _write(d, "arrival", arrs, "codar")
     return 0
 
 
@@ -107,19 +109,24 @@ def cmd_backfill_hfdl(a):
         caps += c
         arrs += r
     d = _out_dir(a.out)
-    _write(d, "capture", caps)
-    _write(d, "arrival", arrs)
+    _write(d, "capture", caps, "hfdl")
+    _write(d, "arrival", arrs, "hfdl")
     return 0
+
+
+def _table_files(d, table):
+    """<table>.jsonl and <table>.*.jsonl in d, sorted by name."""
+    return sorted(set(d.glob(table + ".jsonl")) | set(d.glob(table + ".*.jsonl")),
+                  key=lambda p: p.name)
 
 
 def cmd_load(a):
     d = Path(a.dir)
     client = connect(a.conf)
     ddl.ensure_schema(client)
-    for table in ddl._SPEC:
-        p = d / (table + ".jsonl")
-        if p.exists():
-            print("%s: %d rows" % (table, insert_file(client, table, p)))
+    for table in ddl.TABLE_ORDER:
+        for p in _table_files(d, table):
+            print("%s: %d rows" % (p.name, insert_file(client, table, p)))
     return 0
 
 
@@ -144,7 +151,7 @@ def cmd_solve(a):
         arr = read_rows(a.arrivals)
         tx = read_rows(a.transmitters) if a.transmitters else []
         rx = read_rows(a.receivers) if a.receivers else []
-    sols = ground_wave_solutions(fixed_clusters(arr), tx, rx, SOLVER_VERSION)
+    sols = ground_wave_solutions(fixed_clusters(arr, max_sd_ns=a.max_sd_us * 1000.0), tx, rx, SOLVER_VERSION)
     n = write_rows(a.out, sols)
     print("solution: %d rows" % n)
     return 0
@@ -153,7 +160,9 @@ def cmd_solve(a):
 def build_parser():
     p = argparse.ArgumentParser(prog="python -m sigmondb")
     sub = p.add_subparsers(dest="verb", required=True)
-    sub.add_parser("ddl", help="print the schema SQL").set_defaults(fn=cmd_ddl)
+    sub.add_parser("ddl", help="print the schema SQL; it creates nothing (load creates the schema)",
+                   description="Print the schema SQL to stdout.  This verb creates nothing: "
+                               "`load` creates the database and tables before it inserts.").set_defaults(fn=cmd_ddl)
     s = sub.add_parser("seed", help="write transmitter, waveform and receiver rows")
     s.add_argument("--hfrnet")
     s.add_argument("--systable")
@@ -166,7 +175,7 @@ def build_parser():
         s.add_argument("--root", required=True, help="the hamsci root holding tasks/")
         s.add_argument("--out", required=True)
         s.set_defaults(fn=fn)
-    s = sub.add_parser("load", help="insert every <table>.jsonl in DIR")
+    s = sub.add_parser("load", help="insert every <table>.jsonl and <table>.*.jsonl in DIR; creates the schema first")
     s.add_argument("--dir", required=True)
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_load)
@@ -177,6 +186,8 @@ def build_parser():
     g.add_argument("--arrivals")
     s.add_argument("--transmitters", help="with --arrivals: transmitter.jsonl")
     s.add_argument("--receivers", help="with --arrivals: receiver.jsonl")
+    s.add_argument("--max-sd-us", type=float, default=20.0,
+                   help="largest delay sd, in microseconds, a fixed cluster may have (default 20)")
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_solve)
     return p

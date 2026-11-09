@@ -102,7 +102,7 @@ _SPEC = {
             ("time", "DateTime64(9)"), ("reporter_id", "String"), ("tx_id", "String"),
             ("group_key", LC), ("centre_hz", "Float64"), ("rate_hz_per_s", "Float64"),
             ("delay_ns", "Int64"), ("delay_sigma_ns", NF32),
-            ("level_db", "Float32"), ("margin_db", "Float32"), ("half_band_db", NF32),
+            ("level_db", "Float32"), ("margin_db", NF32), ("half_band_db", NF32),
             ("clean_tag", LC),
             ("doppler_hz", NF32), ("phase_rate", NF32), ("carrier_phase_rad", NF32),
             ("s4", NF32), ("sigma_phi_rad", NF32),
@@ -154,7 +154,10 @@ def _create_table(name, cols, part, order, engine=None):
 
 TABLES = {}
 COLUMNS = {}
+COLUMN_TYPES = {}  # table -> {column: ClickHouse type}, insertable columns only
+TABLE_ORDER = tuple(_SPEC)  # the insert order: every row table, in DDL order
 for _name, _s in _SPEC.items():
+    COLUMN_TYPES[_name] = dict(_s["cols"])
     TABLES[_name] = _create_table(_name, _s["cols"], _s["part"], _s["order"])
     COLUMNS[_name] = tuple(n for n, _ in _s["cols"])
 
@@ -184,6 +187,15 @@ FROM sigmondb.arrival
 GROUP BY reporter_id, tx_id, group_key"""
 
 COLUMNS["heard_state"] = ("reporter_id", "tx_id", "group_key", "last_time", "last_level_db")
+
+
+def is_nullable(typ):
+    return typ.startswith("Nullable(")
+
+
+def is_string(typ):
+    """True for String and LowCardinality(String); false for Nullable and the rest."""
+    return typ in ("String", LC)
 
 
 def ddl_statements():
