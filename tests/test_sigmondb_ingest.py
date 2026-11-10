@@ -140,3 +140,22 @@ def test_invalid_utf8_costs_only_that_line(tmp_path):
     p.write_bytes(good + b"\n" + b'{"a": "\xff\xfe"}\n' + good + b"\n")
     rows, bad = read_chirp_file(p, "arrival", received_at=RA, fallback_reporter="AC0G/B4")
     assert (len(rows), bad) == (2, 1)
+
+
+def test_huge_integer_in_float_column_raises_valueerror(tmp_path):
+    huge = int("9" * 400)
+    with pytest.raises(ValueError):
+        chirp_row("arrival", dict(ARR, level_db=huge), received_at=RA, fallback_reporter="AC0G/B4")
+    p = tmp_path / "arrival.jsonl"
+    g = json.dumps(ARR)
+    p.write_text(g + "\n" + g.replace('"level_db": -90.0', '"level_db": ' + "9" * 400) + "\n" + g + "\n")
+    rows, bad = read_chirp_file(p, "arrival", received_at=RA, fallback_reporter="AC0G/B4")
+    assert (len(rows), bad) == (2, 1)
+
+
+def test_deeply_nested_line_costs_only_that_line(tmp_path):
+    p = tmp_path / "arrival.jsonl"
+    g = json.dumps(ARR)
+    p.write_text(g + "\n" + "[" * 100000 + "\n" + g + "\n")
+    rows, bad = read_chirp_file(p, "arrival", received_at=RA, fallback_reporter="AC0G/B4")
+    assert (len(rows), bad) == (2, 1)

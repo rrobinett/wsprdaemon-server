@@ -106,7 +106,7 @@ def chirp_row(table, row, *, received_at, fallback_reporter, warned=None):
                 v = ({str(k): float(x) for k, x in v.items()} if isinstance(v, dict) else {})
             elif c in DATETIME_KEYS and v is not None:
                 v = _naive_utc(v)
-        except (TypeError, ValueError, AttributeError) as e:
+        except (TypeError, ValueError, AttributeError, OverflowError) as e:
             raise ValueError("%s: %s" % (c, e)) from e
         if v is None and not ddl.is_nullable(typ):
             if ddl.is_string(typ):
@@ -116,7 +116,7 @@ def chirp_row(table, row, *, received_at, fallback_reporter, warned=None):
         if v is not None and c not in ("engineering", "expected") and c not in DATETIME_KEYS:
             try:
                 v = _check(typ, v)
-            except (TypeError, ValueError) as e:
+            except (TypeError, ValueError, OverflowError) as e:
                 raise ValueError("%s: %s" % (c, e)) from e
         out.append(v)
     return tuple(out)
@@ -133,7 +133,7 @@ def read_chirp_file(path, table, *, received_at, fallback_reporter):
                 rows.append(chirp_row(table, json.loads(raw.decode("utf-8")),
                                       received_at=received_at,
                                       fallback_reporter=fallback_reporter, warned=warned))
-            except ValueError as e:  # JSONDecodeError is a ValueError
+            except (ValueError, OverflowError, TypeError, RecursionError) as e:  # JSONDecodeError is a ValueError
                 n_bad += 1
                 if first is None:
                     first = "line %d: %s" % (n, e)
