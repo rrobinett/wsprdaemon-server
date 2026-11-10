@@ -178,3 +178,11 @@ def test_real_nd_captures_have_unique_table_keys():
     keys = [(c["reporter_id"], c["centre_hz"], c["rate_hz_per_s"], c["time"], c["detector_version"])
             for c in caps]
     assert caps and len(keys) == len(set(keys))
+
+
+def test_backfill_arrivals_match_parity_fixture():
+    """hfdl-recorder's live mapping tests against this same file; the two move together."""
+    from sigmondb.rows import read_rows
+    want = (read_squitters(FX / "t6-group.csv", "AC0G/B4")[1]
+            + read_squitters(FX / "t5-group.csv", "UACNJ")[1])
+    assert read_rows(FX / "parity-arrivals.jsonl") == want
