@@ -73,7 +73,7 @@ def _capture(**kw):
     row = dict(time=None, reporter_id="", centre_hz=0.0, rate_hz_per_s=0.0, duration_s=HOUR_S,
                n_sweeps=None, expected={}, null_max_db=None, null_median_db=None, n_expected=0,
                n_found=0, detector_version="", ring_ref="", schema_version=SCHEMA_VERSION,
-               engineering={})
+               engineering={}, received_at=None)
     row.update(null_provenance())
     row.update(kw)
     return {c: row[c] for c in COLUMNS["capture"]}
@@ -84,7 +84,7 @@ def _arrival(**kw):
                rate_hz_per_s=0.0, delay_ns=0, delay_sigma_ns=None, level_db=0.0, margin_db=None,
                half_band_db=None, clean_tag="", doppler_hz=None, phase_rate=None,
                carrier_phase_rad=None, s4=None, sigma_phi_rad=None, detector_version="",
-               schema_version=SCHEMA_VERSION, engineering={})
+               schema_version=SCHEMA_VERSION, engineering={}, received_at=None)
     row.update(null_provenance())
     row.update(kw)
     return {c: row[c] for c in COLUMNS["arrival"]}

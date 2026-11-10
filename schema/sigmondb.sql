@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS sigmondb.capture
     `counter_epoch_id` String CODEC(ZSTD(3)),
     `origin` LowCardinality(String) CODEC(ZSTD(3)),
     `engineering` Map(String, String),
+    `received_at` Nullable(DateTime) CODEC(ZSTD(3)),
     `ingested_at` DateTime DEFAULT now() CODEC(Delta(4), ZSTD(3))
 )
 ENGINE = ReplacingMergeTree(ingested_at)
@@ -138,6 +139,7 @@ CREATE TABLE IF NOT EXISTS sigmondb.arrival
     `counter_epoch_id` String CODEC(ZSTD(3)),
     `origin` LowCardinality(String) CODEC(ZSTD(3)),
     `engineering` Map(String, String),
+    `received_at` Nullable(DateTime) CODEC(ZSTD(3)),
     `ingested_at` DateTime DEFAULT now() CODEC(Delta(4), ZSTD(3))
 )
 ENGINE = ReplacingMergeTree(ingested_at)
@@ -207,3 +209,7 @@ AS SELECT
     argMaxState(level_db, time) AS last_level_db
 FROM sigmondb.arrival
 GROUP BY reporter_id, tx_id, group_key;
+
+ALTER TABLE sigmondb.capture ADD COLUMN IF NOT EXISTS received_at Nullable(DateTime) CODEC(ZSTD(3)) AFTER engineering;
+
+ALTER TABLE sigmondb.arrival ADD COLUMN IF NOT EXISTS received_at Nullable(DateTime) CODEC(ZSTD(3)) AFTER engineering;

@@ -41,7 +41,7 @@ def test_sql_file_mirrors_ddl():
     with open(SQL_FILE) as f:
         text = re.sub(r"--[^\n]*", "", f.read())
     file_stmts = [_norm(p) for p in text.split(";") if p.strip()]
-    assert file_stmts == [_norm(s) for s in ddl.ddl_statements()]
+    assert file_stmts == [_norm(s) for s in ddl.ddl_statements() + list(ddl.MIGRATIONS)]
 
 
 def test_ensure_schema_runs_each_statement_once():
@@ -54,8 +54,9 @@ def test_ensure_schema_runs_each_statement_once():
 
     c = Fake()
     ddl.ensure_schema(c)
-    assert len(c.calls) == len(ddl.ddl_statements())
-    assert c.calls == ddl.ddl_statements()
+    expect = ddl.ddl_statements() + list(ddl.MIGRATIONS)
+    assert len(c.calls) == len(expect)
+    assert c.calls == expect
 
 
 def test_columns_whitelist_names_real_columns():

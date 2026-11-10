@@ -48,6 +48,8 @@ PROVENANCE = [
     ("origin", LC),
 ]
 ENGINEERING = [("engineering", "Map(String, String)")]
+# When the ingester received the line, from the upload tar; never a station clock value.
+RECEIVED = [("received_at", "Nullable(DateTime)")]
 
 _SPEC = {
     "transmitter": dict(
@@ -93,7 +95,7 @@ _SPEC = {
             ("n_expected", "Nullable(UInt32)"), ("n_found", "Nullable(UInt32)"),
             ("detector_version", LC), ("ring_ref", "String"),
             ("schema_version", "UInt16"),
-        ] + PROVENANCE + ENGINEERING,
+        ] + PROVENANCE + ENGINEERING + RECEIVED,
         part="toYYYYMM(time)",
         order="reporter_id, centre_hz, rate_hz_per_s, time, detector_version",
     ),
@@ -107,7 +109,7 @@ _SPEC = {
             ("doppler_hz", NF32), ("phase_rate", NF32), ("carrier_phase_rad", NF32),
             ("s4", NF32), ("sigma_phi_rad", NF32),
             ("detector_version", LC), ("schema_version", "UInt16"),
-        ] + PROVENANCE + ENGINEERING,
+        ] + PROVENANCE + ENGINEERING + RECEIVED,
         part="toYYYYMM(time)",
         order=("reporter_id, centre_hz, rate_hz_per_s, time, detector_version, "
                "intDiv(delay_ns, 1000)"),
@@ -189,6 +191,13 @@ GROUP BY reporter_id, tx_id, group_key"""
 COLUMNS["heard_state"] = ("reporter_id", "tx_id", "group_key", "last_time", "last_level_db")
 
 
+# Adds received_at to tables created before it existed.  Run after ddl_statements().
+MIGRATIONS = tuple(
+    "ALTER TABLE sigmondb.%s ADD COLUMN IF NOT EXISTS received_at Nullable(DateTime) "
+    "CODEC(ZSTD(3)) AFTER engineering" % t
+    for t in ("capture", "arrival"))
+
+
 def is_nullable(typ):
     return typ.startswith("Nullable(")
 
@@ -205,7 +214,7 @@ def ddl_statements():
 
 def ensure_schema(client):
     """Create the database and every table.  Idempotent."""
-    for stmt in ddl_statements():
+    for stmt in ddl_statements() + list(MIGRATIONS):
         client.command(stmt)
 
 
@@ -227,7 +236,7 @@ _HEADER = """-- sigmondb: registry of chirp (CODAR) and HFDL receptions.
 
 
 def sql_text():
-    return _HEADER + "\n" + ";\n\n".join(ddl_statements()) + ";\n"
+    return _HEADER + "\n" + ";\n\n".join(ddl_statements() + list(MIGRATIONS)) + ";\n"
 
 
 if __name__ == "__main__":
