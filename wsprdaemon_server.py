@@ -56,6 +56,13 @@ DEFAULT_CONFIG = {
     'status_subdir': 'status',
     'max_status_per_insert': 50000,
     'batch_flush_status': 5000,
+    # sigmondb.{arrival,capture} ingestion (chirp/ peer subdir): off by
+    # default, like psk and status.
+    # Flip via env WSPRDAEMON_INGEST_CHIRP=1 or --ingest-chirp.
+    'ingest_chirp': False,
+    'chirp_subdir': 'chirp',
+    'max_chirp_per_insert': 50000,
+    'batch_flush_chirp': 50000,
     'incoming_tbz_dirs': [],  # Must be specified via --incoming-dirs
     'extraction_dir': '/tmp/wsprdaemon/extraction',
     'processed_tbz_file': '/var/lib/wsprdaemon/wsprdaemon/processed_tbz_list.txt',
@@ -394,6 +401,17 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
         if config.get('ingest_status'):
             setup_status_tables(admin_client, config)
 
+        if config.get('ingest_chirp'):
+            # Chirp is the passenger: a sigmondb fault turns chirp ingestion
+            # off and never fails setup, so spots keep flowing.
+            try:
+                from sigmondb import ddl as _sigmondb_ddl
+                _sigmondb_ddl.ensure_schema(admin_client)
+            except Exception as e:
+                log(f"sigmondb schema setup failed; chirp ingestion "
+                    f"DISABLED: {e}", "ERROR")
+                config['ingest_chirp'] = False
+
         return True
 
     except Exception as e:
@@ -554,6 +572,23 @@ def insert_status_rows(client, rows: List[Dict], database: str, table: str,
         log(f"Error inserting status rows: {e}", "ERROR")
         import traceback
         traceback.print_exc()
+        return False
+
+
+def insert_chirp_rows(client, rows_by_table: Dict[str, List[tuple]],
+                      max_per_insert: int = 50000) -> bool:
+    """Insert sigmondb chirp rows, one statement per table per batch."""
+    try:
+        from sigmondb.ingest import insert_sql
+        for table, rows in rows_by_table.items():
+            if not rows:
+                continue
+            sql = insert_sql(table)
+            for i in range(0, len(rows), max_per_insert):
+                client.execute(sql, rows[i:i + max_per_insert])
+        return True
+    except Exception as e:
+        log(f"Error inserting chirp rows: {e}", "ERROR")
         return False
 
 
@@ -1263,6 +1298,46 @@ def process_status_files(extraction_dir: Path, status_subdir: str,
 
     log(f"Processed {len(rows)} status rows", "DEBUG")
     return rows
+
+
+def process_chirp_files(extraction_dir: Path, chirp_subdir: str,
+                        received_at: datetime) -> Dict[str, List[tuple]]:
+    """Scan `<extraction_dir>/<chirp_subdir>/<RX_SITE>/<RECEIVER>/<table>.jsonl`.
+
+    Returns {table: [row tuples]} for the tables in sigmondb.ingest.CHIRP_TABLES.
+    `received_at` is the tar's mtime, never the host's now.  Any other depth
+    or table name is skipped with a WARNING.  A missing sigmondb package logs
+    a WARNING and returns {}.
+    """
+    try:
+        from sigmondb.ingest import CHIRP_TABLES, read_chirp_file
+    except ImportError as exc:
+        log(f"sigmondb.ingest unavailable, skipping chirp: {exc}", "WARNING")
+        return {}
+    out: Dict[str, List[tuple]] = {}
+    root = extraction_dir / chirp_subdir
+    if not root.exists():
+        return out
+    for path in sorted(root.rglob('*.jsonl')):
+        rel = path.relative_to(root).parts
+        if len(rel) != 3:
+            log(f"Skipping chirp file with unexpected path depth: {path}",
+                "WARNING")
+            continue
+        table = path.stem
+        if table not in CHIRP_TABLES:
+            log(f"Skipping chirp file with unknown table {table!r}: {path}",
+                "WARNING")
+            continue
+        fallback = decode_rx_site_dir(rel[0])[0]
+        try:
+            rows, _n_bad = read_chirp_file(
+                path, table, received_at=received_at, fallback_reporter=fallback)
+        except Exception as exc:
+            log(f"Error reading {path}: {exc}", "WARNING")
+            continue
+        out.setdefault(table, []).extend(rows)
+    return out
 
 
 def _parse_psk_time(ts) -> datetime:
@@ -2129,12 +2204,13 @@ def maybe_provision_sftp(worker_dir) -> None:
 
 def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path,
                           psk_modes: Optional[List[str]] = None,
-                          status_subdir: Optional[str] = None) -> Optional[Tuple]:
+                          status_subdir: Optional[str] = None,
+                          chirp_subdir: Optional[str] = None) -> Optional[Tuple]:
     """Read tbz file into RAM then extract and parse in a private temp directory.
 
     Reading the file content in one shot minimises disk seeks — one sequential
     read per file instead of multiple random seeks during tarfile streaming.
-    Returns (tbz_file, spots, noise_records, psk_rows, status_rows) on
+    Returns (tbz_file, spots, noise_records, psk_rows, status_rows, chirp_rows) on
     success, None on failure.
 
     `psk_modes` is the list of peer-named modulation subdirs to scan at the
@@ -2210,7 +2286,18 @@ def extract_and_parse_tbz(tbz_file: Path, base_extraction_dir: Path,
                 log(f"Status parse failed for {tbz_file.name} "
                     f"(spots unaffected): {exc}", "WARNING")
 
-        return (tbz_file, spots, noise_records, psk_rows, status_rows)
+        chirp_rows: Dict[str, List[tuple]] = {}
+        if chirp_subdir:
+            # Contained like status: chirp never costs a tar its spots.
+            # received_at is the tar mtime, never the host clock.
+            try:
+                chirp_rows = process_chirp_files(worker_dir, chirp_subdir, tbz_mtime)
+            except Exception as exc:
+                log(f"Chirp parse failed for {tbz_file.name} "
+                    f"(spots unaffected): {exc}", "WARNING")
+                chirp_rows = {}
+
+        return (tbz_file, spots, noise_records, psk_rows, status_rows, chirp_rows)
 
     except Exception as e:
         log(f"Error processing {tbz_file.name}: {e}", "ERROR")
@@ -2246,6 +2333,10 @@ def main():
                        help='Enable station.heartbeat ingestion from the '
                             'status/ peer subdir '
                             '(also honors WSPRDAEMON_INGEST_STATUS=1 env var)')
+    parser.add_argument('--ingest-chirp', action='store_true',
+                       help='Enable sigmondb.{arrival,capture} ingestion from the '
+                            'chirp/ peer subdir '
+                            '(also honors WSPRDAEMON_INGEST_CHIRP=1 env var)')
     parser.add_argument('--ingest-psk', action='store_true',
                        help='Enable FT8/FT4/MSK144 ingest into psk.spots '
                             '(also honors WSPRDAEMON_INGEST_PSK=1 env var)')
@@ -2304,6 +2395,15 @@ def main():
     else:
         log("Status ingestion disabled (use --ingest-status or "
             "WSPRDAEMON_INGEST_STATUS=1)", "DEBUG")
+
+    if (args.ingest_chirp
+            or os.environ.get('WSPRDAEMON_INGEST_CHIRP', '0') == '1'):
+        config['ingest_chirp'] = True
+        log(f"Chirp ingestion ENABLED: subdir={config['chirp_subdir']}/ "
+            f"-> sigmondb.{{arrival,capture}}", "INFO")
+    else:
+        log("Chirp ingestion disabled (use --ingest-chirp or "
+            "WSPRDAEMON_INGEST_CHIRP=1)", "DEBUG")
 
     if args.ingest_psk or os.environ.get('WSPRDAEMON_INGEST_PSK', '0') == '1':
         config['ingest_psk'] = True
@@ -2431,14 +2531,18 @@ def main():
             pending_noise = []
             pending_psk   = []
             pending_status = []
+            pending_chirp: Dict[str, List[tuple]] = {}
             pending_tbz   = []
             last_flush    = time.time()
 
+            def n_chirp():
+                return sum(len(v) for v in pending_chirp.values())
+
             def do_flush():
                 nonlocal pending_spots, pending_noise, pending_psk
-                nonlocal pending_status, pending_tbz, last_flush
+                nonlocal pending_status, pending_chirp, pending_tbz, last_flush
                 if not (pending_spots or pending_noise or pending_psk
-                        or pending_status):
+                        or pending_status or n_chirp()):
                     pending_tbz = []
                     last_flush = time.time()
                     return
@@ -2446,10 +2550,11 @@ def main():
                 if config.get('dry_run'):
                     log(f"DRY RUN: would flush {len(pending_spots)} spots, "
                         f"{len(pending_noise)} noise, {len(pending_psk)} psk, "
-                        f"{len(pending_status)} status "
+                        f"{len(pending_status)} status, {n_chirp()} chirp "
                         f"from {len(pending_tbz)} tbz files", "INFO")
                     pending_spots, pending_noise, pending_psk = [], [], []
                     pending_status, pending_tbz = [], []
+                    pending_chirp = {}
                     last_flush = time.time()
                     return
 
@@ -2559,6 +2664,27 @@ def main():
                         flush_errors.append("status")
                         # don't block tbz cleanup
 
+                # sigmondb chirp flush — the same containment as status:
+                # a chirp fault never pins a tar, so never costs spots.
+                if n_chirp() and success:
+                    max_retries, retry_delay, ok = 3, 2, False
+                    for attempt in range(max_retries):
+                        if insert_chirp_rows(client, pending_chirp,
+                                             config['max_chirp_per_insert']):
+                            log(f"Flushed {n_chirp()} chirp rows", "INFO")
+                            ok = True
+                            break
+                        if attempt < max_retries - 1:
+                            log(f"Chirp flush failed, retrying in "
+                                f"{retry_delay}s", "WARNING")
+                            time.sleep(retry_delay)
+                            retry_delay *= 2
+                    if not ok:
+                        log(f"Chirp flush failed after {max_retries} "
+                            f"attempts", "ERROR")
+                        flush_errors.append("chirp")
+                        # don't block tbz cleanup
+
                 if success:
                     for tbz_file in pending_tbz:
                         mark_tbz_processed(tbz_file, processed_file,
@@ -2569,6 +2695,7 @@ def main():
                             log(f"Failed to delete {tbz_file.name}: {e}", "WARNING")
                     pending_spots, pending_noise, pending_psk = [], [], []
                     pending_status, pending_tbz = [], []
+                    pending_chirp = {}
 
                 last_flush = time.time()
 
@@ -2577,20 +2704,22 @@ def main():
                     item = results_queue.get(timeout=config['batch_flush_seconds'])
                 except queue.Empty:
                     if (pending_spots or pending_noise or pending_psk
-                            or pending_status):
+                            or pending_status or n_chirp()):
                         log(f"Timeout flush: {len(pending_spots)} spots, "
                             f"{len(pending_noise)} noise, {len(pending_psk)} psk, "
                             f"{len(pending_status)} status, "
+                            f"{n_chirp()} chirp, "
                             f"{len(pending_tbz)} files", "INFO")
                         do_flush()
                     continue
 
                 if item is SENTINEL:
                     if (pending_spots or pending_noise or pending_psk
-                            or pending_status):
+                            or pending_status or n_chirp()):
                         log(f"Final flush: {len(pending_spots)} spots, "
                             f"{len(pending_noise)} noise, {len(pending_psk)} psk, "
                             f"{len(pending_status)} status, "
+                            f"{n_chirp()} chirp, "
                             f"{len(pending_tbz)} files", "INFO")
                         do_flush()
                     break
@@ -2601,10 +2730,13 @@ def main():
                 tbz_file, spots, noise_records = item[0], item[1], item[2]
                 psk_rows = item[3] if len(item) > 3 else []
                 status_rows = item[4] if len(item) > 4 else []
+                chirp_rows = item[5] if len(item) > 5 else {}
                 pending_spots.extend(spots)
                 pending_noise.extend(noise_records)
                 pending_psk.extend(psk_rows)
                 pending_status.extend(status_rows)
+                for _t, _rows in chirp_rows.items():
+                    pending_chirp.setdefault(_t, []).extend(_rows)
                 pending_tbz.append(tbz_file)
 
                 elapsed = time.time() - last_flush
@@ -2612,10 +2744,11 @@ def main():
                         len(pending_noise) >= config['batch_flush_noise'] or
                         len(pending_psk) >= config['batch_flush_psk'] or
                         len(pending_status) >= config['batch_flush_status'] or
+                        n_chirp() >= config['batch_flush_chirp'] or
                         elapsed >= config['batch_flush_seconds']):
                     log(f"Flush trigger: {len(pending_spots)} spots, "
                         f"{len(pending_noise)} noise, {len(pending_psk)} psk, "
-                        f"{len(pending_status)} status, "
+                        f"{len(pending_status)} status, {n_chirp()} chirp, "
                         f"{elapsed:.1f}s elapsed", "INFO")
                     do_flush()
 
@@ -2630,9 +2763,12 @@ def main():
         psk_modes_arg = config['psk_modes'] if config.get('ingest_psk') else None
         status_subdir_arg = (config['status_subdir']
                              if config.get('ingest_status') else None)
+        chirp_subdir_arg = (config['chirp_subdir']
+                            if config.get('ingest_chirp') else None)
         with Pool(max_workers=n_workers) as executor:
             futures = {executor.submit(extract_and_parse_tbz, f, extraction_dir,
-                                       psk_modes_arg, status_subdir_arg): f
+                                       psk_modes_arg, status_subdir_arg,
+                                       chirp_subdir_arg): f
                        for f in unprocessed}
             for future in as_completed(futures):
                 try:

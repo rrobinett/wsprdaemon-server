@@ -109,6 +109,9 @@ WSPRDAEMON_INGEST_PSK=1 wsprdaemon_server.py ...
 # or, --ingest-psk on the CLI
 ```
 
+Chirp ingestion (`chirp/` into `sigmondb`) has the same gate:
+`WSPRDAEMON_INGEST_CHIRP=1` or `--ingest-chirp`.
+
 Expected tar layout (Phase 2): modes live as **peer subdirs** at the tar
 root, alongside the existing `wsprdaemon/` (or new `wspr/`) wspr tree:
 
@@ -154,6 +157,15 @@ exactly like psk ingestion:
 ```bash
 sudo systemctl edit wsprdaemon_server@wsprdaemon   # Environment=WSPRDAEMON_INGEST_STATUS=1
 # or --ingest-status on the CLI
+```
+
+The `chirp/` peer subdir (HFDL squitter arrivals and captures, in
+`chirp/<RX_SITE>/<RECEIVER>/{arrival,capture}.jsonl`) feeds `sigmondb.arrival`
+and `sigmondb.capture` the same way.  Off by default:
+
+```bash
+sudo systemctl edit wsprdaemon_server@wsprdaemon   # Environment=WSPRDAEMON_INGEST_CHIRP=1
+# or --ingest-chirp on the CLI
 ```
 
 Tar layout — `status` is a peer subdir at the tar root, beside `wspr/` and the
