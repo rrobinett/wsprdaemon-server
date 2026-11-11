@@ -28,6 +28,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
@@ -106,6 +108,24 @@ def test_a_RESOLVED_bracketed_callsign_passes_through():
     """wsprnet accepts these and strips the brackets itself — dropping them
     would silently discard real spots."""
     assert "<W2NAF>" in wf.row_to_mept(_row(tx_sign="<W2NAF>"))
+
+
+@pytest.mark.parametrize("wd_code,wsprnet_code", [(2, 2), (3, 3), (6, 5), (16, 15), (31, 30)])
+def test_the_mode_column_takes_wsprnets_number_not_wsprdaemons(wd_code, wsprnet_code):
+    """wsprdaemon.spots stores wsprdaemon's pkt_mode (FST4W: period in
+    minutes plus one); wsprnet's MEPT mode column numbers FST4W by its
+    period (2, 3, 5, 15, 30).  On wsprnet's scale 16 and 31 mean nothing,
+    and 6 is not FST4W-300.  Same table as hs_uploader.wspr_modes."""
+    line = wf.row_to_mept(_row(code=wd_code))
+    assert line.split()[-1] == str(wsprnet_code)
+
+
+def test_an_fst4w_line_takes_the_f_mode_short_form():
+    """wd-decode's F-mode MEPT line: SNR as %3.0f, drift written as 0."""
+    line = wf.row_to_mept(_row(code=6, drift=3, snr=-21.4))
+    parts = line.split()
+    assert parts[3] == "-21" and parts[9] == "0"
+    assert len(parts) == 11
 
 
 def test_missing_optional_fields_do_not_lose_the_spot():
@@ -277,9 +297,15 @@ def test_our_lines_are_BYTE_IDENTICAL_to_what_stations_send():
     sigmond's bundled-copy compat test does.
     """
     import importlib.util
-    src = Path("/home/rob/hamsci/repos/hs-uploader/src")
-    if not (src / "hs_uploader" / "transports" / "wsprnet.py").exists():
-        import pytest
+    def readable(p):
+        try:
+            return (p / "hs_uploader" / "transports" / "wsprnet.py").is_file()
+        except OSError:                  # another user's home: no access
+            return False
+    src = next((p for p in (HERE.parent.parent / "hs-uploader" / "src",
+                            Path("/home/rob/hamsci/repos/hs-uploader/src"))
+                if readable(p)), None)
+    if src is None:
         pytest.skip("no hs-uploader checkout to compare against")
     sys.path.insert(0, str(src))
     from hs_uploader.transports.wsprnet import _record_to_mept
@@ -297,6 +323,15 @@ def test_our_lines_are_BYTE_IDENTICAL_to_what_stations_send():
              snr=3.0, power=50, drift=2, code=2, sync_quality=1.0, dt=0.0),
         dict(tx_sign="LONGCALL/P", tx_loc="IO91", frequency_mhz=10.1402000,
              snr=-5.0, power=10, drift=0, code=2, sync_quality=0.5, dt=1.0),
+        # FST4W: wsprnet's mode number and the F-mode line form.
+        dict(tx_sign="W8GPS", tx_loc="EM79", frequency_mhz=7.0400600,
+             snr=0.0, power=30, drift=0, code=3, sync_quality=426.8, dt=0.07),
+        dict(tx_sign="K9AN", tx_loc="EN50", frequency_mhz=7.0401200,
+             snr=-24.0, power=37, drift=1, code=6, sync_quality=12.0, dt=0.5),
+        dict(tx_sign="G3ZJO", tx_loc="IO92", frequency_mhz=0.4757000,
+             snr=-30.0, power=40, drift=0, code=16, sync_quality=3.0, dt=-0.3),
+        dict(tx_sign="DK7FC", tx_loc="JN49", frequency_mhz=0.1375000,
+             snr=-33.0, power=30, drift=0, code=31, sync_quality=1.5, dt=0.0),
     ]
     for c in cases:
         ours = wf.row_to_mept(wf.SpotRow(time=T0, ingested_at=T0,

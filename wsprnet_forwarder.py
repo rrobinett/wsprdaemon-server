@@ -307,6 +307,13 @@ def dedup_for_wsprnet(rows: List[SpotRow]) -> List[SpotRow]:
 
 # ── MEPT rendering ───────────────────────────────────────────────────────────
 
+# wsprdaemon.spots `code` (the station's pkt_mode) -> wsprnet's MEPT mode
+# column.  The scales agree for WSPR-2 and FST4W-120 only: wsprdaemon numbers
+# FST4W by period in minutes plus one, wsprnet by the period.  Same table as
+# hs_uploader.wspr_modes.  A code not listed passes through as WSPR.
+_WD_TO_WSPRNET_MODE = {2: 2, 3: 3, 6: 5, 16: 15, 31: 30}
+
+
 def row_to_mept(row: SpotRow) -> Optional[str]:
     """One wsprnet.org MEPT line, byte-compatible with wd-upload-wsprnet.
 
@@ -324,19 +331,21 @@ def row_to_mept(row: SpotRow) -> Optional[str]:
         return None
     if not row.frequency_mhz:
         return None
-    return "%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d" % (
-        row.time.strftime("%y%m%d"),
-        row.time.strftime("%H%M"),
-        row.sync_quality if row.sync_quality is not None else 0.0,
-        int(round(row.snr)) if row.snr is not None else 0,
-        row.dt if row.dt is not None else 0.0,
-        row.frequency_mhz,
-        call,
-        (row.tx_loc or "").strip(),
-        row.power if row.power is not None else 0,
-        row.drift if row.drift is not None else 0,
-        row.code if row.code is not None else 0,
-    )
+    code = row.code if row.code is not None else 0
+    head = (row.time.strftime("%y%m%d"), row.time.strftime("%H%M"),
+            row.sync_quality if row.sync_quality is not None else 0.0)
+    tail = (row.dt if row.dt is not None else 0.0, row.frequency_mhz, call,
+            (row.tx_loc or "").strip(),
+            row.power if row.power is not None else 0)
+    snr = row.snr if row.snr is not None else 0
+    ntype = _WD_TO_WSPRNET_MODE.get(code)
+    if ntype is None or ntype == 2:
+        return "%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d" % (
+            *head, int(round(snr)), *tail,
+            row.drift if row.drift is not None else 0, code)
+    # wd-decode's F-mode line: SNR %3.0f, drift written as 0.
+    return "%-6s %4s %5.1f %3.0f %5.2f %12.7f %-14s %-6s %2d  0 %4d" % (
+        *head, float(snr), *tail, ntype)
 
 
 def build_multipart(*, version: str, call: str, grid: str,
