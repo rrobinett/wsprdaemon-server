@@ -111,7 +111,8 @@ def _capture(**kw):
 
 def _arrival(**kw):
     row = dict(time=None, reporter_id="", tx_id="", group_key="", centre_hz=0.0,
-               rate_hz_per_s=0.0, delay_ns=0, delay_sigma_ns=None, level_db=0.0, margin_db=None,
+               rate_hz_per_s=0.0, delay_ns=0, delay_sigma_ns=None, freq_hz=None, level_db=0.0,
+               margin_db=None,
                half_band_db=None, clean_tag="", doppler_hz=None, phase_rate=None,
                carrier_phase_rad=None, s4=None, sigma_phi_rad=None,
                detector_version=DETECTOR_VERSION, schema_version=SCHEMA_VERSION,

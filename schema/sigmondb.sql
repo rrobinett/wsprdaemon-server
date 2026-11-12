@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS sigmondb.arrival
     `rate_hz_per_s` Float64 CODEC(ZSTD(3)),
     `delay_ns` Int64 CODEC(ZSTD(3)),
     `delay_sigma_ns` Nullable(Float32) CODEC(ZSTD(3)),
+    `freq_hz` Nullable(Float64) CODEC(ZSTD(3)),
     `level_db` Float32 CODEC(ZSTD(3)),
     `margin_db` Nullable(Float32) CODEC(ZSTD(3)),
     `half_band_db` Nullable(Float32) CODEC(ZSTD(3)),
@@ -213,3 +214,5 @@ GROUP BY reporter_id, tx_id, group_key;
 ALTER TABLE sigmondb.capture ADD COLUMN IF NOT EXISTS received_at Nullable(DateTime) CODEC(ZSTD(3)) AFTER engineering;
 
 ALTER TABLE sigmondb.arrival ADD COLUMN IF NOT EXISTS received_at Nullable(DateTime) CODEC(ZSTD(3)) AFTER engineering;
+
+ALTER TABLE sigmondb.arrival ADD COLUMN IF NOT EXISTS freq_hz Nullable(Float64) CODEC(ZSTD(3)) AFTER delay_sigma_ns;

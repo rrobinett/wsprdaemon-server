@@ -103,7 +103,7 @@ _SPEC = {
         cols=[
             ("time", "DateTime64(9)"), ("reporter_id", "String"), ("tx_id", "String"),
             ("group_key", LC), ("centre_hz", "Float64"), ("rate_hz_per_s", "Float64"),
-            ("delay_ns", "Int64"), ("delay_sigma_ns", NF32),
+            ("delay_ns", "Int64"), ("delay_sigma_ns", NF32), ("freq_hz", NF64),
             ("level_db", "Float32"), ("margin_db", NF32), ("half_band_db", NF32),
             ("clean_tag", LC),
             ("doppler_hz", NF32), ("phase_rate", NF32), ("carrier_phase_rad", NF32),
@@ -191,11 +191,16 @@ GROUP BY reporter_id, tx_id, group_key"""
 COLUMNS["heard_state"] = ("reporter_id", "tx_id", "group_key", "last_time", "last_level_db")
 
 
-# Adds received_at to tables created before it existed.  Run after ddl_statements().
+# Adds columns to tables created before they existed.  Run after ddl_statements().
+# freq_hz (2026-11-12): the frequency an arrival's delay belongs to -- the centre
+# for a narrow sweep, the reflection's instantaneous frequency for a wideband
+# one (an ionogram trace), so the tables serve any chirp, not CODAR alone.
 MIGRATIONS = tuple(
     "ALTER TABLE sigmondb.%s ADD COLUMN IF NOT EXISTS received_at Nullable(DateTime) "
     "CODEC(ZSTD(3)) AFTER engineering" % t
-    for t in ("capture", "arrival"))
+    for t in ("capture", "arrival")) + (
+    "ALTER TABLE sigmondb.arrival ADD COLUMN IF NOT EXISTS freq_hz Nullable(Float64) "
+    "CODEC(ZSTD(3)) AFTER delay_sigma_ns",)
 
 
 def is_nullable(typ):
