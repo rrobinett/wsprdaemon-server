@@ -556,6 +556,20 @@ last two needed a night of it, and the fourth hid the third:
   to there.  A group that is cut stops posting its later chunks, which would
   hit the same cutoff and deliver nothing but more duplicates.
 
+- **wsprnet got 20x slower and the 180 s timeout became the storm again
+  (2026-11-13, v1.1.0).**  Under load wsprnet took 255 s for 123 spots
+  (K9TRV-5's own upload log), so 999-spot posts timed out 353 times in 24 h
+  on wd30, plus 130 HTTP 500s.  Each timeout held the watermark, wsprnet
+  often went on recording, and the re-post a few minutes later raced it:
+  ~0.3 % duplicates on wsprnet for KFS, AC0G/B4 and AC0G/B1A, and the
+  forwarder ran 2-3 h behind.  Now it posts `DEFAULT_MAX_PER_UPLOAD` = 250
+  per transaction (999 stays the hard cap), waits up to 600 s, and after any
+  failed pass posts nothing for `RETRY_HOLDOFF_SEC` = 300 s, so wsprnet
+  finishes the first copy before the second arrives.  The same fix went into
+  the WD client as 8a48999.  Tests pin a 250-spot chunk inside the timeout
+  at the slowest measured rate, and the hold-off even with
+  `post_interval_sec=0` or a full batch.
+
 ### Skipping what wsprnet already holds (`WSPRNET_FORWARDER_SKIP_KNOWN`, default on)
 
 A POST that times out on our side usually lands on wsprnet anyway.  The

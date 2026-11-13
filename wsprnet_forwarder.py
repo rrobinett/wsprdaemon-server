@@ -61,7 +61,7 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("wsprnet_forwarder")
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 DEFAULT_LEADER_URL = "http://gw1.wsprdaemon.org/wsprnet-leader.txt"
 DEFAULT_WATERMARK_PATH = Path("/var/lib/wsprdaemon/wsprnet_forwarder/watermark")
@@ -80,7 +80,18 @@ DEFAULT_LEADER_POLL_SEC = 60
 # 2026-10-27 doing exactly that, at 4.3x the traffic for zero extra spots.
 # Keep at least 2x the measured worst case (test_the_timeout_must_outlast_
 # wsprnets_OWN_measured_processing_rate pins it).
-DEFAULT_HTTP_TIMEOUT = 180
+#
+# ⛔ 2026-11-13: wsprnet got far slower than that — 255 s for 123 spots from
+# K9TRV-5 (2.1 s per spot), 157 s for 54 — and the 180 s timeout fired 353
+# times in 24 h on 999-spot posts.  Each timeout held the watermark while
+# wsprnet often went on recording, the next pass re-posted, and overlapping
+# requests put ~0.3 % duplicates on wsprnet while the backlog grew to 2-3 h.
+# So: post DEFAULT_MAX_PER_UPLOAD (250) at a time, wait up to 600 s, and after
+# any failure hold off RETRY_HOLDOFF_SEC before posting again (run_loop).
+# test_a_CHUNK_finishes_inside_the_timeout_at_wsprnets_SLOWEST_measured_rate
+# pins the chunk/timeout pair to that measurement.
+DEFAULT_HTTP_TIMEOUT = 600
+RETRY_HOLDOFF_SEC = 300
 DEFAULT_URL = "http://wsprnet.org/meptspots.php"
 DEFAULT_COLD_START_MINUTES = 5
 
@@ -89,6 +100,11 @@ DEFAULT_COLD_START_MINUTES = 5
 # Larger uploads are silently truncated by the far end, which is the
 # worst possible failure: it looks like success.
 MAX_SPOTS_PER_UPLOAD = 999
+# What we actually post per transaction: well under the cap, so one upload
+# finishes inside DEFAULT_HTTP_TIMEOUT even when wsprnet is at its slowest
+# (see DEFAULT_HTTP_TIMEOUT).  A smaller transaction also means a failure
+# re-posts 250 spots, not 999.  Same figure as WD's client (8a48999).
+DEFAULT_MAX_PER_UPLOAD = 250
 # Sized against the batching window below: one 5-minute window across this
 # fleet is ~8,000 rows (2.3 M WSPR spots/day), so a 2,000-row cap would have
 # meant four passes per window and a forwarder that falls permanently behind
@@ -693,7 +709,7 @@ def post_mept(url: str, body: bytes, *, timeout: float,
 def forward_rows(rows: List[SpotRow], *, url: str, version: str = "",
                  overrides: Dict[str, Dict[str, str]],
                  timeout: float = DEFAULT_HTTP_TIMEOUT,
-                 max_per_upload: int = MAX_SPOTS_PER_UPLOAD,
+                 max_per_upload: int = DEFAULT_MAX_PER_UPLOAD,
                  opener=None,
                  on_wsprnet=None) -> Tuple[int, int, Optional[datetime]]:
     """Dedup, group by reporter, POST.
@@ -803,6 +819,8 @@ class ForwarderConfig:
     batch: int = DEFAULT_BATCH
     post_interval_sec: int = DEFAULT_POST_INTERVAL_SEC
     http_timeout: float = DEFAULT_HTTP_TIMEOUT
+    max_per_upload: int = DEFAULT_MAX_PER_UPLOAD
+    retry_holdoff_sec: float = RETRY_HOLDOFF_SEC
     dry_run: bool = False
     once: bool = False
     # Skip spots wspr.rx shows wsprnet already holds (see WsprRxLookup).
@@ -847,6 +865,8 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
     was_leader: Optional[bool] = None
     # Post on the first pass, then once per window.
     last_post = time.monotonic() - cfg.post_interval_sec
+    # Set after a pass with failed POSTs: no posting before this moment.
+    not_before = 0.0
     if cfg.post_interval_sec:
         logger.info("batching: fetch and post once per %d s "
                     "(polling every %d s)", cfg.post_interval_sec, cfg.poll_sec)
@@ -886,7 +906,7 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
         # restarted by a deploy, and they would be lost with the log line
         # that promised them — the same shape of failure the dry-run
         # watermark bug had.
-        if now - last_post < cfg.post_interval_sec:
+        if now - last_post < cfg.post_interval_sec or now < not_before:
             _interruptible_sleep(cfg.poll_sec)
             continue
         last_post = now
@@ -907,6 +927,7 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
                 posted, failed, stopped_at = forward_rows(
                     rows, url=cfg.url, version=VERSION,
                     overrides=overrides, timeout=cfg.http_timeout,
+                    max_per_upload=cfg.max_per_upload,
                     on_wsprnet=on_wsprnet)
                 # ⛔ ADVANCE ONLY ON A CLEAN PASS.  Advancing past spots
                 # that failed to post loses them with no record anywhere;
@@ -929,8 +950,17 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
                     since = high
                     write_watermark(cfg.watermark_path, since)
                 else:
+                    # ⛔ HOLD OFF BEFORE THE RETRY.  A timed-out POST is often
+                    # still being recorded by wsprnet, and re-posting while it
+                    # is is exactly how both copies end up on wsprnet (wd30,
+                    # 2026-11-13: 353 timeouts/day, ~0.3 % duplicates).  Wait
+                    # long enough for it to finish; then the spots it did take
+                    # are either skipped (wspr.rx) or refused as duplicates.
+                    not_before = time.monotonic() + cfg.retry_holdoff_sec
                     logger.warning("%d spot(s) failed — holding the watermark "
-                                   "so the next pass retries them", failed)
+                                   "and retrying in %d s, once wsprnet has "
+                                   "finished with them", failed,
+                                   cfg.retry_holdoff_sec)
             elif cfg.dry_run:
                 # ⛔ DRY RUN MUST NOT ADVANCE THE WATERMARK.  It is the same
                 # process that goes live later, and the unit file tells

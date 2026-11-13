@@ -254,9 +254,23 @@ def test_over_999_spots_are_chunked():
             for i in range(1500)]
     calls = []
     posted, failed, _cut = wf.forward_rows(rows, url="http://x/", version="1",
-                                     overrides={}, opener=_ok_opener(calls))
+                                     overrides={}, opener=_ok_opener(calls),
+                                     max_per_upload=wf.MAX_SPOTS_PER_UPLOAD)
     assert posted == 1500 and failed == 0
     assert len(calls) == 2, "1500 spots must go as two transactions"
+
+
+def test_by_default_the_forwarder_posts_250_at_a_time():
+    """⛔ 999 per POST timed out 353 times in a day on wd30 (2026-11-13), when
+    wsprnet was taking ~2 s per spot.  250 finishes inside the timeout."""
+    rows = [_row(tx_sign=f"W{i:04d}", frequency_mhz=14.0 + i * 0.001)
+            for i in range(600)]
+    calls = []
+    posted, failed, _cut = wf.forward_rows(rows, url="http://x/", version="1",
+                                     overrides={}, opener=_ok_opener(calls))
+    assert posted == 600 and failed == 0
+    assert len(calls) == 3, "600 spots must go as 250 + 250 + 100"
+    assert wf.DEFAULT_MAX_PER_UPLOAD <= wf.MAX_SPOTS_PER_UPLOAD
 
 
 def test_a_failed_post_is_counted_and_not_silently_dropped():
@@ -776,6 +790,52 @@ def test_the_timeout_must_outlast_wsprnets_OWN_measured_processing_rate():
         f"{wf.DEFAULT_HTTP_TIMEOUT}s leaves no headroom")
 
 
+def test_a_CHUNK_finishes_inside_the_timeout_at_wsprnets_SLOWEST_measured_rate():
+    """⛔ 2026-11-13, K9TRV-5's upload log: wsprnet took 255 s to take 123
+    spots.  At that rate a 999-spot POST needs ~34 minutes, so the 180 s
+    timeout fired on almost every busy pass and every retry raced the
+    original.  The chunk we post must fit inside the timeout at that rate."""
+    sec_per_spot = 255 / 123
+    assert wf.DEFAULT_MAX_PER_UPLOAD * sec_per_spot <= wf.DEFAULT_HTTP_TIMEOUT, (
+        f"{wf.DEFAULT_MAX_PER_UPLOAD} spots need about "
+        f"{wf.DEFAULT_MAX_PER_UPLOAD * sec_per_spot:.0f}s at wsprnet's slowest; "
+        f"the timeout is {wf.DEFAULT_HTTP_TIMEOUT}s")
+
+
+def test_after_a_FAILED_pass_the_retry_waits_out_the_holdoff():
+    """⛔ A timed-out POST is often still being recorded by wsprnet.
+    Re-posting before it finishes is how both copies end up on wsprnet, so a
+    failed pass must not be followed by another POST for retry_holdoff_sec —
+    not even with post_interval 0 or a full batch."""
+    clock = {"t": 1000.0}
+    calls = []
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = wf.ForwarderConfig(this_host="wd20", pin_leader="wd20",
+                                 watermark_path=Path(tmp) / "wm",
+                                 poll_sec=30, batch=1, post_interval_sec=0,
+                                 retry_holdoff_sec=300)
+        n = {"i": 0}
+        def sleep(sec):
+            clock["t"] += sec
+            n["i"] += 1
+            if n["i"] >= 12:
+                wf._STOP = True
+        def failing(*a, **k):
+            calls.append(clock["t"])
+            return (0, 1, None)
+        with mock.patch.object(wf.time, "monotonic", lambda: clock["t"]), \
+             mock.patch.object(wf, "_interruptible_sleep", sleep), \
+             mock.patch.object(wf, "fetch_pending", return_value=[_row()]), \
+             mock.patch.object(wf, "forward_rows", side_effect=failing), \
+             mock.patch.object(wf, "load_reporter_overrides", return_value={}), \
+             mock.patch.object(wf, "load_declared_identities", return_value={}):
+            wf._STOP = False
+            wf.run_loop(cfg, ch_client_factory=lambda: object())
+    # 12 polls of 30 s = 360 s: the first POST fails at t=1000, so the next
+    # may not come before t=1300.  Without the hold-off there would be 12.
+    assert calls == [1000.0, 1300.0], calls
+
+
 def test_post_mept_tells_the_verdict_how_many_spots_it_SENT():
     """Without this the shortfall check above can never fire in production."""
     seen = {}
@@ -815,7 +875,7 @@ def test_forward_rows_tells_the_verdict_THE_SIZE_OF_EACH_CHUNK_it_sent():
     with mock.patch.object(wf, "_wsprnet_verdict", _spy):
         wf.forward_rows(rows, url="http://x/", version="1",
                         overrides={}, opener=_ok_opener([]))
-    assert seen == [999, 501], f"chunk sizes never reached the verdict: {seen}"
+    assert seen == [250] * 6, f"chunk sizes never reached the verdict: {seen}"
 
 
 # ---------- wsprnet's 100-duplicate cutoff ----------
