@@ -152,6 +152,7 @@ _SPEC = {
         ],
         part="toYYYYMM(run_at)",
         order="group_key, mode_policy, tx_id, run_id",
+        ttl="run_at + INTERVAL 30 DAY",
     ),
     "path": dict(
         cols=[
@@ -165,7 +166,7 @@ _SPEC = {
 }
 
 
-def _create_table(name, cols, part, order, engine=None):
+def _create_table(name, cols, part, order, engine=None, ttl=None):
     lines = ["    `%s` %s %s" % (n, t, _codec(t)) for n, t in cols]
     lines = [ln.rstrip() for ln in lines]
     lines.append("    `ingested_at` DateTime DEFAULT now() CODEC(Delta(4), %s)" % _Z)
@@ -175,6 +176,8 @@ def _create_table(name, cols, part, order, engine=None):
     if part:
         sql += "PARTITION BY %s\n" % part
     sql += "ORDER BY (%s)" % order
+    if ttl:
+        sql += "\nTTL %s" % ttl
     return sql
 
 
@@ -184,7 +187,7 @@ COLUMN_TYPES = {}  # table -> {column: ClickHouse type}, insertable columns only
 TABLE_ORDER = tuple(_SPEC)  # the insert order: every row table, in DDL order
 for _name, _s in _SPEC.items():
     COLUMN_TYPES[_name] = dict(_s["cols"])
-    TABLES[_name] = _create_table(_name, _s["cols"], _s["part"], _s["order"])
+    TABLES[_name] = _create_table(_name, _s["cols"], _s["part"], _s["order"], ttl=_s.get("ttl"))
     COLUMNS[_name] = tuple(n for n, _ in _s["cols"])
 
 # heard: last arrival time and level per (receiver, transmitter, group).
@@ -224,7 +227,9 @@ MIGRATIONS = tuple(
     "CODEC(ZSTD(3)) AFTER engineering" % t
     for t in ("capture", "arrival")) + (
     "ALTER TABLE sigmondb.arrival ADD COLUMN IF NOT EXISTS freq_hz Nullable(Float64) "
-    "CODEC(ZSTD(3)) AFTER delay_sigma_ns",)
+    "CODEC(ZSTD(3)) AFTER delay_sigma_ns",
+    # attribution is rewritten every hour: keep 30 days (a table made before the TTL gets it here)
+    "ALTER TABLE sigmondb.attribution MODIFY TTL run_at + INTERVAL 30 DAY",)
 
 
 def is_nullable(typ):

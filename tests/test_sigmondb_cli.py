@@ -223,8 +223,8 @@ def test_from_db_detector_version_overrides(monkeypatch):
     assert sorted(r["delay_ns"] for r in arr) == [1, 4]
     call = [k for k in c.calls if ".arrival" in k["sql"]][0]
     assert "detector_version = {dv:String}" in call["sql"]
-    assert call["parameters"] == {"dv": "offline-2026-11", "days": 30.0}
-    assert "INTERVAL {days:Float64} DAY" in call["sql"]
+    assert call["parameters"] == {"dv": "offline-2026-11", "hours": 720}
+    assert "INTERVAL {hours:UInt32} HOUR" in call["sql"] and "Float" not in call["sql"]
 
 
 def test_from_db_converts_times_to_naive_utc(monkeypatch):
@@ -323,9 +323,9 @@ def test_cli_attribute_writes_both_policies_and_exits_zero_with_nothing_named(mo
     assert any("CREATE TABLE IF NOT EXISTS sigmondb.attribution" in s for s in c.commands)
     asql = [k for k in c.calls if ".arrival" in k["sql"]][0]
     for frag in ("FROM sigmondb.arrival FINAL", "u_epoch_ns IS NOT NULL", "u_epoch_ns <= 1000",
-                 "clean_tag = 'A'", "rate_hz_per_s != 0", "INTERVAL {days:Float64} DAY"):
+                 "clean_tag = 'A'", "rate_hz_per_s != 0", "INTERVAL {hours:UInt32} HOUR"):
         assert frag in asql["sql"], frag
-    assert asql["parameters"] == {"days": 30.0}
+    assert asql["parameters"] == {"hours": 720}
     tsql = [k["sql"] for k in c.calls if ".transmitter" in k["sql"]][0]
     assert "kind = 'codar'" in tsql and "ORDER BY tx_id" in tsql
 
@@ -495,6 +495,55 @@ def test_solve_write_db_inserts_solutions_and_tolerates_an_empty_attribution_tab
     assert all(r["tx_id"] == "" and r["solver_version"] == "groundwave-3" for r in _sols(c))
 
 
+class _NoAttrTableUntilEnsured(QueryClient):
+    """Reading sigmondb.attribution raises, as ClickHouse does for a missing table, until a
+    CREATE TABLE for it arrives."""
+    made = False
+
+    def query(self, sql, parameters=None, **kw):
+        if ".attribution" in sql and not self.made:
+            raise RuntimeError("UNKNOWN_TABLE sigmondb.attribution")
+        return super().query(sql, parameters, **kw)
+
+    def command(self, sql):
+        super().command(sql)
+        if "CREATE TABLE IF NOT EXISTS sigmondb.attribution" in sql:
+            self.made = True
+
+
+def test_solve_from_db_survives_a_server_with_no_attribution_table_yet(monkeypatch):
+    c = _NoAttrTableUntilEnsured({"arrival": _gw_arrivals(rid="UACNJ", centre_ns=HOOK_D_NS),
+                                  "receiver": GW_RX})
+    monkeypatch.setattr(cli, "connect", lambda conf: c)
+    assert cli.main(["solve", "--from-db", "--write-db"]) == 0
+    assert c.made and any(t == "sigmondb.solution" for t, _ in c.inserted)
+
+
+def test_attribute_ensures_the_schema_even_when_it_finds_no_arrivals(monkeypatch):
+    c = _db(monkeypatch, {})
+    assert cli.main(["attribute"]) == 0
+    assert any("CREATE TABLE IF NOT EXISTS sigmondb.attribution" in s for s in c.commands)
+
+
+def test_the_attribution_table_keeps_30_days_and_solution_is_untouched():
+    assert ddl.TABLES["attribution"].endswith("TTL run_at + INTERVAL 30 DAY")
+    assert "TTL" not in ddl.TABLES["solution"]
+    assert "MODIFY TTL run_at + INTERVAL 30 DAY" in " ".join(ddl.MIGRATIONS)   # an existing table
+    sql = open(os.path.join(os.path.dirname(__file__), "..", "schema", "sigmondb.sql")).read()
+    att = sql.split("CREATE TABLE IF NOT EXISTS sigmondb.attribution")[1].split(";")[0]
+    assert "TTL run_at + INTERVAL 30 DAY" in att
+
+
+def test_intervals_are_whole_hours_never_float(monkeypatch):
+    assert cli._hours(30) == 720 and cli._hours(0.5) == 12 and cli._hours(1 / 24 * 1.4) == 1
+
+
+def test_attribute_prints_the_duplicate_line_only_when_something_dropped(capsys):
+    c = QueryClient({"arrival": [], "transmitter": [], "waveform": [], "receiver": []})
+    cli._attribution_inputs(c, 1)
+    assert "duplicate carried" not in capsys.readouterr().out
+
+
 def test_solve_needs_out_or_write_db():
     with pytest.raises(SystemExit):
         cli.main(["solve", "--from-db"])
@@ -518,7 +567,7 @@ def test_solve_from_db_attaches_a_default_name_and_reads_the_latest_run(monkeypa
     acall = [k for k in c.calls if ".attribution" in k["sql"]][0]
     assert acall["parameters"] == {"max_age_h": 3}
     arr_call = [k for k in c.calls if ".arrival" in k["sql"]][0]
-    assert arr_call["parameters"] == {"days": 7.0}
+    assert arr_call["parameters"] == {"hours": 168}
 
 
 def test_solve_from_db_never_attaches_a_gw900_fit(monkeypatch, capsys):

@@ -32,4 +32,5 @@ def test_new_units_match_the_brief():
         assert s["ExecStart"].startswith("/opt/wsprdaemon-server/venv/bin/python -m sigmondb ")
         assert s["TimeoutStartSec"] == tmo and s["NoNewPrivileges"] == "true"
         assert s["SyslogIdentifier"] == n
+        assert s["Nice"] == "10" and s["IOSchedulingClass"] == "idle"     # gentle on wd30
         assert "clickhouse-server.service" in u["Unit"]["After"]

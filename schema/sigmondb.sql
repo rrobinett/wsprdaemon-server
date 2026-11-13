@@ -207,7 +207,8 @@ CREATE TABLE IF NOT EXISTS sigmondb.attribution
 )
 ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMM(run_at)
-ORDER BY (group_key, mode_policy, tx_id, run_id);
+ORDER BY (group_key, mode_policy, tx_id, run_id)
+TTL run_at + INTERVAL 30 DAY;
 
 CREATE TABLE IF NOT EXISTS sigmondb.path
 (
@@ -251,3 +252,5 @@ ALTER TABLE sigmondb.capture ADD COLUMN IF NOT EXISTS received_at Nullable(DateT
 ALTER TABLE sigmondb.arrival ADD COLUMN IF NOT EXISTS received_at Nullable(DateTime) CODEC(ZSTD(3)) AFTER engineering;
 
 ALTER TABLE sigmondb.arrival ADD COLUMN IF NOT EXISTS freq_hz Nullable(Float64) CODEC(ZSTD(3)) AFTER delay_sigma_ns;
+
+ALTER TABLE sigmondb.attribution MODIFY TTL run_at + INTERVAL 30 DAY;

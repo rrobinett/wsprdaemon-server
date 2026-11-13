@@ -69,6 +69,7 @@ IMAGE_TOL_MS = 0.4
 COASTAL = frozenset({"KFS-OMNI", "WB6CXC/7", "UACNJ"})   # paths run mostly over sea
 P_NULL_MAX = 0.05           # a name stands only when fakes match this well in at most 5 % of draws
 P_UPPER_CONF = 0.95         # confidence of the one-sided upper bound that a two-station name must clear
+N_FAKE_MIN = 59              # fewest eligible fakes whose 0 hits bound p under 0.05 at 95 %
 N_FAKE = 400                # fake sites per group, at least 100 km from every candidate
 ATTRIB_VERSION = "attribute-1"
 
@@ -588,6 +589,8 @@ def attribute_group(g, rxpos, policy, n_fake, seed):
         nf = null_flag(n, hits, len(fbest))
         if nf:
             flags.append(nf)
+        if len(fbest) < N_FAKE_MIN:
+            flags.append(f"null test too thin ({len(fbest)} eligible fakes)")
         status = "ambiguous" if flags else ("named" if n >= 3 else "named_two_stations")
         gmodes = [m for m in mem if m[2] == "G"]
         if gmodes:
@@ -741,7 +744,8 @@ def apply_attribution(clusters, attributions, match_tol_ns=50_000, now=None,
     """Attach names from sigmondb.attribution rows to groundwave.fixed_clusters, in place.
 
     A cluster (one reporter, one group) takes tx_ids = [tx] when every row that matches it
-    names the one tx and lists no co-sited alias.  A row matches when its mode_policy is
+    names the one tx and lists no co-sited alias.  The matched member must carry mode "G" (a name earned by a skywave
+    fit says nothing of the ground-wave delay).  A row matches when its mode_policy is
     "default", its status is in NAMED_STATUSES, its p_null is not None and <= P_NULL_MAX (a fit
     with no null test never names), its run_at lies within max_age_h of now (naive UTC; a row
     with no run_at never names), its group_key equals the cluster's, and one of
@@ -768,16 +772,25 @@ def apply_attribution(clusters, attributions, match_tol_ns=50_000, now=None,
         if len(c["reporter_ids"]) != 1:
             continue
         rid = c["reporter_ids"][0]
-        hits = []
+        hits, sky = [], []
         for r in rows:
             if r.get("group_key") != c["group_key"]:
                 continue
             P = r.get("period_ns") or 0
-            if any(st == rid and _period_gap(d, c["fixed_delay_ns"], P) <= match_tol_ns
-                   for st, d in zip(r.get("reporter_ids") or [], r.get("cluster_delays_ns") or [])):
-                hits.append(r)
+            ms = list(r.get("modes") or [])
+            for i, (st, d) in enumerate(zip(r.get("reporter_ids") or [],
+                                            r.get("cluster_delays_ns") or [])):
+                if st == rid and _period_gap(d, c["fixed_delay_ns"], P) <= match_tol_ns:
+                    mode = ms[i] if i < len(ms) else ""
+                    (hits if mode == "G" else sky).append((r, mode))
+                    break
         if not hits:
+            if sky:
+                reasons[c["cluster_key"]] = (
+                    "named by a skywave fit (%s); the ground-wave solver declines"
+                    % ", ".join(sorted({m or "no mode" for _, m in sky})))
             continue
+        hits = [r for r, _ in hits]
         names = sorted({r["tx_id"] for r in hits})
         aliases = sorted({a for r in hits for a in (r.get("alias_tx_ids") or [])})
         own = [t for t in c.get("tx_ids", []) if t]

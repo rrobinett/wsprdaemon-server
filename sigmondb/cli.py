@@ -250,6 +250,11 @@ def _carried(arr, rx, latest_detector=True):
     return _one_per_capture(arr)
 
 
+def _hours(days):
+    """A day count as whole hours, for an integer INTERVAL."""
+    return int(round(float(days) * 24))
+
+
 def _from_db(a, client=None):
     """(arrivals, transmitters, receivers) from the registry, every table read FINAL so a
     re-ingested row counts once.  Arrivals: anchored only, within --days; by default the
@@ -261,8 +266,8 @@ def _from_db(a, client=None):
         return _fetch(client, table, ddl.COLUMNS[table], where, params)
 
     where = ("WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000 "
-             "AND time > now() - INTERVAL {days:Float64} DAY")
-    params = {"days": float(a.days)}
+             "AND time > now() - INTERVAL {hours:UInt32} HOUR")
+    params = {"hours": _hours(a.days)}
     if a.detector_version:
         arr = fetch("arrival", where + " AND detector_version = {dv:String}",
                     dict(params, dv=a.detector_version))
@@ -279,7 +284,7 @@ def _from_db(a, client=None):
 _ATTR_ARRIVAL_COLS = ("time", "reporter_id", "group_key", "delay_ns", "level_db",
                       "detector_version", "engineering")
 _ATTR_WHERE = ("WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000 AND clean_tag = 'A' "
-               "AND rate_hz_per_s != 0 AND time > now() - INTERVAL {days:Float64} DAY")
+               "AND rate_hz_per_s != 0 AND time > now() - INTERVAL {hours:UInt32} HOUR")
 
 
 def _attribution_inputs(client, days):
@@ -292,7 +297,7 @@ def _attribution_inputs(client, days):
     break the same way every run.
     rxpos: reporter_id -> (lat, lon, pos_source) from the latest receiver row with a position;
     coherence: reporter_id -> coherence_group for the same rows."""
-    arr = _fetch(client, "arrival", _ATTR_ARRIVAL_COLS, _ATTR_WHERE, {"days": float(days)})
+    arr = _fetch(client, "arrival", _ATTR_ARRIVAL_COLS, _ATTR_WHERE, {"hours": _hours(days)})
     for r in arr:
         eng = r.get("engineering") or {}
         r["live"] = "sweep_repetition_hz" in eng
@@ -327,7 +332,8 @@ def _attribution_inputs(client, days):
     rxpos = {r["reporter_id"]: (r["lat"], r["lon"], r.get("pos_source") or "") for r in placed}
     coherence = {r["reporter_id"]: r.get("coherence_group") or "" for r in placed}
     arr, dropped = _carried(arr, rx)
-    print("attribute: %d duplicate carried arrivals dropped" % dropped)
+    if dropped:
+        print("attribute: %d duplicate carried arrivals dropped" % dropped)
     return arr, sites, rxpos, coherence
 
 
@@ -353,6 +359,8 @@ def cmd_attribute(a):
     a database error propagates, so systemd records a failure."""
     from sigmondb import attribution as at
     client = connect(a.conf)
+    if not a.out:                       # --out leaves the database alone; so does reading
+        ddl.ensure_schema(client)
     arr, sites, rxpos, coherence = _attribution_inputs(client, a.days)
     if not arr:
         print("attribute: no arrivals in the last %g days; nothing written" % a.days)
@@ -377,7 +385,6 @@ def cmd_attribute(a):
     if a.out:
         print("attribution: %d rows to %s" % (write_rows(a.out, rows), a.out))
         return 0
-    ddl.ensure_schema(client)
     print("attribution: %d rows" % insert_rows(client, "attribution", rows))
     return 0
 
@@ -434,6 +441,7 @@ def cmd_solve(a):
     client = None
     if a.from_db:
         client = connect(a.conf)
+        ddl.ensure_schema(client)
         arr, tx, rx = _from_db(a, client)
         attrs = [] if a.no_attribution else _latest_attributions(client)
     else:

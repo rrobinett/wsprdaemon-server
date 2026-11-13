@@ -553,11 +553,12 @@ def _gw_arrivals(rid="UACNJ", centre_ns=HOOK_D_NS, seed=1):
     return _gw_base(centre_ns, seed=seed, reporter_id=rid)
 
 
-def _attr(tx, status, rid, d_ns, run_at=None, p_null=0.01):
-    """One attribution row; run_at defaults to now (naive UTC), so it passes the age rule."""
+def _attr(tx, status, rid, d_ns, run_at=None, p_null=0.01, mode="G"):
+    """One attribution row; run_at defaults to now (naive UTC), so it passes the age rule.
+    The one member is a ground-wave fit ("G") unless mode says otherwise."""
     return dict(tx_id=tx, status=status, mode_policy="default", group_key="4.4630 -25.73",
                 period_ns=1_000_000_000, alias_tx_ids=[], reporter_ids=[rid],
-                cluster_delays_ns=[d_ns], p_null=p_null,
+                cluster_delays_ns=[d_ns], modes=[mode], p_null=p_null,
                 run_at=run_at or _dt.now(_tz.utc).replace(tzinfo=None))
 
 
@@ -666,6 +667,65 @@ def test_a_fit_without_a_passing_null_test_never_names():
     apply_attribution(cl, [_attr("hfrnet:HOOK", "named_two_stations", "UACNJ", HOOK_D_NS,
                                  p_null=0.05)])
     assert cl[0]["tx_ids"] == ["hfrnet:HOOK"]
+
+
+def test_a_skywave_earned_name_never_becomes_a_ground_wave_offset():
+    for mode in ("1F", "2F", ""):
+        cl = fixed_clusters(_gw_arrivals(), RX_ROWS)
+        r = apply_attribution(cl, [_attr("hfrnet:HOOK", "named_two_stations", "UACNJ",
+                                         HOOK_D_NS, mode=mode)])
+        assert cl[0]["tx_ids"] == [""], mode
+        assert "named by a skywave fit (%s); the ground-wave solver declines" % (mode or "no mode") \
+            in r[cl[0]["cluster_key"]]
+    # a row from before modes were stored carries none: it declines too
+    cl = fixed_clusters(_gw_arrivals(), RX_ROWS)
+    row = _attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS)
+    del row["modes"]
+    apply_attribution(cl, [row])
+    assert cl[0]["tx_ids"] == [""]
+    # the same row with G at that reporter attaches
+    cl = fixed_clusters(_gw_arrivals(), RX_ROWS)
+    assert apply_attribution(cl, [_attr("hfrnet:HOOK", "named_two_stations", "UACNJ",
+                                        HOOK_D_NS, mode="G")]) == {}
+    assert cl[0]["tx_ids"] == ["hfrnet:HOOK"]
+
+
+def test_the_mode_checked_is_the_matched_reporters_not_another_members():
+    row = _attr("hfrnet:HOOK", "named_two_stations", "UACNJ", HOOK_D_NS)
+    row.update(reporter_ids=["K3LR/D", "UACNJ"], cluster_delays_ns=[5, HOOK_D_NS],
+               modes=["G", "1F"])
+    cl = fixed_clusters(_gw_arrivals(), RX_ROWS)
+    apply_attribution(cl, [row])
+    assert cl[0]["tx_ids"] == [""]
+    row.update(modes=["1F", "G"])
+    cl = fixed_clusters(_gw_arrivals(), RX_ROWS)
+    apply_attribution(cl, [row])
+    assert cl[0]["tx_ids"] == ["hfrnet:HOOK"]
+
+
+def _assa3_with_k_eligible_fakes(monkeypatch, k):
+    """The three-station ASSA fit, its null test fed exactly k eligible fakes, none matching."""
+    from sigmondb import attribution as at
+    fake = (0.0, 0.0)
+    real_entries = at.entries
+    monkeypatch.setattr(at, "fake_sites", lambda *a, **kw: [fake] * k)
+    monkeypatch.setattr(at, "entries", lambda site, *a, **kw: (
+        [("K3LR/D", 0, "G", 0.0, 0.1, 100.0), ("W2NAF", 0, "G", 400.0, 0.1, 100.0)]
+        if site == fake else real_entries(site, *a, **kw)))
+    hits = _holding(_run("hfrnet:ASSA", "G", 0, ["K3LR/D", "W2NAF", "UACNJ"], GW900), INJ)
+    return next(nm for nm in hits if nm["site"]["id"] == "hfrnet:ASSA")
+
+
+def test_a_null_test_with_too_few_eligible_fakes_never_stores_named(monkeypatch):
+    from sigmondb.attribution import N_FAKE_MIN
+    assert N_FAKE_MIN == 59
+    assert null_upper_bound(0, 58) > P_NULL_MAX >= null_upper_bound(0, 59)
+    for k in (0, 58):
+        nm = _assa3_with_k_eligible_fakes(monkeypatch, k)
+        assert nm["n"] == 3 and nm["status"] == "ambiguous", k
+        assert "null test too thin (%d eligible fakes)" % k in nm["flags"], k
+    nm = _assa3_with_k_eligible_fakes(monkeypatch, 59)
+    assert nm["status"] == "named" and nm["flags"] == []
 
 
 # ---------------------------------------------------------------- ruling A10: the two-station bound
