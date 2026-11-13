@@ -46,7 +46,10 @@ Choices, stated once:
   match.  A name only stands when real sites beat the fakes.
 """
 import math
+import random
 import statistics
+import zlib
+from collections import defaultdict
 from dataclasses import dataclass
 
 C_KM_S = 299_792.458
@@ -61,6 +64,8 @@ CO_SITE_KM = 50.0           # receivers closer than this count as one station
 RUNG_TOL_MS = 0.15
 IMAGE_TOL_MS = 0.4
 COASTAL = frozenset({"KFS-OMNI", "WB6CXC/7", "UACNJ"})   # paths run mostly over sea
+P_NULL_MAX = 0.05           # a name stands only when fakes match this well in at most 5 % of draws
+N_FAKE = 400                # fake sites per group, at least 100 km from every candidate
 
 
 @dataclass(frozen=True)
@@ -341,3 +346,238 @@ def analyse_group(gk, rows_by_st, sites, rxpos, eng_period, coherence=None, site
         g["stations"][st] = cl
         g["caps"][st] = caps
     return g
+
+
+# ---------------------------------------------------------------- matching
+
+def _set_aside(c):
+    return c.get("rung") or c.get("image") or c.get("twin")
+
+
+def _gw_ok(rxpos, st):
+    """Ground wave needs the receiver at its GPSDO position; a typed grid can sit 4 km off."""
+    return rxpos[st][2] == "gpsdo"
+
+
+def entries(site_pos, st_clusters, rxpos, P, policy):
+    """Every (station, cluster index, mode, O, tol, d km) a site allows."""
+    out = []
+    for st, cl in st_clusters.items():
+        d = gc_km(site_pos, rxpos[st][:2])
+        for j, c in enumerate(cl):
+            if _set_aside(c):
+                continue
+            for mname, p, tol in modes(d, st, policy, c["mad_us"] <= TIGHT_US,
+                                       gw_ok=_gw_ok(rxpos, st)):
+                out.append((st, j, mname, (c["D"] - p) % P, tol, d))
+    return out
+
+
+def best_sets(ents, P, min_st=2):
+    """Tuples, one entry per station, whose O agree within each entry's tolerance.
+
+    Returns a list of (n_stations, spread_us, Obar, members) sorted best first, keeping for each
+    set of clusters its tightest tuple."""
+    by_st = defaultdict(list)
+    for e in ents:
+        by_st[e[0]].append(e)
+    sts = sorted(by_st)
+    found = {}
+    for a in ents:
+        members = [a]
+        for st in sts:
+            if st == a[0]:
+                continue
+            cands = [e for e in by_st[st] if abs(cdiff(e[3], a[3], P)) <= e[4] + a[4]]
+            if cands:
+                members.append(min(cands, key=lambda e: abs(cdiff(e[3], a[3], P)) / e[4]))
+        if len(members) < min_st:
+            continue
+        # refine: weighted mean, then drop members outside their own tolerance
+        for _ in range(2):
+            w = [1 / m[4] ** 2 for m in members]
+            ob = (a[3] + sum(wi * cdiff(m[3], a[3], P) for wi, m in zip(w, members)) / sum(w)) % P
+            keep = [m for m in members if abs(cdiff(m[3], ob, P)) <= m[4]]
+            if len(keep) == len(members):
+                break
+            members = keep
+        if len(members) < min_st:
+            continue
+        os_ = [cdiff(m[3], ob, P) for m in members]
+        spread = (max(os_) - min(os_)) * 1e3
+        key = tuple(sorted((m[0], m[1]) for m in members))
+        if key not in found or spread < found[key][1]:
+            found[key] = (len(members), spread, ob, sorted(members))
+    return sorted(found.values(), key=lambda s: (-s[0], s[1]))
+
+
+def tuple_fit(site_pos, tup, st_clusters, rxpos, P, policy):
+    """Best agreement a site gives for a fixed tuple of (station, cluster).
+
+    Returns (spread us, Obar, all within tolerance, modes), or None when the site allows no
+    mode at some station."""
+    choices = []
+    for st, j in tup:
+        d = gc_km(site_pos, rxpos[st][:2])
+        c = st_clusters[st][j]
+        choices.append([(st, j, m, (c["D"] - p) % P, tol)
+                        for m, p, tol in modes(d, st, policy, c["mad_us"] <= TIGHT_US,
+                                               gw_ok=_gw_ok(rxpos, st))])
+    best = None
+
+    def rec(i, picked):
+        nonlocal best
+        if i == len(choices):
+            w = [1 / m[4] ** 2 for m in picked]
+            a = picked[0][3]
+            ob = (a + sum(wi * cdiff(m[3], a, P) for wi, m in zip(w, picked)) / sum(w)) % P
+            os_ = [cdiff(m[3], ob, P) for m in picked]
+            ok = all(abs(o) <= m[4] for o, m in zip(os_, picked))
+            spread = (max(os_) - min(os_)) * 1e3
+            if best is None or (ok, -spread) > (best[2], -best[0]):
+                best = (spread, ob, ok, [m[2] for m in picked])
+            return
+        for c in choices[i]:
+            rec(i + 1, picked + [c])
+    rec(0, [])
+    return best
+
+
+def fake_sites(cands, n, seed, avoid_km=100.0, avoid_from=None):
+    """n random positions in the candidates' extent +- 5 degrees, each at least avoid_km from
+    every site in avoid_from (default: the candidates)."""
+    avoid_from = avoid_from or cands
+    rnd = random.Random(seed)
+    la = [s["lat"] for s in cands]
+    lo = [s["lon"] for s in cands]
+    box = (min(la) - 5, max(la) + 5, min(lo) - 5, max(lo) + 5)
+    out = []
+    tries = 0
+    while len(out) < n and tries < n * 50:
+        tries += 1
+        p = (rnd.uniform(box[0], box[1]), rnd.uniform(box[2], box[3]))
+        if all(gc_km(p, (s["lat"], s["lon"])) >= avoid_km for s in avoid_from):
+            out.append(p)
+    return out
+
+
+# ---------------------------------------------------------------- attribution
+
+_ORDER = {"named": 0, "named_two_stations": 1, "ambiguous": 2}
+
+
+def attribute_group(g, rxpos, policy, n_fake, seed):
+    """Fit every candidate site to the group's clusters and judge each fit.
+
+    Fills g["named"] (one entry per site that took a tuple, best first) and g["verdict"] (None,
+    or why no fit can be tried).  A fit gets a name only when no rival site fits the same
+    clusters within tolerance and fake sites match as well in at most P_NULL_MAX of draws;
+    otherwise it reads ambiguous."""
+    g["policy"] = policy.name
+    sts = {s: c for s, c in g["stations"].items() if any(not _set_aside(x) for x in c)}
+    P = g["P"]
+    g["named"] = []
+    if not g["cands"]:
+        g["verdict"] = "no HFRNet site matches this centre and rate"
+        return
+    if len(sts) < 2:
+        g["verdict"] = (f"only {len(sts)} T6 station(s) with usable clusters: cross-station "
+                        "consistency cannot name a radar")
+        return
+
+    def eligible(ents):                         # a site some mode links to two or more stations
+        return len({e[0] for e in ents}) >= 2
+
+    allsets = []
+    for s in g["cands"]:
+        for n, spread, ob, mem in best_sets(entries((s["lat"], s["lon"]), sts, rxpos, P, policy), P):
+            allsets.append((n, spread, ob, mem, s))
+    allsets.sort(key=lambda x: (-x[0], x[1]))
+    # null: fake sites scattered where the real candidates that yield tuples lie
+    live_c = [s for s in g["cands"] if any(x[4] is s for x in allsets)] or g["cands"]
+    fakes = fake_sites(live_c, n_fake, seed, avoid_from=g["cands"]) if n_fake else []
+    fbest = []
+    for p in fakes:
+        ents = entries(p, sts, rxpos, P, policy)
+        if eligible(ents):                      # fakes no mode can link cannot test anything
+            fbest.append(best_sets(ents, P))
+    g["n_fake"] = len(fbest)
+
+    def p_null(n, spread):
+        if not fbest:
+            return float("nan")
+        hit = sum(1 for bs in fbest if any(x[0] >= n and x[1] <= spread for x in bs))
+        return hit / len(fbest)
+
+    used, named = set(), {}
+    for n, spread, ob, mem, s in allsets:
+        if s["id"] in named or any((m[0], m[1]) in used for m in mem):
+            continue
+        tup = tuple((m[0], m[1]) for m in mem)
+        # runner-up: the best other site for the same clusters
+        rivals, alias = [], []
+        for o in g["cands"]:
+            if o is s:
+                continue
+            if gc_km((s["lat"], s["lon"]), (o["lat"], o["lon"])) < SAME_SITE_KM:
+                alias.append(o["id"])
+                continue
+            f = tuple_fit((o["lat"], o["lon"]), tup, sts, rxpos, P, policy)
+            if f is None:                     # the rival allows no mode at some station
+                f = (float("inf"), None, False, [])
+            rivals.append((not f[2], f[0], o, f))
+        rivals.sort(key=lambda r: (r[0], r[1]))
+        ru = rivals[0] if rivals else None
+        # A spread finer than the model's own tolerance proves nothing more than a fit within it,
+        # so fakes count as equally good down to the tuple's mean tolerance.
+        floor = statistics.mean(m[4] for m in mem) * 1e3
+        pn = p_null(n, max(spread, floor))
+        flags = []
+        if ru and not ru[0]:
+            flags.append(f"runner-up {ru[2]['id']} also fits ({ru[1]:.0f} us)")
+        if pn == pn and pn > P_NULL_MAX:
+            flags.append(f"fake sites match as well in {pn:.0%} of draws")
+        status = "ambiguous" if flags else ("named" if n >= 3 else "named_two_stations")
+        gmodes = [m for m in mem if m[2] == "G"]
+        if gmodes:
+            w = [1 / m[4] ** 2 for m in gmodes]
+            a = gmodes[0][3]
+            o_g = (a + sum(wi * cdiff(m[3], a, P) for wi, m in zip(w, gmodes)) / sum(w)) % P
+        else:
+            o_g = None
+        named[s["id"]] = {"site": s, "alias": alias, "n": n, "spread": spread, "O": ob,
+                          "O_ground": o_g, "mem": mem, "runner": ru, "p_null": pn,
+                          "flags": flags, "status": status}
+        used |= {(m[0], m[1]) for m in mem}
+    g["named"] = sorted(named.values(), key=lambda x: (_ORDER[x["status"]], -x["n"], x["spread"]))
+    g["sets_total"] = len(allsets)
+    g["verdict"] = None
+
+
+def run_attribution(arrivals, sites, rxpos, policy, n_fake=N_FAKE, coherence=None):
+    """Run one path policy over every sweep group in the arrivals.
+
+    arrivals: dicts with time, reporter_id, group_key, delay_ns, level_db, live (and, when
+    known, sweep_repetition_hz).  sites: dicts with id, lat, lon, freq, rate, period.  rxpos:
+    reporter -> (lat, lon, pos_source).  The site representative of each reporter comes from
+    one site_map over every group, so all groups (and flag_images across them) count the same
+    reporter.  Groups at or above policy.max_centre_hz are skipped.  The fake-site seed is the
+    group key's CRC-32, so hourly runs on the same data agree.  Returns the groups, sorted by key."""
+    by = defaultdict(lambda: defaultdict(list))
+    eng = {}
+    for a in arrivals:
+        gk = a["group_key"]
+        by[gk][a["reporter_id"]].append((int(a["time"]), a["delay_ns"] / 1e6,
+                                         float(a["level_db"]), bool(a["live"])))
+        sr = a.get("sweep_repetition_hz")
+        if sr:
+            eng[gk] = float(sr)
+    site_of = site_map(by, rxpos, coherence)
+    keys = [gk for gk in sorted(by)
+            if policy.max_centre_hz is None or parse_key(gk)[0] < policy.max_centre_hz]
+    groups = [analyse_group(gk, by[gk], sites, rxpos, eng.get(gk), coherence, site_of)
+              for gk in keys]
+    flag_images(groups)
+    for g in groups:
+        attribute_group(g, rxpos, policy, n_fake, zlib.crc32(g["key"].encode()))
+    return groups

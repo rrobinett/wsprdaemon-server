@@ -3,17 +3,24 @@
 No ClickHouse.  Every position here is synthetic or a typed-grid centre; no operator's home
 position enters the repo.
 """
+import json
 import os
 import random
 import sys
+from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sigmondb.attribution import (  # noqa: E402
-    DEFAULT, GW900, analyse_group, collapse_colocated, flag_images, flag_rungs, flag_twins, gc_km,
-    modes, parse_key, rung_spacing_ms, site_map, sky_km)
+    C_KM_S, DEFAULT, GW900, GW_TOL_MS, N_FAKE, P_NULL_MAX, Policy, analyse_group, attribute_group,
+    candidates_for, cdiff, collapse_colocated, entries, fake_sites, flag_images, flag_rungs,
+    flag_twins, gc_km, modes, parse_key, run_attribution, rung_spacing_ms, site_map, sky_km,
+    tuple_fit)
+from sigmondb.receivers import grid_to_latlon  # noqa: E402
+
+FX = Path(__file__).parent / "fixtures" / "sigmondb"
 
 # Hand-made sites: one per sweep group the tests use.  Positions are synthetic.
 SITES = [
@@ -191,3 +198,222 @@ def test_study_kfs_clusters_get_the_study_flags():
     assert [c["flags"] for c in cl] == [f for *_, f in STUDY_KFS]
     assert sum(1 for c in cl if c.get("rung")) == 8
     assert sum(1 for c in cl if c.get("twin")) == 4
+
+
+# ---------------------------------------------------------------- the driver
+
+def _arrivals(rows_by_group):
+    """Arrival dicts from {group: {reporter: [(t, d_ms, level, live)]}}."""
+    return [{"time": t, "reporter_id": st, "group_key": gk, "delay_ns": int(round(d * 1e6)),
+             "level_db": lv, "live": live}
+            for gk, by_st in rows_by_group.items() for st, rows in by_st.items()
+            for t, d, lv, live in rows]
+
+
+def test_run_attribution_chooses_sites_once_so_the_cross_group_image_is_flagged():
+    # The shape of _image_groups, through the top-level driver.  Per-group site choice would
+    # keep B in the 13.5000 group and miss the image silently.
+    rx = {"A": (37.0, -122.0, "gpsdo"), "B": (37.01, -122.0, "gpsdo")}
+    shift = -(13.4750e6 - 13.5000e6) / -99_260.0 * 1e3
+    d2 = (100.0 + shift) % 500.0
+    by_group = {"13.4750 -99.26 0.5s": {"A": _cluster_rows(100.0, 4, 200, True, 25.0),
+                                        "B": _cluster_rows(100.0, 4, 100, True, 25.0)},
+                "13.5000 -99.26 0.5s": {"A": _cluster_rows(d2, 4, 50, True, 15.0),
+                                        "B": _cluster_rows(d2, 4, 80, True, 15.0)}}
+    gs = {g["key"]: g for g in run_attribution(_arrivals(by_group), [], rx, DEFAULT, n_fake=0,
+                                               coherence={"A": "s", "B": "s"})}
+    g2 = gs["13.5000 -99.26 0.5s"]
+    assert list(g2["stations"]) == ["A"]
+    assert [c.get("image", False) for c in g2["stations"]["A"]] == [True]
+    assert any(v.startswith("image of 13.4750") for v in g2["set_aside"].values())
+
+
+def test_run_attribution_skips_groups_above_the_policy_centre():
+    by_group = {"13.4750 -99.26 0.5s": {"A": _cluster_rows(100.0, 4, 20)},
+                "4.4630 -25.73": {"A": _cluster_rows(100.0, 4, 20)}}
+    rx = {"A": (37.0, -122.0, "gpsdo")}
+    assert [g["key"] for g in run_attribution(_arrivals(by_group), [], rx, GW900, n_fake=0)] \
+        == ["4.4630 -25.73"]
+    gs = run_attribution(_arrivals(by_group), [], rx, DEFAULT, n_fake=0)
+    assert sorted(g["key"] for g in gs) == ["13.4750 -99.26 0.5s", "4.4630 -25.73"]
+    assert all(g["policy"] == "default" for g in gs)
+
+
+def test_typed_grid_receiver_never_gets_ground_wave_in_a_fit():
+    # Site 50 km from both receivers, tight clusters: G would apply at a GPSDO position only.
+    site = (40.0, -74.0)
+    rx = {"GPS": (40.0, -74.6, "gpsdo"), "GRID": (40.45, -74.0, "typed_grid")}
+    cl = {st: [{"D": 100.0 + gc_km(site, rx[st][:2]) / C_KM_S * 1e3, "mad_us": 5.0, "n": 50,
+                "level": 20.0, "flags": []}] for st in rx}
+    ents = entries(site, cl, rx, 1000.0, DEFAULT)
+    assert {e[2] for e in ents if e[0] == "GPS"} == {"G", "1F"}
+    assert {e[2] for e in ents if e[0] == "GRID"} == {"1F"}
+    fit = tuple_fit(site, (("GPS", 0), ("GRID", 0)), cl, rx, 1000.0, DEFAULT)
+    assert fit[3][1] == "1F"
+    # Under the ground-wave-only pass, the typed grid allows no mode at all.
+    assert not [e for e in entries(site, cl, rx, 1000.0, GW900) if e[0] == "GRID"]
+    assert tuple_fit(site, (("GPS", 0), ("GRID", 0)), cl, rx, 1000.0, GW900) is None
+
+
+def test_fake_sites_keep_their_distance_and_repeat_for_a_seed():
+    cands = [{"lat": 40.0, "lon": -74.0}, {"lat": 38.0, "lon": -75.0}]
+    a = fake_sites(cands, 50, 7)
+    assert a == fake_sites(cands, 50, 7) and len(a) == 50
+    assert all(gc_km(p, (c["lat"], c["lon"])) >= 100.0 for p in a for c in cands)
+    assert all(33.0 <= p[0] <= 45.0 and -80.0 <= p[1] <= -69.0 for p in a)
+
+
+def test_one_station_gets_a_verdict_not_a_name():
+    g = analyse_group("4.4630 -25.73", {"K3LR/D": _cluster_rows(40.0, 10, 50)}, SITES,
+                      RX, None)
+    attribute_group(g, RX, DEFAULT, 0, 1)
+    assert g["named"] == [] and g["verdict"].startswith("only 1 T6 station")
+
+
+# ---------------------------------------------------------------- the study's mutation cases
+
+def _sites_4463():
+    return [json.loads(l) for l in (FX / "attr_sites_4463.jsonl").read_text().splitlines() if l]
+
+
+# Receivers at their typed-grid centres (sigmondb/seed/receivers.toml), labelled gpsdo here so
+# ground wave applies.  The synthetic radar uses the same positions: self-consistent.
+RXPOS = {st: (*grid_to_latlon(gr), "gpsdo") for st, gr in
+         (("AC0G/ND", "EN16ov"), ("K3LR/D", "EN91se"), ("W2NAF", "FN21ei"), ("UACNJ", "FN20mv"))}
+
+# attribution-result.md, "Group 4.4630 -25.73": (reporter, D ms, p10-90 us, captures, level dB).
+# Each row also carries the table's level: with one shared level, flag_twins and flag_rungs
+# would judge other pairs than the study did; with it, the background gets the study's flags.
+BACKGROUND_4463 = [
+    ("AC0G/ND", 534.644, 217, 20, 24.2), ("AC0G/ND", 535.797, 242, 25, 24.4),
+    ("AC0G/ND", 542.204, 176, 37, 25.2), ("AC0G/ND", 542.686, 197, 14, 23.9),
+    ("AC0G/ND", 545.300, 88, 24, 26.5), ("AC0G/ND", 10.366, 688, 52, 25.8),
+    ("AC0G/ND", 17.613, 70, 21, 27.8), ("AC0G/ND", 21.549, 310, 33, 26.9),
+    ("AC0G/ND", 22.250, 238, 36, 25.7), ("AC0G/ND", 26.340, 76, 14, 25.6),
+    ("AC0G/ND", 27.080, 139, 15, 26.3), ("AC0G/ND", 30.773, 140, 22, 25.2),
+    ("AC0G/ND", 39.429, 800, 43, 25.5), ("AC0G/ND", 51.892, 875, 34, 20.8),
+    ("AC0G/ND", 56.303, 162, 18, 27.0), ("AC0G/ND", 56.986, 279, 16, 24.6),
+    ("K3LR/D", 5.549, 442, 110, 41.5), ("K3LR/D", 9.173, 437, 35, 37.8),
+    ("K3LR/D", 13.127, 732, 123, 36.5), ("K3LR/D", 16.706, 41, 64, 38.7),
+    ("K3LR/D", 17.311, 413, 121, 43.5), ("K3LR/D", 21.460, 39, 77, 40.0),
+    ("K3LR/D", 22.111, 408, 90, 41.6), ("K3LR/D", 25.161, 36, 69, 39.2),
+    ("K3LR/D", 25.734, 413, 80, 41.1), ("K3LR/D", 29.495, 41, 63, 35.6),
+    ("K3LR/D", 30.131, 387, 76, 40.0), ("K3LR/D", 33.886, 37, 83, 40.2),
+    ("K3LR/D", 34.519, 439, 125, 43.0), ("K3LR/D", 42.556, 33, 65, 38.1),
+    ("K3LR/D", 43.172, 413, 67, 39.2), ("K3LR/D", 46.852, 21, 71, 47.7),
+    ("K3LR/D", 47.583, 807, 111, 42.3), ("K3LR/D", 51.317, 37, 73, 37.4),
+    ("K3LR/D", 51.933, 437, 107, 41.1), ("K3LR/D", 61.316, 493, 44, 36.5),
+    ("W2NAF", 522.230, 150, 25, 34.4), ("W2NAF", 526.398, 168, 30, 35.8),
+    ("W2NAF", 3.753, 44, 56, 29.4), ("W2NAF", 4.413, 477, 95, 38.1),
+    ("W2NAF", 12.572, 32, 43, 32.8), ("W2NAF", 13.085, 279, 63, 37.0),
+    ("W2NAF", 15.496, 75, 29, 24.1), ("W2NAF", 16.207, 558, 88, 32.8),
+    ("W2NAF", 24.846, 114, 36, 26.8), ("W2NAF", 32.963, 84, 30, 25.7),
+    ("W2NAF", 33.667, 579, 86, 31.4), ("W2NAF", 41.898, 39, 51, 30.5),
+    ("W2NAF", 42.508, 589, 78, 32.5), ("W2NAF", 46.336, 27, 56, 40.2),
+    ("W2NAF", 46.849, 175, 50, 36.3), ("W2NAF", 50.939, 39, 52, 32.5),
+    ("W2NAF", 51.560, 417, 84, 38.1), ("W2NAF", 60.144, 452, 74, 33.6),
+]
+CAPTURES_4463 = {"AC0G/ND": 88, "K3LR/D": 201, "W2NAF": 141, "UACNJ": 4}
+GROUP = "4.4630 -25.73"
+INJ = {}
+
+
+def _background():
+    """One row per capture per cluster, evenly spread over D +- p10-90/2, then one stray row per
+    capture up to each station's total, at delays 100-500 ms apart from every cluster, where no
+    cluster forms.
+
+    Evenly, not randomly: a random draw can leave a gap over GAP_MS inside a sparse wide cluster
+    and split it.  The choice does not drive the results: five random backgrounds gave the same
+    statuses, with the two-station ASSA p at 0.076-0.085."""
+    rows = {}
+    for si, st in enumerate(sorted(CAPTURES_4463)):
+        t0 = 1_761_000_000 + si
+        mine = [b for b in BACKGROUND_4463 if b[0] == st]
+        out = []
+        for _, D, w_us, caps, lv in mine:
+            w = w_us / 1e3
+            out += [(t0 + 600 * i, (D - w / 2 + w * (i + 0.5) / caps) % 1000.0, lv, False)
+                    for i in range(caps)]
+        used = max((b[3] for b in mine), default=0)
+        pad = CAPTURES_4463[st] - used
+        out += [(t0 + 600 * (used + i), 100.0 + 400.0 * (i + 0.5) / pad, 10.0, False)
+                for i in range(pad)]
+        rows[st] = out
+    return rows
+
+
+def _run(site, mode, h_km, stations, policy):
+    """Background plus a synthetic radar, as tasks/t3-augment-study/attribute_mutation.py."""
+    sites = _sites_4463()
+    s = next(x for x in sites if x["id"] == site)
+    rows = _background()
+    rnd = random.Random(1)
+    INJ.clear()
+    O = 300.0
+    for i, st in enumerate(stations):
+        d = gc_km((s["lat"], s["lon"]), RXPOS[st][:2])
+        p = d / C_KM_S * 1e3 if mode == "G" else sky_km(d, h_km, 1) / C_KM_S * 1e3
+        INJ[st] = (O + p) % 1000.0
+        for k in range(80):
+            dd = O + p + rnd.gauss(0, 0.01 if mode == "G" else 0.08)
+            rows[st].append((1_762_500_000 + 600 * k + 7 * i, int(dd * 1e6) / 1e6, 30.0, False))
+    return run_attribution(_arrivals({GROUP: rows}), sites, RXPOS, policy)
+
+
+def _holding(groups, injected):
+    """Results whose tuple uses an injected cluster.  Members at a station that got no
+    synthetic radar (ND in the ASSA cases) are skipped, not looked up: injected has no D there."""
+    g = next(g for g in groups if g["key"] == GROUP)
+    return [nm for nm in g["named"]
+            if any(abs(cdiff(g["stations"][m[0]][m[1]]["D"], injected[m[0]], g["P"])) < 0.2
+                   for m in nm["mem"] if m[0] in injected)]
+
+
+def test_background_reproduces_the_study_clusters():
+    g = analyse_group(GROUP, _background(), _sites_4463(), RXPOS, None)
+    assert len(g["cands"]) == 23
+    assert {st: len(cl) for st, cl in g["stations"].items()} == \
+        {"AC0G/ND": 16, "K3LR/D": 20, "W2NAF": 18, "UACNJ": 0}
+    flagged = {(st, round(c["D"], 3)) for st, cl in g["stations"].items() for c in cl if c["flags"]}
+    assert flagged == {("K3LR/D", 61.316), ("W2NAF", 32.963)}
+
+
+def test_mutation_assa_ground_wave_read_as_skywave_is_never_named():
+    hits = _holding(_run("hfrnet:ASSA", "G", 0, ["K3LR/D", "W2NAF"], DEFAULT), INJ)
+    assert hits and all(nm["status"] == "ambiguous" for nm in hits)
+
+
+# The two ground-wave ASSA cases below use repo-safe inputs: receivers at their typed-grid
+# centres and the CRC-32 seed.  The study used GPSDO positions and seed 1009; with those, this
+# port reproduces it (2 stations named at p 0.049, 3 stations p 0.000; task-4-report.md,
+# "Reproduction with the study's inputs").  The grid inputs move the 2-station p over the
+# threshold, so these tests state what the method gives for those inputs.
+
+def test_mutation_assa_two_ground_wave_stations_grid_positions_stays_ambiguous():
+    # Measured with grid positions: p 0.076 at the CRC-32 seed (17 of 223 eligible fakes);
+    # 0.054-0.122 over seeds 1000-1019.  No rival fits (CEDR's best is 157 us, outside
+    # tolerance), so only the fake-site guard keeps this from a name.  This is the test that
+    # fails when that guard is loosened (pn > 0.5).
+    hits = _holding(_run("hfrnet:ASSA", "G", 0, ["K3LR/D", "W2NAF"], GW900), INJ)
+    nm = next(nm for nm in hits if nm["site"]["id"] == "hfrnet:ASSA")
+    assert nm["status"] == "ambiguous"
+    assert abs(cdiff(nm["O_ground"], 300.0, 1000.0)) <= GW_TOL_MS
+    assert nm["runner"][0]                                  # the best rival fails tolerance
+    assert P_NULL_MAX < nm["p_null"] <= 0.13
+
+
+def test_mutation_assa_three_ground_wave_stations_grid_positions_is_named():
+    # Measured with grid positions: p 0.007 at the CRC-32 seed, 0.000-0.004 over seeds 1000-1019.
+    hits = _holding(_run("hfrnet:ASSA", "G", 0, ["K3LR/D", "W2NAF", "UACNJ"], GW900), INJ)
+    nm = next(nm for nm in hits if nm["site"]["id"] == "hfrnet:ASSA")
+    assert nm["status"] == "named" and nm["n"] == 3
+    assert abs(cdiff(nm["O_ground"], 300.0, 1000.0)) <= GW_TOL_MS
+    assert nm["p_null"] <= P_NULL_MAX
+
+
+def test_mutation_nant_skywave_is_found_but_stays_ambiguous():
+    hits = _holding(_run("hfrnet:NANT", "1F", 320.0, ["K3LR/D", "W2NAF", "AC0G/ND"], DEFAULT), INJ)
+    nm = next(nm for nm in hits if nm["site"]["id"] in ("hfrnet:NANT", "hfrnet:NAUS"))
+    assert nm["status"] == "ambiguous"
+    assert abs(cdiff(nm["O"], 300.0, 1000.0)) <= 0.15            # study: 79 us off
