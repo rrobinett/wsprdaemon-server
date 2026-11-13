@@ -321,8 +321,8 @@ def analyse_group(gk, rows_by_st, sites, rxpos, eng_period, coherence=None, site
     cands, opp_sign = candidates_for(centre, rate, sites)
     if kperiod:
         P_s = kperiod
-    elif cands:
-        P_s = statistics.mode(round(s["period"], 4) for s in cands)
+    elif any(s.get("period") for s in cands):          # a site with no period still competes
+        P_s = statistics.mode(round(s["period"], 4) for s in cands if s.get("period"))
     elif eng_period:
         P_s = 1.0 / eng_period
     else:

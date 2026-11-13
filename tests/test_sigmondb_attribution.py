@@ -516,3 +516,13 @@ def test_group_with_no_fit_gets_an_unattributable_row():
     rows = attribution_rows([g], DEFAULT, RUN_AT, W0, W1, "c" * 64)
     assert [(r["status"], r["tx_id"]) for r in rows] == [("unattributable", "")]
     assert rows[0]["flags"] and rows[0]["n_stations"] == 3
+
+
+def test_a_candidate_without_period_stays_a_candidate():
+    sites = SITES + [dict(SITES[1], id="hfrnet:NOPER", lat=36.0, lon=-121.0, period=None)]
+    g = analyse_group("4.7850 -25.73", {"KFS-OMNI": _cluster_rows(40.0, 10, 50)}, sites, RX, None)
+    assert [s["id"] for s in g["cands"]] == ["hfrnet:TSTB", "hfrnet:NOPER"]
+    assert g["P"] == 1000.0
+    only = [dict(SITES[1], period=None)]
+    g = analyse_group("4.7850 -25.73", {"KFS-OMNI": _cluster_rows(40.0, 10, 50)}, only, RX, 2.0)
+    assert g["P"] == 500.0                              # no candidate period: engineering's

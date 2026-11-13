@@ -181,21 +181,62 @@ def _latest(rows, key):
     return [r for _, r in best.values()]
 
 
-def _at_radiod(arrivals, receivers):
-    """Count each arrival at the receiver whose radiod heard it.
+TRANSPORTERS = Path(__file__).parent / "seed" / "transporters.toml"
 
-    When engineering['radiod'] equals a receiver row's radiod_id, the arrival takes that row's
-    reporter_id and keeps its old label as carried_by.  A transporter such as KFS-MAIN runs no
-    radiod (Michael, 11-13), so its rows count at KFS-OMNI, never as a second station.  In
-    memory only: the arrival rows in the database keep their labels.  Returns new dicts."""
-    by_radiod = {r["radiod_id"]: r["reporter_id"] for r in receivers if r.get("radiod_id")}
+
+def load_transporters(path=TRANSPORTERS):
+    """radiod_id -> [reporter ids allowed to carry that radiod's receptions], from the seed."""
+    import tomllib
+    with open(path, "rb") as fh:
+        doc = tomllib.load(fh)
+    return {k: list(v) for k, v in doc.get("transporters", {}).items()}
+
+
+def _at_radiod(arrivals, receivers, transporters):
+    """Count a carried arrival at the receiver whose radiod heard it.
+
+    An arrival takes the reporter_id of the receiver row whose radiod_id equals its
+    engineering['radiod'] only when its own reporter is a listed transporter for that radiod
+    (seed/transporters.toml); it keeps its old label as carried_by.  A transporter such as
+    KFS-MAIN runs no radiod (Michael, 11-13), so its rows count at KFS-OMNI, never as a second
+    station.  engineering['radiod'] comes from the station, so any other reporter keeps its
+    own reporter_id: naming another station's radiod must not fake a second station.  A
+    radiod_id that two receivers share relabels nothing, and says so on stderr.
+    In memory only: the rows in the database keep their labels.  Returns new dicts."""
+    owners = {}
+    for r in receivers:
+        if r.get("radiod_id"):
+            owners.setdefault(r["radiod_id"], set()).add(r["reporter_id"])
+    by_radiod = {}
+    for rd, rids in sorted(owners.items()):
+        if len(rids) > 1:
+            print("radiod %s belongs to %d receivers (%s); its arrivals keep their own labels"
+                  % (rd, len(rids), ", ".join(sorted(rids))), file=sys.stderr)
+        else:
+            by_radiod[rd] = next(iter(rids))
     out = []
     for a in arrivals:
-        rid = by_radiod.get((a.get("engineering") or {}).get("radiod"))
-        if rid and rid != a["reporter_id"]:
+        rd = (a.get("engineering") or {}).get("radiod")
+        rid = by_radiod.get(rd)
+        if rid and rid != a["reporter_id"] and a["reporter_id"] in transporters.get(rd, ()):
             a = dict(a, reporter_id=rid, carried_by=a["reporter_id"])
         out.append(a)
     return out
+
+
+def _one_per_capture(arrivals):
+    """Keep the first row per (reporter_id, group_key, time, delay to the microsecond), the
+    arrival table's own grain (intDiv truncates toward zero).  After _at_radiod, one capture
+    carried under two labels (KFS-MAIN and KFS/MAIN) would otherwise count twice, and skew a
+    cluster's n, median and MAD.  Returns (kept, dropped count)."""
+    seen, kept = set(), []
+    for a in arrivals:
+        d = a["delay_ns"]
+        k = (a["reporter_id"], a["group_key"], a["time"], -(-d // 1000) if d < 0 else d // 1000)
+        if k not in seen:
+            seen.add(k)
+            kept.append(a)
+    return kept, len(arrivals) - len(kept)
 
 
 def _from_db(a):
@@ -215,7 +256,11 @@ def _from_db(a):
     else:
         arr = _latest_detector(fetch("arrival", where))
     rx = fetch("receiver")
-    return _at_radiod(arr, _latest(rx, "reporter_id")), fetch("transmitter"), rx
+    arr, dropped = _one_per_capture(_at_radiod(arr, _latest(rx, "reporter_id"),
+                                               load_transporters()))
+    if dropped:
+        print("solve: %d duplicate carried arrivals dropped" % dropped, file=sys.stderr)
+    return arr, fetch("transmitter"), rx
 
 
 _ATTR_ARRIVAL_COLS = ("time", "reporter_id", "group_key", "delay_ns", "level_db",
@@ -244,10 +289,19 @@ def _attribution_inputs(client, days):
     tx = _latest(_fetch(client, "transmitter", ddl.COLUMNS["transmitter"],
                         "WHERE kind = 'codar' ORDER BY tx_id"), "tx_id")
     wf = _fetch(client, "waveform", ddl.COLUMNS["waveform"], "ORDER BY tx_id")
+    # The latest row per (tx_id, centre) among rows WITH a period; a centre with none keeps its
+    # latest row, period None: analyse_group skips it for the period yet keeps it as a rival.
+    # Dropping it could turn an ambiguous fit into a name.
+    keyed = [dict(w, _k=(w["tx_id"], w["centre_hz"])) for w in wf]
+    best = {w["_k"]: w for w in _latest([w for w in keyed if not w.get("period_s")], "_k")}
+    best.update((w["_k"], w) for w in _latest([w for w in keyed if w.get("period_s")], "_k"))
     wf_by = {}
-    for w in _latest([dict(w, _k=(w["tx_id"], w["centre_hz"])) for w in wf], "_k"):
-        if w.get("period_s"):
-            wf_by.setdefault(w["tx_id"], []).append(w)
+    for w in best.values():
+        wf_by.setdefault(w["tx_id"], []).append(w)
+    noper = sorted({w["tx_id"] for w in best.values() if not w.get("period_s")})
+    if noper:
+        print("attribute: %d waveform(s) with no period_s kept as candidates: %s"
+              % (len(noper), ", ".join(noper)))
     sites = []
     for t in sorted(tx, key=lambda t: t["tx_id"]):
         if t.get("lat") is None or t.get("lon") is None:
@@ -260,7 +314,24 @@ def _attribution_inputs(client, days):
     placed = [r for r in rx if r.get("lat") is not None and r.get("lon") is not None]
     rxpos = {r["reporter_id"]: (r["lat"], r["lon"], r.get("pos_source") or "") for r in placed}
     coherence = {r["reporter_id"]: r.get("coherence_group") or "" for r in placed}
-    return _at_radiod(arr, rx), sites, rxpos, coherence
+    arr, dropped = _one_per_capture(_at_radiod(arr, rx, load_transporters()))
+    print("attribute: %d duplicate carried arrivals dropped" % dropped)
+    return arr, sites, rxpos, coherence
+
+
+_NAMED = frozenset({"named", "named_two_stations"})
+_FITS_GW900 = frozenset({"fits_gw900", "fits_gw900_two_stations"})
+
+
+def _summary(policy_name, n_groups, rows):
+    """attribute <policy>: <n> groups, <n> named, <n> ambiguous, <n> unattributable; the
+    ground-wave-only pass adds its fits, which never carry a name."""
+    count = lambda st: sum(1 for r in rows if r["status"] in st)  # noqa: E731
+    line = "attribute %s: %d groups, %d named, %d ambiguous, %d unattributable" % (
+        policy_name, n_groups, count(_NAMED), count({"ambiguous"}), count({"unattributable"}))
+    if policy_name == "gw_only_900km":
+        line += ", %d fits_gw900 (never named)" % count(_FITS_GW900)
+    return line
 
 
 def cmd_attribute(a):
@@ -284,15 +355,9 @@ def cmd_attribute(a):
         groups = at.run_attribution(arr, sites, rxpos, policy, n_fake=a.n_fake,
                                     coherence=coherence)
         mine = at.attribution_rows(groups, policy, run_at, min(times), max(times), digest)
-        count = lambda pred: sum(1 for r in mine if pred(r["status"]))  # noqa: E731
-        line = "attribute %s: %d groups, %d named, %d ambiguous, %d unattributable" % (
-            policy.name, len(groups), count(lambda s: s.startswith("named")),
-            count(lambda s: s == "ambiguous"), count(lambda s: s == "unattributable"))
-        if policy is at.GW900:
-            line += ", %d fits_gw900 (never named)" % count(lambda s: s.startswith("fits_gw900"))
-        print(line)
+        print(_summary(policy.name, len(groups), mine))
         for r in mine:
-            if r["status"].startswith(("named", "fits_gw900")):
+            if r["status"] in _NAMED | _FITS_GW900:
                 print("  %s %s %s: %d stations, offset %d ns (%s), p_null %s" % (
                     r["group_key"], r["tx_id"], r["status"], r["n_stations"], r["offset_ns"],
                     r["offset_from"], "n/a" if r["p_null"] is None else "%.3f" % r["p_null"]))

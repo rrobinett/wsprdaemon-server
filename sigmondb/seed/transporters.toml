@@ -1,0 +1,12 @@
+# Transporters: reporters that carry another receiver's receptions but run no radiod.
+#
+# An arrival counts at the receiver whose radiod heard it (engineering['radiod'] matched to
+# sigmondb.receiver.radiod_id) ONLY when its reporter appears here under that radiod_id.  Any
+# other reporter naming a radiod keeps its own reporter_id: a station that names another's
+# radiod, by mistake or on purpose, must not become a second station.
+#
+# radiod_id = [carrier reporter_ids]
+
+[transporters]
+# Michael, 2026-11-13: "MAIN at KFS has no radiod so cannot be a reporter, it is a transporter only."
+"KFS-OMNI-status.local" = ["KFS-MAIN", "KFS/MAIN"]

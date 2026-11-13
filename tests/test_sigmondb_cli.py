@@ -336,11 +336,14 @@ def test_cli_attribute_sets_aside_a_reporter_without_position(monkeypatch, tmp_p
     assert c.inserted == [] and c.commands == []          # --out leaves the database alone
 
 
+KFS_TRANSPORT = {"KFS-OMNI-status.local": ["KFS-MAIN", "KFS/MAIN"]}
+_KFS_RX = dict(valid_row("receiver"), reporter_id="KFS-OMNI", radiod_id="KFS-OMNI-status.local")
+
+
 def test_kfs_main_rows_count_as_the_kfs_omni_radiod():
     eng = {"radiod": "KFS-OMNI-status.local", "sweep_repetition_hz": "1"}
     arr = [dict(_arr("KFS-MAIN", "g", "v"), engineering=eng), dict(_arr("KFS/MAIN", "g", "v"), engineering=eng)]
-    out = cli._at_radiod(arr, [dict(valid_row("receiver"), reporter_id="KFS-OMNI",
-                                    radiod_id="KFS-OMNI-status.local")])
+    out = cli._at_radiod(arr, [_KFS_RX], KFS_TRANSPORT)
     assert {r["reporter_id"] for r in out} == {"KFS-OMNI"}
     assert {r["carried_by"] for r in out} == {"KFS-MAIN", "KFS/MAIN"}
     assert {r["reporter_id"] for r in arr} == {"KFS-MAIN", "KFS/MAIN"}    # inputs untouched
@@ -349,16 +352,51 @@ def test_kfs_main_rows_count_as_the_kfs_omni_radiod():
 def test_at_radiod_leaves_an_unmatched_arrival_alone():
     arr = [dict(_arr("W2NAF", "g", "v"), engineering={"radiod": "elsewhere.local"}),
            _arr("K3LR/D", "g", "v")]                       # engineering absent (None)
-    out = cli._at_radiod(arr, [dict(valid_row("receiver"), reporter_id="KFS-OMNI",
-                                    radiod_id="KFS-OMNI-status.local")])
+    out = cli._at_radiod(arr, [_KFS_RX], KFS_TRANSPORT)
     assert [r["reporter_id"] for r in out] == ["W2NAF", "K3LR/D"]
     assert all("carried_by" not in r for r in out)
 
 
-def test_solve_from_db_counts_kfs_main_at_its_radiod(monkeypatch):
-    _db(monkeypatch, {"arrival": KFS_LIVE_ROWS[:3], "receiver": RX_ROWS})
+def test_at_radiod_ignores_a_reporter_not_listed_as_that_radiods_transporter():
+    # A station that names another station's radiod must not become that station: it would
+    # fake a second station and hand any site a false two-station fit.
+    arr = [dict(_arr("W2NAF", "g", "v"), engineering={"radiod": "KFS-OMNI-status.local"})]
+    out = cli._at_radiod(arr, [_KFS_RX], KFS_TRANSPORT)
+    assert out[0]["reporter_id"] == "W2NAF" and "carried_by" not in out[0]
+    assert cli._at_radiod(arr, [_KFS_RX], {})[0]["reporter_id"] == "W2NAF"
+
+
+def test_at_radiod_refuses_a_radiod_id_two_receivers_share(capsys):
+    twin = dict(_KFS_RX, reporter_id="KFS-OTHER")
+    arr = [dict(_arr("KFS-MAIN", "g", "v"), engineering={"radiod": "KFS-OMNI-status.local"})]
+    out = cli._at_radiod(arr, [_KFS_RX, twin], KFS_TRANSPORT)
+    assert out[0]["reporter_id"] == "KFS-MAIN"
+    assert "KFS-OMNI-status.local" in capsys.readouterr().err
+
+
+def test_seed_transporters_list_kfs_main():
+    assert cli.load_transporters() == KFS_TRANSPORT
+
+
+def test_one_capture_under_both_kfs_labels_counts_once():
+    eng = {"radiod": "KFS-OMNI-status.local"}
+    a = dict(_arr("KFS-MAIN", "g", "v", delay=1_234_567), engineering=eng)
+    b = dict(_arr("KFS/MAIN", "g", "v", delay=1_234_890), engineering=eng)   # same 1 us bin
+    c = dict(_arr("KFS/MAIN", "g", "v", delay=1_236_000), engineering=eng)   # another bin
+    kept, dropped = cli._one_per_capture(cli._at_radiod([a, b, c], [_KFS_RX], KFS_TRANSPORT))
+    assert [r["delay_ns"] for r in kept] == [1_234_567, 1_236_000] and dropped == 1
+    # the arrival table's intDiv truncates toward zero: -500 and 500 share bin 0 (a floor
+    # would split them into -1 and 0); -1500 lands in bin -1
+    neg = [dict(_arr("X", "g", "v", delay=d)) for d in (-500, 500, -1500)]
+    assert [r["delay_ns"] for r in cli._one_per_capture(neg)[0]] == [-500, -1500]
+
+
+def test_solve_from_db_counts_kfs_main_at_its_radiod(monkeypatch, capsys):
+    dup = dict(KFS_LIVE_ROWS[0], reporter_id="KFS/MAIN")             # one capture, two labels
+    _db(monkeypatch, {"arrival": KFS_LIVE_ROWS[:3] + [dup], "receiver": RX_ROWS})
     arr, _, _ = cli._from_db(_ns())
-    assert {r["reporter_id"] for r in arr} == {"KFS-OMNI"}
+    assert {r["reporter_id"] for r in arr} == {"KFS-OMNI"} and len(arr) == 3
+    assert "1 duplicate" in capsys.readouterr().err
 
 
 def test_cli_attribute_with_no_arrivals_writes_nothing_and_exits_zero(monkeypatch):
@@ -383,6 +421,31 @@ def test_cli_attribute_database_error_propagates(monkeypatch):
         raise AssertionError("a database error must reach systemd")
 
 
+def test_attribution_inputs_dedups_a_capture_carried_twice(monkeypatch, capsys):
+    dup = dict(KFS_LIVE_ROWS[0], reporter_id="KFS/MAIN")
+    c = _db(monkeypatch, {"arrival": KFS_LIVE_ROWS[:2] + [dup], "transmitter": TX,
+                          "waveform": WF, "receiver": RX_ROWS})
+    arr, _, _, _ = cli._attribution_inputs(c, 30.0)
+    assert len(arr) == 2
+    assert "1 duplicate" in capsys.readouterr().out
+
+
+def test_waveform_without_period_never_hides_a_rival(monkeypatch, capsys):
+    newer = datetime(2026, 11, 12)
+    wf = WF + [dict(WF[0], valid_from=newer, period_s=None),           # newest TSTB row: no period
+               valid_row("waveform", tx_id="hfrnet:NOPER", valid_from=_VF, centre_hz=4.785e6,
+                         rate_hz_per_s=-25_733.913, period_s=None)]
+    noper = valid_row("transmitter", tx_id="hfrnet:NOPER", kind="codar", lat=36.0, lon=-121.0,
+                      valid_from=_VF, version=1)
+    c = _db(monkeypatch, {"arrival": KFS_LIVE_ROWS[:2], "transmitter": TX + [noper],
+                          "waveform": wf, "receiver": RX_ROWS})
+    _, sites, _, _ = cli._attribution_inputs(c, 30.0)
+    by = {s["id"]: s for s in sites}
+    assert by["hfrnet:TSTB"]["period"] == 1.0          # the older row with a period stays
+    assert by["hfrnet:NOPER"]["period"] is None        # kept as a rival; analyse_group copes
+    assert "hfrnet:NOPER" in capsys.readouterr().out
+
+
 def test_attribution_inputs_sites_and_receivers(monkeypatch):
     old_tx = dict(TX[0], lat=0.0, lon=0.0, valid_from=datetime(2026, 1, 1))
     nowf = valid_row("transmitter", tx_id="hfrnet:NOWF", kind="codar", lat=1.0, lon=1.0,
@@ -399,3 +462,13 @@ def test_attribution_inputs_sites_and_receivers(monkeypatch):
     assert set(coh) == {"KFS-OMNI", "K3LR/D"}
     assert {a["reporter_id"] for a in arr} == {"KFS-OMNI"}
     assert all(a["live"] for a in arr) and arr[0]["sweep_repetition_hz"] == "1"
+
+
+def test_summary_counts_named_by_exact_status():
+    rows_ = [{"status": s} for s in ("named", "named_two_stations", "named_by_mistake",
+                                    "ambiguous", "unattributable", "fits_gw900")]
+    assert cli._summary("gw_only_900km", 4, rows_) == (
+        "attribute gw_only_900km: 4 groups, 2 named, 1 ambiguous, 1 unattributable, "
+        "1 fits_gw900 (never named)")
+    assert cli._summary("default", 4, rows_[:2]) == \
+        "attribute default: 4 groups, 2 named, 0 ambiguous, 0 unattributable"
