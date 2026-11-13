@@ -198,3 +198,31 @@ def test_a_position_equal_to_the_latest_row_gets_no_new_version(tmp_path):
     first, _ = position_rows(base, load_positions(f), datetime(2026, 11, 14))
     again, unknown = position_rows(base + first, load_positions(f), datetime(2026, 11, 15))
     assert again == [] and unknown == []
+
+
+def test_a_sigma_read_back_as_float32_is_unchanged(tmp_path):
+    base = load_receivers(SEED)
+    old = dict(_latest(base, "reporter_id")["K3LR/D"], lat=41.0, lon=-80.0,
+               pos_sigma_m=12.300000190734863, pos_source="gpsdo", version=2)
+    f = _pos(tmp_path, {"K3LR/D": {"lat": 41.0, "lon": -80.0, "pos_sigma_m": 12.3}})
+    rows, _ = position_rows(base + [old], load_positions(f), datetime(2026, 11, 15))
+    assert rows == []
+
+
+@pytest.mark.parametrize("entry", [
+    {"lat": "41.5551", "lon": -80.0, "pos_sigma_m": 10.0},
+    {"lat": float("nan"), "lon": -80.0, "pos_sigma_m": 10.0},
+    {"lat": float("inf"), "lon": -80.0, "pos_sigma_m": 10.0},
+    {"lat": 41.0, "lon": -80.0, "pos_sigma_m": float("inf")},
+    {"lat": 90.5, "lon": -80.0, "pos_sigma_m": 10.0},
+    {"lat": 41.0, "lon": -180.5, "pos_sigma_m": 10.0},
+    {"lat": 41.0, "lon": -80.0, "pos_sigma_m": -1.0},
+])
+def test_bad_position_values_are_refused_without_the_value(tmp_path, entry):
+    f = tmp_path / "pos.json"
+    f.write_text(json.dumps({"K3LR/D": entry}))   # json.dumps writes NaN/Infinity, load accepts
+    f.chmod(0o600)
+    with pytest.raises(ValueError) as e:
+        load_positions(f)
+    msg = str(e.value)
+    assert "K3LR/D" in msg and "41.5551" not in msg and "90.5" not in msg and "180.5" not in msg

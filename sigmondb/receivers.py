@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import struct
 import tomllib
 from datetime import datetime
 from pathlib import Path
@@ -68,6 +69,12 @@ def load_receivers(path):
 
 
 _POS_KEYS = ("lat", "lon", "pos_sigma_m")
+_POS_LIMITS = {"lat": (-90.0, 90.0), "lon": (-180.0, 180.0), "pos_sigma_m": (0.0, math.inf)}
+
+
+def _f32(x):
+    """x rounded to float32: pos_sigma_m is Nullable(Float32) in the database."""
+    return None if x is None else struct.unpack("f", struct.pack("f", x))[0]
 
 
 def load_positions(path):
@@ -88,7 +95,18 @@ def load_positions(path):
         for k in _POS_KEYS:
             if not isinstance(p, dict) or p.get(k) is None:
                 raise ValueError("positions entry %s lacks %s" % (rid, k))
-        out[rid] = {k: float(p[k]) for k in _POS_KEYS}
+        v = {}
+        for k in _POS_KEYS:
+            try:
+                if isinstance(p[k], (str, bool)):
+                    raise TypeError
+                v[k] = float(p[k])
+            except (TypeError, ValueError):
+                raise ValueError("positions entry %s: %s must be a number" % (rid, k)) from None
+            lim = _POS_LIMITS[k]
+            if not math.isfinite(v[k]) or not lim[0] <= v[k] <= lim[1]:
+                raise ValueError("positions entry %s: %s is out of range" % (rid, k))
+        out[rid] = v
     return out
 
 
@@ -105,8 +123,8 @@ def position_rows(latest_rows, positions, now):
         if old is None:
             unknown.append(rid)
             continue
-        if (old.get("lat"), old.get("lon"), old.get("pos_sigma_m")) == (
-                p["lat"], p["lon"], p["pos_sigma_m"]):
+        if (old.get("lat"), old.get("lon"), _f32(old.get("pos_sigma_m"))) == (
+                p["lat"], p["lon"], _f32(p["pos_sigma_m"])):
             continue
         new = dict(old)
         new.update(lat=p["lat"], lon=p["lon"], pos_sigma_m=p["pos_sigma_m"],
