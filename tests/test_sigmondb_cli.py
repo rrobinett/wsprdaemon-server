@@ -513,6 +513,10 @@ def test_solve_from_db_attaches_a_default_name_and_reads_the_latest_run(monkeypa
     # the latest run per (group_key, mode_policy): run_id hashes the inputs, so FINAL alone
     # would keep an older run's rows beside the newer ones
     assert "max(run_at)" in asql and "GROUP BY group_key, mode_policy" in asql
+    # names older than ATTRIB_MAX_AGE_H drop out in the database too
+    assert "run_at > now() - INTERVAL {max_age_h:UInt32} HOUR" in asql
+    acall = [k for k in c.calls if ".attribution" in k["sql"]][0]
+    assert acall["parameters"] == {"max_age_h": 3}
     arr_call = [k for k in c.calls if ".arrival" in k["sql"]][0]
     assert arr_call["parameters"] == {"days": 7.0}
 
@@ -571,3 +575,33 @@ def test_attribution_inputs_pick_the_detector_after_relabelling(monkeypatch):
                           "receiver": RX_ROWS})
     arr, _, _, _ = cli._attribution_inputs(c, 30.0)
     assert [r["detector_version"] for r in arr] == ["codar-sounder/0.8.0"]
+
+
+def test_from_db_run_at_comes_back_naive_utc(monkeypatch):
+    cdt = timezone(timedelta(hours=-5))
+    row = dict(_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS),
+               run_at=datetime(2026, 11, 13, 5, 0, tzinfo=cdt))
+    c = _db(monkeypatch, {"attribution": [row]})
+    got = cli._latest_attributions(c)
+    assert got[0]["run_at"] == datetime(2026, 11, 13, 10, 0) and got[0]["run_at"].tzinfo is None
+
+
+def test_solve_refuses_attribution_flags_that_would_be_ignored(capsys):
+    with pytest.raises(SystemExit) as e:
+        cli.main(["solve", "--arrivals", "a.jsonl", "--no-attribution", "--out", "x"])
+    assert e.value.code == 2 and "--no-attribution" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as e:
+        cli.main(["solve", "--from-db", "--attributions", "a.jsonl", "--write-db"])
+    assert e.value.code == 2 and "--attributions" in capsys.readouterr().err
+
+
+def test_solve_summary_separates_station_named_from_attributed(monkeypatch, capsys):
+    station = _gw_arrivals(centre_ns=HOOK_D_NS + 5_000_000, seed=3)
+    for r in station:
+        r["tx_id"] = "hfrnet:OWN"
+    arr = [dict(r, detector_version="v") for r in _gw_arrivals() + station]
+    c = _db(monkeypatch, {"arrival": arr, "receiver": GW_RX,
+                          "transmitter": GW_TX,
+                          "attribution": [_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS)]})
+    assert cli.main(["solve", "--from-db", "--write-db"]) == 0
+    assert "solve: 2 clusters, 1 station-named, 1 attributed" in capsys.readouterr().out

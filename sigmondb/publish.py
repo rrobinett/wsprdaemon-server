@@ -112,11 +112,21 @@ def latlon_to_grid6(lat, lon):
 
 # --- builders -----------------------------------------------------------------------------
 
+# A solution counts only when its window_to lies within this many hours before the build
+# (ruling A11).  A withdrawn or aged-out name therefore leaves transmitter_offsets within 3 h.
+# A transmitter that nothing has confirmed for 3 h drops out of the table: nothing vouches for
+# its offset any more.
+PUBLISH_MAX_AGE_H = 3
+
+
 def build_transmitter_offsets(solutions, transmitters, built_at):
     txs = _latest(transmitters or [], "tx_id")
+    oldest = built_at - PUBLISH_MAX_AGE_H * 3600.0
     best = {}
     for s in solutions:
         if not s.get("tx_id") or s.get("offset_ns") is None or s.get("offset_sigma_ns") is None:
+            continue
+        if _unix(s["window_to"]) < oldest:
             continue
         k = (_unix(s["window_to"]), s.get("solve_id") or "")
         if s["tx_id"] not in best or k > best[s["tx_id"]][0]:

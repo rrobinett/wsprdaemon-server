@@ -164,7 +164,7 @@ def _fetch(client, table, cols, where="", params=None):
         res = client.query(sql, parameters=params)
     out = [dict(zip(cols, r)) for r in res.result_rows]
     for r in out:
-        for c in ("time", "valid_from", "window_from", "window_to"):
+        for c in ("time", "valid_from", "window_from", "window_to", "run_at"):
             if c in r:
                 r[c] = _utc_naive(r[c])
     return out
@@ -389,17 +389,23 @@ def _read_receivers(path):
     return read_rows(path)
 
 
-# The latest attribution run per (group_key, mode_policy).  run_id hashes the inputs, so a run
-# on changed inputs adds rows beside the old run's, and FINAL alone would keep both.
+# The latest attribution run per (group_key, mode_policy), among runs no older than
+# attribution.ATTRIB_MAX_AGE_H.  run_id hashes the inputs, so a run on changed inputs adds rows
+# beside the old run's, and FINAL alone would keep both.  A group missing from every recent run
+# yields no rows, so its name lapses instead of going stale.
 _LATEST_ATTRIBUTION = (
     "WHERE (group_key, mode_policy, run_at) IN (SELECT group_key, mode_policy, max(run_at) "
-    "FROM %s.attribution GROUP BY group_key, mode_policy)" % ddl.DATABASE)
+    "FROM %s.attribution WHERE run_at > now() - INTERVAL {max_age_h:UInt32} HOUR "
+    "GROUP BY group_key, mode_policy)" % ddl.DATABASE)
 
 
 def _latest_attributions(client):
-    """sigmondb.attribution rows of the latest run per (group_key, mode_policy); [] when the
-    table holds none.  apply_attribution picks the default-policy names among them."""
-    return _fetch(client, "attribution", ddl.COLUMNS["attribution"], _LATEST_ATTRIBUTION)
+    """sigmondb.attribution rows of the latest recent run per (group_key, mode_policy); []
+    when the table holds none.  apply_attribution picks the default-policy names among them
+    and checks the age again."""
+    from sigmondb.attribution import ATTRIB_MAX_AGE_H
+    return _fetch(client, "attribution", ddl.COLUMNS["attribution"], _LATEST_ATTRIBUTION,
+                  {"max_age_h": ATTRIB_MAX_AGE_H})
 
 
 def cmd_solve(a):
@@ -421,11 +427,15 @@ def cmd_solve(a):
     clusters = fixed_clusters(arr, rx, max_sd_ns=a.max_sd_us * 1000.0, set_aside=aside)
     for rid, why in sorted(aside.items()):
         print("set aside %s: %s" % (rid, why), file=sys.stderr)
+    station_named = {c["cluster_key"] for c in clusters if any(c.get("tx_ids") or [])}
     for key, why in sorted(apply_attribution(clusters, attrs).items()):
         print("attribution not applied %s: %s" % (key, why), file=sys.stderr)
+    attributed = sum(1 for c in clusters
+                     if any(c.get("tx_ids") or []) and c["cluster_key"] not in station_named)
     sols = ground_wave_solutions(clusters, tx, rx, SOLVER_VERSION,
                                  max_ground_km=a.max_ground_km)
-    print("solve: %d clusters, %d named" % (len(clusters), sum(1 for s in sols if s["tx_id"])))
+    print("solve: %d clusters, %d station-named, %d attributed"
+          % (len(clusters), len(station_named), attributed))
     if a.out:
         print("solution: %d rows" % write_rows(a.out, sols))
         return 0
@@ -526,7 +536,16 @@ def build_parser():
 
 
 def main(argv=None):
-    a = build_parser().parse_args(argv)
+    p = build_parser()
+    a = p.parse_args(argv)
+    if a.verb == "solve":
+        # Refuse a flag the chosen source would ignore, rather than ignore it silently.
+        if a.no_attribution and not a.from_db:
+            p.error("solve: --no-attribution works only with --from-db; "
+                    "with --arrivals, leave out --attributions instead")
+        if a.attributions and a.from_db:
+            p.error("solve: --attributions works only with --arrivals; "
+                    "--from-db reads sigmondb.attribution")
     return a.fn(a)
 
 

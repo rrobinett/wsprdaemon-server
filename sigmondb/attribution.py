@@ -53,6 +53,7 @@ import statistics
 import zlib
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 C_KM_S = 299_792.458
 RE = 6371.0
@@ -668,6 +669,16 @@ def attribution_rows(groups, policy, run_at, window_from, window_to, digest):
 # fits_gw900*, and apply_attribution also checks the policy, so a GW900 row that somehow read
 # "named" would still attach nothing.
 NAMED_STATUSES = ("named", "named_two_stations")
+# A name attaches only from a run no older than this (ruling A9): a group that drops out of the
+# hourly run loses its name within 3 h instead of keeping a stale one.  If attribute fails for
+# 3 h, names drop until it recovers; no false name results.
+ATTRIB_MAX_AGE_H = 3
+
+
+def _naive_utc(t):
+    if t is not None and t.tzinfo is not None:
+        return t.astimezone(timezone.utc).replace(tzinfo=None)
+    return t
 
 
 def _period_gap(a, b, period):
@@ -678,18 +689,33 @@ def _period_gap(a, b, period):
     return d
 
 
-def apply_attribution(clusters, attributions, match_tol_ns=50_000):
+def apply_attribution(clusters, attributions, match_tol_ns=50_000, now=None,
+                      max_age_h=ATTRIB_MAX_AGE_H):
     """Attach names from sigmondb.attribution rows to groundwave.fixed_clusters, in place.
 
     A cluster (one reporter, one group) takes tx_ids = [tx] when every row that matches it
     names the one tx and lists no co-sited alias.  A row matches when its mode_policy is
-    "default", its status is in NAMED_STATUSES, its group_key equals the cluster's, and one of
+    "default", its status is in NAMED_STATUSES, its p_null is not None and <= P_NULL_MAX (a fit
+    with no null test never names), its run_at lies within max_age_h of now (naive UTC; a row
+    with no run_at never names), its group_key equals the cluster's, and one of
     its members sits at the cluster's reporter with a cluster delay within match_tol_ns of
     fixed_delay_ns, modulo period_ns.  Two names, or a name with aliases, leave the cluster
     unnamed.  A cluster the station already named differently stays as it is.
     Returns {cluster_key: reason} for each matched cluster left unnamed."""
+    now = _naive_utc(now) or datetime.now(timezone.utc).replace(tzinfo=None)
+    oldest = now - timedelta(hours=max_age_h)
+
+    def fresh(r):
+        t = _naive_utc(r.get("run_at"))
+        return t is not None and t >= oldest
+
+    def null_passed(r):
+        pn = r.get("p_null")
+        return pn is not None and pn <= P_NULL_MAX       # NaN fails the comparison too
+
     rows = [r for r in attributions
-            if r.get("mode_policy") == "default" and r.get("status") in NAMED_STATUSES]
+            if r.get("mode_policy") == "default" and r.get("status") in NAMED_STATUSES
+            and null_passed(r) and fresh(r)]
     reasons = {}
     for c in clusters:
         if len(c["reporter_ids"]) != 1:

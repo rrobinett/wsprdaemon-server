@@ -534,6 +534,7 @@ from sigmondb.groundwave import C_M_PER_S, fixed_clusters, ground_wave_solutions
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_sigmondb_groundwave import _arrivals as _gw_base  # noqa: E402
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz  # noqa: E402
 
 # UACNJ at its typed-grid centre (FN20mv, from the seed), labelled gpsdo so ground wave applies.
 # hfrnet:HOOK here is a synthetic site about 95 km east of it, not the real radar's position.
@@ -551,10 +552,12 @@ def _gw_arrivals(rid="UACNJ", centre_ns=HOOK_D_NS, seed=1):
     return _gw_base(centre_ns, seed=seed, reporter_id=rid)
 
 
-def _attr(tx, status, rid, d_ns):
+def _attr(tx, status, rid, d_ns, run_at=None, p_null=0.01):
+    """One attribution row; run_at defaults to now (naive UTC), so it passes the age rule."""
     return dict(tx_id=tx, status=status, mode_policy="default", group_key="4.4630 -25.73",
                 period_ns=1_000_000_000, alias_tx_ids=[], reporter_ids=[rid],
-                cluster_delays_ns=[d_ns])
+                cluster_delays_ns=[d_ns], p_null=p_null,
+                run_at=run_at or _dt.now(_tz.utc).replace(tzinfo=None))
 
 
 def test_named_statuses_are_exactly_the_default_policys_names():
@@ -625,3 +628,40 @@ def test_a_cluster_the_station_named_differently_keeps_its_name():
     cl = fixed_clusters(_gw_base(HOOK_D_NS, reporter_id="UACNJ", tx_id="hfrnet:OTHER"), RX_ROWS)
     r = apply_attribution(cl, [_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS)])
     assert cl[0]["tx_ids"] == ["hfrnet:OTHER"] and "station names hfrnet:OTHER" in r[cl[0]["cluster_key"]]
+
+
+def test_a_name_older_than_the_age_limit_attaches_nothing():
+    from sigmondb.attribution import ATTRIB_MAX_AGE_H
+    assert ATTRIB_MAX_AGE_H == 3
+    now = _dt(2026, 11, 13, 12, 0)
+    cl = fixed_clusters(_gw_arrivals(), RX_ROWS)
+    apply_attribution(cl, [_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS,
+                                 run_at=now - _td(hours=4))], now=now)
+    assert cl[0]["tx_ids"] == [""]
+    cl = fixed_clusters(_gw_arrivals(), RX_ROWS)
+    apply_attribution(cl, [_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS,
+                                 run_at=now - _td(hours=2))], now=now)
+    assert cl[0]["tx_ids"] == ["hfrnet:HOOK"]
+    # A tz-aware run_at (as a database read may give) is compared in UTC, never relabelled.
+    cl = fixed_clusters(_gw_arrivals(), RX_ROWS)
+    cdt = _tz(_td(hours=-5))
+    apply_attribution(cl, [_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS,
+                                 run_at=_dt(2026, 11, 13, 5, 0, tzinfo=cdt))], now=now)
+    assert cl[0]["tx_ids"] == ["hfrnet:HOOK"]                    # 10:00Z: 2 h old
+    # A row with no run_at cannot show its age: it never names.
+    cl = fixed_clusters(_gw_arrivals(), RX_ROWS)
+    apply_attribution(cl, [dict(_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS),
+                                run_at=None)], now=now)
+    assert cl[0]["tx_ids"] == [""]
+
+
+def test_a_fit_without_a_passing_null_test_never_names():
+    for pn in (None, float("nan"), 0.06):
+        cl = fixed_clusters(_gw_arrivals(), RX_ROWS)
+        apply_attribution(cl, [_attr("hfrnet:HOOK", "named_two_stations", "UACNJ", HOOK_D_NS,
+                                     p_null=pn)])
+        assert cl[0]["tx_ids"] == [""], pn
+    cl = fixed_clusters(_gw_arrivals(), RX_ROWS)
+    apply_attribution(cl, [_attr("hfrnet:HOOK", "named_two_stations", "UACNJ", HOOK_D_NS,
+                                 p_null=0.05)])
+    assert cl[0]["tx_ids"] == ["hfrnet:HOOK"]

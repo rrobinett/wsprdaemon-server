@@ -432,3 +432,15 @@ def test_cli_publish_without_credentials_fails(monkeypatch, capsys):
     monkeypatch.setattr(cli, "connect", lambda conf: pytest.fail("must not connect"))
     assert cli.main(["publish"]) == 2
     assert "CH_PUB_" in capsys.readouterr().err
+
+
+def test_transmitter_offsets_drop_solutions_older_than_the_publish_age():
+    assert publish.PUBLISH_MAX_AGE_H == 3
+    built = _utc(2026, 11, 12, 12).timestamp()
+    # The name was withdrawn: newer solutions for that cluster carry no tx_id.  The older
+    # named row must leave the public table within PUBLISH_MAX_AGE_H.
+    sols = [_sol("hfrnet:A", _utc(2026, 11, 12, 8), 1_000_000),
+            _sol("", _utc(2026, 11, 12, 11), 1_000_000)]
+    assert publish.build_transmitter_offsets(sols, [_tx("hfrnet:A")], built) == []
+    sols = [_sol("hfrnet:A", _utc(2026, 11, 12, 10), 1_000_000)]           # 2 h old
+    assert [r["tx_id"] for r in publish.build_transmitter_offsets(sols, [], built)] == ["hfrnet:A"]
