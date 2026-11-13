@@ -227,9 +227,7 @@ MIGRATIONS = tuple(
     "CODEC(ZSTD(3)) AFTER engineering" % t
     for t in ("capture", "arrival")) + (
     "ALTER TABLE sigmondb.arrival ADD COLUMN IF NOT EXISTS freq_hz Nullable(Float64) "
-    "CODEC(ZSTD(3)) AFTER delay_sigma_ns",
-    # attribution is rewritten every hour: keep 30 days (a table made before the TTL gets it here)
-    "ALTER TABLE sigmondb.attribution MODIFY TTL run_at + INTERVAL 30 DAY",)
+    "CODEC(ZSTD(3)) AFTER delay_sigma_ns",)
 
 
 def is_nullable(typ):

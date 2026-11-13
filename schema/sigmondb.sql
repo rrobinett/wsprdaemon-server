@@ -252,5 +252,3 @@ ALTER TABLE sigmondb.capture ADD COLUMN IF NOT EXISTS received_at Nullable(DateT
 ALTER TABLE sigmondb.arrival ADD COLUMN IF NOT EXISTS received_at Nullable(DateTime) CODEC(ZSTD(3)) AFTER engineering;
 
 ALTER TABLE sigmondb.arrival ADD COLUMN IF NOT EXISTS freq_hz Nullable(Float64) CODEC(ZSTD(3)) AFTER delay_sigma_ns;
-
-ALTER TABLE sigmondb.attribution MODIFY TTL run_at + INTERVAL 30 DAY;

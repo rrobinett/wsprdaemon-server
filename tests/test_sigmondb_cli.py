@@ -528,7 +528,8 @@ def test_attribute_ensures_the_schema_even_when_it_finds_no_arrivals(monkeypatch
 def test_the_attribution_table_keeps_30_days_and_solution_is_untouched():
     assert ddl.TABLES["attribution"].endswith("TTL run_at + INTERVAL 30 DAY")
     assert "TTL" not in ddl.TABLES["solution"]
-    assert "MODIFY TTL run_at + INTERVAL 30 DAY" in " ".join(ddl.MIGRATIONS)   # an existing table
+    # no MODIFY TTL migration: ensure_schema runs hourly and a MODIFY TTL rematerialises the table each time
+    assert "MODIFY TTL" not in " ".join(ddl.MIGRATIONS)
     sql = open(os.path.join(os.path.dirname(__file__), "..", "schema", "sigmondb.sql")).read()
     att = sql.split("CREATE TABLE IF NOT EXISTS sigmondb.attribution")[1].split(";")[0]
     assert "TTL run_at + INTERVAL 30 DAY" in att
