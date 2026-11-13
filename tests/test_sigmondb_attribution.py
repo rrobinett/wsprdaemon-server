@@ -7,11 +7,13 @@ import os
 import random
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sigmondb.attribution import (  # noqa: E402
-    DEFAULT, GW900, analyse_group, collapse_colocated, flag_rungs, flag_twins, gc_km, modes,
-    parse_key, rung_spacing_ms, sky_km)
+    DEFAULT, GW900, analyse_group, collapse_colocated, flag_images, flag_rungs, flag_twins, gc_km,
+    modes, parse_key, rung_spacing_ms, site_map, sky_km)
 
 # Hand-made sites: one per sweep group the tests use.  Positions are synthetic.
 SITES = [
@@ -35,18 +37,26 @@ def _cluster_rows(D_ms, width_us, n_captures, live=False, level=20.0, t0=0, seed
 def test_sky_and_ground_delays_match_the_prototype():
     assert abs(gc_km((41.0, -75.0), (41.0, -76.0)) - 83.9) < 0.1
     assert abs(sky_km(564.0, 300.0, 1) - 832.48) < 0.01        # K3LR-ASSA 1F at h = 300 km
-    assert [m[0] for m in modes(90.0, "UACNJ", DEFAULT)] == ["G", "1F"]
-    assert [m[0] for m in modes(150.0, "K3LR/D", DEFAULT)] == ["1F"]
-    assert [m[0] for m in modes(600.0, "K3LR/D", GW900)] == ["G"]
+    assert [m[0] for m in modes(90.0, "UACNJ", DEFAULT, gw_ok=True)] == ["G", "1F"]
+    assert [m[0] for m in modes(150.0, "K3LR/D", DEFAULT, gw_ok=True)] == ["1F"]
+    assert [m[0] for m in modes(600.0, "K3LR/D", GW900, gw_ok=True)] == ["G"]
     assert [m[0] for m in modes(90.0, "UACNJ", DEFAULT, gw_ok=False)] == ["1F"]   # typed grid
 
 
+def test_modes_demands_gw_ok():
+    # A caller that forgets gw_ok must fail, never grant ground wave to a typed grid.
+    with pytest.raises(TypeError):
+        modes(90.0, "UACNJ", DEFAULT)
+    with pytest.raises(TypeError):
+        modes(90.0, "UACNJ", DEFAULT, True, True)
+
+
 def test_modes_reach_and_hops():
-    assert [m[0] for m in modes(250.0, "KFS-OMNI", DEFAULT)] == ["G", "1F"]       # coastal 300 km
-    assert [m[0] for m in modes(250.0, "K3LR/D", DEFAULT, tight=False)] == ["1F"]
-    assert [m[0] for m in modes(3500.0, "K3LR/D", DEFAULT)] == ["1F", "2F"]
-    assert [m[0] for m in modes(4000.0, "K3LR/D", DEFAULT)] == ["2F"]
-    assert modes(950.0, "K3LR/D", GW900) == []
+    assert [m[0] for m in modes(250.0, "KFS-OMNI", DEFAULT, gw_ok=True)] == ["G", "1F"]  # coastal
+    assert [m[0] for m in modes(250.0, "K3LR/D", DEFAULT, tight=False, gw_ok=True)] == ["1F"]
+    assert [m[0] for m in modes(3500.0, "K3LR/D", DEFAULT, gw_ok=True)] == ["1F", "2F"]
+    assert [m[0] for m in modes(4000.0, "K3LR/D", DEFAULT, gw_ok=True)] == ["2F"]
+    assert modes(950.0, "K3LR/D", GW900, gw_ok=True) == []
 
 
 def test_parse_key():
@@ -89,6 +99,49 @@ def test_coherence_group_counts_once_even_far_apart():
                                      {"RX-A": "site1", "RX-B": "site1", "RX-C": ""})
     assert sorted(kept) == ["RX-B", "RX-C"]
     assert aside == {"RX-A": "co-located with RX-B; counted once"}
+
+
+def _image_groups(site_of):
+    """A 13.4750 MHz cluster at A and B (A hears more), and its image in the 13.5000 MHz group,
+    where B hears more.  A and B share one coherence group."""
+    rx = {"A": (37.0, -122.0, "gpsdo"), "B": (37.01, -122.0, "gpsdo")}
+    coh = {"A": "s", "B": "s"}
+    shift = -(13.4750e6 - 13.5000e6) / -99_260.0 * 1e3
+    d2 = (100.0 + shift) % 500.0
+    by_group = {"13.4750 -99.26 0.5s": {"A": _cluster_rows(100.0, 4, 200, True, 25.0),
+                                        "B": _cluster_rows(100.0, 4, 100, True, 25.0)},
+                "13.5000 -99.26 0.5s": {"A": _cluster_rows(d2, 4, 50, True, 15.0),
+                                        "B": _cluster_rows(d2, 4, 80, True, 15.0)}}
+    if site_of == "all":
+        site_of = site_map(by_group, rx, coh)
+    return [analyse_group(gk, rows, [], rx, None, coh, site_of) for gk, rows in by_group.items()]
+
+
+def test_site_chosen_once_so_cross_group_image_is_flagged():
+    g1, g2 = _image_groups("all")
+    assert list(g1["stations"]) == list(g2["stations"]) == ["A"]     # 250 captures beat 180
+    flag_images([g1, g2])
+    assert [c.get("image", False) for c in g2["stations"]["A"]] == [True]
+    assert any(v.startswith("image of 13.4750") for v in g2["set_aside"].values())
+    assert g2["set_aside"]["B"] == "co-located with A; counted once"
+
+
+def test_per_group_choice_would_miss_that_image():
+    # The control: without one site map, each group keeps its own capture leader and the
+    # image goes unflagged.  This pins why run_attribution must pass site_of.
+    g1, g2 = _image_groups(None)
+    assert list(g1["stations"]) == ["A"] and list(g2["stations"]) == ["B"]
+    flag_images([g1, g2])
+    assert not any(c.get("image") for c in g2["stations"]["B"])
+
+
+def test_site_map_prefers_gpsdo_then_total_captures():
+    rows = _cluster_rows(40.0, 10, 50)
+    rx = {"RX-A": (37.0, -122.0, "grid"), "RX-B": (37.01, -122.0, "gpsdo"),
+          "RX-C": (37.02, -122.0, "gpsdo")}
+    by_group = {"g1": {"RX-A": rows, "RX-B": rows[:10], "RX-C": rows[:20]},
+                "g2": {"RX-B": rows[:20], "RX-C": rows[:5]}}
+    assert site_map(by_group, rx, None) == {"RX-A": "RX-B", "RX-B": "RX-B", "RX-C": "RX-B"}
 
 
 def test_reporter_without_position_is_set_aside():

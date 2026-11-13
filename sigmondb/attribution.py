@@ -90,12 +90,13 @@ def sky_km(d, h, hops):
     return 2 * hops * math.sqrt(RE ** 2 + r ** 2 - 2 * RE * r * math.cos(th))
 
 
-def modes(d, rx, policy, tight=True, gw_ok=True):
+def modes(d, rx, policy, tight=True, *, gw_ok):
     """Possible propagation modes for a path of d km: (name, delay ms, tolerance ms).
 
     Ground wave only for a cluster that holds still (tight), since a ground-wave path cannot
     wander, and only at a receiver whose position came from its GPSDO (gw_ok); 1F up to
-    3800 km, 2F from 3000 km."""
+    3800 km, 2F from 3000 km.  gw_ok has no default: a caller that forgets it fails rather
+    than granting ground wave to a typed-grid receiver."""
     out = []
     reach = (policy.gw_reach_km if policy.gw_reach_km is not None
              else (300.0 if rx in COASTAL else 100.0))
@@ -241,15 +242,21 @@ def candidates_for(centre, rate, sites):
     return same_sign or exact, len(exact) - len(same_sign)
 
 
-def collapse_colocated(rows_by_st, rxpos, coherence):
-    """Count reporters at one site as one station.
+def site_map(rows_by_group, rxpos, coherence):
+    """Each reporter's site representative, chosen once across every group.
 
-    Reporters that share a non-empty coherence group, or stand within CO_SITE_KM of each other,
-    form one site.  The site keeps the reporter with the most captures (a reporter with a
-    position beats one without, so a site never loses its position); the others go to the
-    returned set-aside map.  Returns (rows_by_st kept, {reporter: reason})."""
+    rows_by_group: group key -> {reporter: rows}.  Reporters that share a non-empty coherence
+    group, or stand within CO_SITE_KM of each other, form one site.  The site counts as the
+    member ranked highest by (has a position, position from its GPSDO, captures summed over all
+    groups, name).  A GPSDO position keeps ground-wave reach.  One choice for all groups keeps
+    flag_images, which pairs clusters across groups by reporter, comparing like with like.
+    Returns {reporter: representative}."""
     coherence = coherence or {}
-    sts = sorted(rows_by_st)
+    caps = {}
+    for rows_by_st in rows_by_group.values():
+        for st, rows in rows_by_st.items():
+            caps[st] = caps.get(st, 0) + len({r[0] for r in rows})
+    sts = sorted(caps)
     parent = {s: s for s in sts}
 
     def find(s):
@@ -266,23 +273,41 @@ def collapse_colocated(rows_by_st, rxpos, coherence):
                 same = gc_km(rxpos[a][:2], rxpos[b][:2]) <= CO_SITE_KM
             if same:
                 parent[find(b)] = find(a)
-    sites = {}
+    members = {}
     for s in sts:
-        sites.setdefault(find(s), []).append(s)
+        members.setdefault(find(s), []).append(s)
+    out = {}
+    for ms in members.values():
+        best = max(ms, key=lambda s: (s in rxpos, s in rxpos and rxpos[s][2] == "gpsdo",
+                                      caps[s], s))
+        out.update((s, best) for s in ms)
+    return out
+
+
+def collapse_colocated(rows_by_st, rxpos, coherence, site_of=None):
+    """Count reporters at one site as one station.
+
+    site_of comes from site_map over every group; without it, this group alone decides.  Only
+    each site's representative keeps its rows.  The others go to the returned set-aside map,
+    even in a group where the representative heard nothing: a site's vote never changes hands
+    between groups.  Returns (rows_by_st kept, {reporter: reason})."""
+    if site_of is None:
+        site_of = site_map({"": rows_by_st}, rxpos, coherence)
     kept, aside = {}, {}
-    for members in sites.values():
-        best = max(members, key=lambda s: (s in rxpos, len({r[0] for r in rows_by_st[s]}), s))
-        kept[best] = rows_by_st[best]
-        for s in members:
-            if s != best:
-                aside[s] = f"co-located with {best}; counted once"
-    return dict(sorted(kept.items())), aside
+    for st in sorted(rows_by_st):
+        rep = site_of.get(st, st)
+        if rep == st:
+            kept[st] = rows_by_st[st]
+        else:
+            aside[st] = f"co-located with {rep}; counted once"
+    return kept, aside
 
 
-def analyse_group(gk, rows_by_st, sites, rxpos, eng_period, coherence=None):
+def analyse_group(gk, rows_by_st, sites, rxpos, eng_period, coherence=None, site_of=None):
     """Clusters per station for one sweep group, with the rung and twin guards applied.
 
     rows_by_st: reporter -> [(t, d_ms, level, live)].  rxpos: reporter -> (lat, lon, pos_source).
+    site_of: site_map over every group; a caller running several groups must pass it.
     Images need every group at once; flag_images runs after this, across groups."""
     centre, rate, kperiod = parse_key(gk)
     cands, opp_sign = candidates_for(centre, rate, sites)
@@ -299,7 +324,7 @@ def analyse_group(gk, rows_by_st, sites, rxpos, eng_period, coherence=None):
     g = {"key": gk, "centre": centre, "rate": rate, "P": P, "R": R, "cands": cands,
          "opp_sign": opp_sign, "stations": {}, "caps": {}, "sets": [], "named": [], "notes": [],
          "set_aside": {}}
-    rows_by_st, aside = collapse_colocated(rows_by_st, rxpos, coherence)
+    rows_by_st, aside = collapse_colocated(rows_by_st, rxpos, coherence, site_of)
     g["set_aside"].update(aside)
     for st, rows in rows_by_st.items():
         if st not in rxpos:
