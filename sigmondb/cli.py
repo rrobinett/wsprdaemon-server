@@ -17,7 +17,7 @@ from sigmondb.load import insert_file, insert_rows
 from sigmondb.rows import read_rows, write_rows
 
 DEFAULT_CONF = "/etc/wsprdaemon/clickhouse.conf"
-SOLVER_VERSION = "groundwave-2"
+SOLVER_VERSION = "groundwave-3"
 _LINE = re.compile(r'^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.*?)\s*$')
 
 
@@ -239,25 +239,38 @@ def _one_per_capture(arrivals):
     return kept, len(arrivals) - len(kept)
 
 
-def _from_db(a):
+def _carried(arr, rx, latest_detector=True):
+    """Count each arrival at its radiod (_at_radiod), THEN keep the latest detector per capture,
+    THEN one row per capture.  In that order: judged on the old labels, one capture carried
+    under KFS-MAIN and KFS/MAIN by two detector versions would keep both rows and reach
+    KFS-OMNI twice.  Returns (arrivals, duplicates dropped)."""
+    arr = _at_radiod(arr, rx, load_transporters())
+    if latest_detector:
+        arr = _latest_detector(arr)
+    return _one_per_capture(arr)
+
+
+def _from_db(a, client=None):
     """(arrivals, transmitters, receivers) from the registry, every table read FINAL so a
-    re-ingested row counts once.  Arrivals: anchored only; by default the latest
-    detector_version per (reporter_id, group_key, time); --detector-version picks one instead.
-    Each arrival counts at the receiver whose radiod heard it (_at_radiod)."""
-    client = connect(a.conf)
+    re-ingested row counts once.  Arrivals: anchored only, within --days; by default the
+    latest detector_version per (reporter_id, group_key, time), judged after each arrival
+    counts at the receiver whose radiod heard it (_carried); --detector-version picks one."""
+    client = client or connect(a.conf)
 
     def fetch(table, where="", params=None):
         return _fetch(client, table, ddl.COLUMNS[table], where, params)
 
-    where = "WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000"
+    where = ("WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000 "
+             "AND time > now() - INTERVAL {days:Float64} DAY")
+    params = {"days": float(a.days)}
     if a.detector_version:
         arr = fetch("arrival", where + " AND detector_version = {dv:String}",
-                    {"dv": a.detector_version})
+                    dict(params, dv=a.detector_version))
     else:
-        arr = _latest_detector(fetch("arrival", where))
+        arr = fetch("arrival", where, params)
     rx = fetch("receiver")
-    arr, dropped = _one_per_capture(_at_radiod(arr, _latest(rx, "reporter_id"),
-                                               load_transporters()))
+    arr, dropped = _carried(arr, _latest(rx, "reporter_id"),
+                            latest_detector=not a.detector_version)
     if dropped:
         print("solve: %d duplicate carried arrivals dropped" % dropped, file=sys.stderr)
     return arr, fetch("transmitter"), rx
@@ -279,8 +292,7 @@ def _attribution_inputs(client, days):
     break the same way every run.
     rxpos: reporter_id -> (lat, lon, pos_source) from the latest receiver row with a position;
     coherence: reporter_id -> coherence_group for the same rows."""
-    arr = _latest_detector(_fetch(client, "arrival", _ATTR_ARRIVAL_COLS, _ATTR_WHERE,
-                                  {"days": float(days)}))
+    arr = _fetch(client, "arrival", _ATTR_ARRIVAL_COLS, _ATTR_WHERE, {"days": float(days)})
     for r in arr:
         eng = r.get("engineering") or {}
         r["live"] = "sweep_repetition_hz" in eng
@@ -314,7 +326,7 @@ def _attribution_inputs(client, days):
     placed = [r for r in rx if r.get("lat") is not None and r.get("lon") is not None]
     rxpos = {r["reporter_id"]: (r["lat"], r["lon"], r.get("pos_source") or "") for r in placed}
     coherence = {r["reporter_id"]: r.get("coherence_group") or "" for r in placed}
-    arr, dropped = _one_per_capture(_at_radiod(arr, rx, load_transporters()))
+    arr, dropped = _carried(arr, rx)
     print("attribute: %d duplicate carried arrivals dropped" % dropped)
     return arr, sites, rxpos, coherence
 
@@ -377,21 +389,49 @@ def _read_receivers(path):
     return read_rows(path)
 
 
+# The latest attribution run per (group_key, mode_policy).  run_id hashes the inputs, so a run
+# on changed inputs adds rows beside the old run's, and FINAL alone would keep both.
+_LATEST_ATTRIBUTION = (
+    "WHERE (group_key, mode_policy, run_at) IN (SELECT group_key, mode_policy, max(run_at) "
+    "FROM %s.attribution GROUP BY group_key, mode_policy)" % ddl.DATABASE)
+
+
+def _latest_attributions(client):
+    """sigmondb.attribution rows of the latest run per (group_key, mode_policy); [] when the
+    table holds none.  apply_attribution picks the default-policy names among them."""
+    return _fetch(client, "attribution", ddl.COLUMNS["attribution"], _LATEST_ATTRIBUTION)
+
+
 def cmd_solve(a):
+    """Fixed ground-wave clusters -> sigmondb.solution rows (--write-db) or JSON Lines (--out).
+    Names come only from default-policy attribution rows (attribution.apply_attribution);
+    a cluster left unnamed gets no offset."""
+    from sigmondb.attribution import apply_attribution
+    client = None
     if a.from_db:
-        arr, tx, rx = _from_db(a)
+        client = connect(a.conf)
+        arr, tx, rx = _from_db(a, client)
+        attrs = [] if a.no_attribution else _latest_attributions(client)
     else:
         arr = read_rows(a.arrivals)
         tx = read_rows(a.transmitters) if a.transmitters else []
         rx = _read_receivers(a.receivers) if a.receivers else []
+        attrs = read_rows(a.attributions) if a.attributions else []
     aside = {}
     clusters = fixed_clusters(arr, rx, max_sd_ns=a.max_sd_us * 1000.0, set_aside=aside)
     for rid, why in sorted(aside.items()):
         print("set aside %s: %s" % (rid, why), file=sys.stderr)
+    for key, why in sorted(apply_attribution(clusters, attrs).items()):
+        print("attribution not applied %s: %s" % (key, why), file=sys.stderr)
     sols = ground_wave_solutions(clusters, tx, rx, SOLVER_VERSION,
                                  max_ground_km=a.max_ground_km)
-    n = write_rows(a.out, sols)
-    print("solution: %d rows" % n)
+    print("solve: %d clusters, %d named" % (len(clusters), sum(1 for s in sols if s["tx_id"])))
+    if a.out:
+        print("solution: %d rows" % write_rows(a.out, sols))
+        return 0
+    client = client or connect(a.conf)
+    ddl.ensure_schema(client)
+    print("solution: %d rows" % insert_rows(client, "solution", sols))
     return 0
 
 
@@ -448,8 +488,12 @@ def build_parser():
     s.add_argument("--out", help="write JSON Lines here and leave the database alone")
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_attribute)
-    s = sub.add_parser("solve")
-    s.add_argument("--out", required=True)
+    s = sub.add_parser("solve", help="fixed ground-wave clusters, named from the latest "
+                                      "attribution run; write sigmondb.solution or --out")
+    o = s.add_mutually_exclusive_group(required=True)
+    o.add_argument("--out", help="write JSON Lines here and leave the database alone")
+    o.add_argument("--write-db", action="store_true",
+                   help="insert the solutions into sigmondb.solution")
     g = s.add_mutually_exclusive_group(required=True)
     g.add_argument("--from-db", action="store_true")
     g.add_argument("--arrivals")
@@ -464,6 +508,12 @@ def build_parser():
     s.add_argument("--detector-version",
                    help="with --from-db: use only this detector_version (default: the latest, "
                         "in lexical order, per reporter and group)")
+    s.add_argument("--days", type=float, default=30.0,
+                   help="with --from-db: arrivals from the last DAYS days (default 30)")
+    s.add_argument("--no-attribution", action="store_true",
+                   help="with --from-db: attach no names from sigmondb.attribution")
+    s.add_argument("--attributions",
+                   help="with --arrivals: attribution rows (JSON Lines) to name clusters from")
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_solve)
     s = sub.add_parser("publish",

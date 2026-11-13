@@ -2,6 +2,8 @@
 import os
 import sys
 import types
+
+import pytest
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -221,7 +223,8 @@ def test_from_db_detector_version_overrides(monkeypatch):
     assert sorted(r["delay_ns"] for r in arr) == [1, 4]
     call = [k for k in c.calls if ".arrival" in k["sql"]][0]
     assert "detector_version = {dv:String}" in call["sql"]
-    assert call["parameters"] == {"dv": "offline-2026-11"}
+    assert call["parameters"] == {"dv": "offline-2026-11", "days": 30.0}
+    assert "INTERVAL {days:Float64} DAY" in call["sql"]
 
 
 def test_from_db_converts_times_to_naive_utc(monkeypatch):
@@ -472,3 +475,99 @@ def test_summary_counts_named_by_exact_status():
         "1 fits_gw900 (never named)")
     assert cli._summary("default", 4, rows_[:2]) == \
         "attribute default: 4 groups, 2 named, 0 ambiguous, 0 unattributable"
+
+
+# --- solve: attribution names, --write-db -----------------------------------------------------
+from test_sigmondb_attribution import (  # noqa: E402
+    HOOK_D_NS, RX_ROWS as GW_RX, TX_ROWS as GW_TX, _attr, _gw_arrivals)
+
+
+def _sols(c):
+    return [r for t, r in c.inserted if t == "sigmondb.solution"]
+
+
+def test_solve_write_db_inserts_solutions_and_tolerates_an_empty_attribution_table(monkeypatch):
+    c = _db(monkeypatch, {"arrival": _gw_arrivals(rid="UACNJ", centre_ns=HOOK_D_NS),
+                          "receiver": GW_RX, "attribution": []})
+    assert cli.main(["solve", "--from-db", "--write-db"]) == 0
+    assert any(t == "sigmondb.solution" for t, _ in c.inserted)
+    assert any("CREATE TABLE IF NOT EXISTS sigmondb.solution" in s for s in c.commands)
+    assert all(r["tx_id"] == "" and r["solver_version"] == "groundwave-3" for r in _sols(c))
+
+
+def test_solve_needs_out_or_write_db():
+    with pytest.raises(SystemExit):
+        cli.main(["solve", "--from-db"])
+    with pytest.raises(SystemExit):
+        cli.main(["solve", "--from-db", "--write-db", "--out", "x"])
+
+
+def test_solve_from_db_attaches_a_default_name_and_reads_the_latest_run(monkeypatch):
+    c = _db(monkeypatch, {"arrival": _gw_arrivals(), "receiver": GW_RX, "transmitter": GW_TX,
+                          "attribution": [_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS)]})
+    assert cli.main(["solve", "--from-db", "--write-db", "--days", "7"]) == 0
+    sols = _sols(c)
+    assert [s["tx_id"] for s in sols] == ["hfrnet:HOOK"] and sols[0]["offset_ns"] is not None
+    asql = [k for k in c.calls if ".attribution" in k["sql"]][0]["sql"]
+    assert "FROM sigmondb.attribution FINAL" in asql
+    # the latest run per (group_key, mode_policy): run_id hashes the inputs, so FINAL alone
+    # would keep an older run's rows beside the newer ones
+    assert "max(run_at)" in asql and "GROUP BY group_key, mode_policy" in asql
+    arr_call = [k for k in c.calls if ".arrival" in k["sql"]][0]
+    assert arr_call["parameters"] == {"days": 7.0}
+
+
+def test_solve_from_db_never_attaches_a_gw900_fit(monkeypatch, capsys):
+    gw = dict(_attr("hfrnet:HOOK", "fits_gw900", "UACNJ", HOOK_D_NS), mode_policy="gw_only_900km")
+    c = _db(monkeypatch, {"arrival": _gw_arrivals(), "receiver": GW_RX, "transmitter": GW_TX,
+                          "attribution": [gw]})
+    assert cli.main(["solve", "--from-db", "--write-db"]) == 0
+    assert [s["tx_id"] for s in _sols(c)] == [""] and _sols(c)[0]["offset_ns"] is None
+
+
+def test_solve_no_attribution_reads_no_names(monkeypatch):
+    c = _db(monkeypatch, {"arrival": _gw_arrivals(), "receiver": GW_RX, "transmitter": GW_TX,
+                          "attribution": [_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS)]})
+    assert cli.main(["solve", "--from-db", "--write-db", "--no-attribution"]) == 0
+    assert [s["tx_id"] for s in _sols(c)] == [""]
+    assert not any(".attribution" in k["sql"] for k in c.calls)
+
+
+def test_solve_from_files_with_attributions_prints_reasons(tmp_path, capsys):
+    rows.write_rows(tmp_path / "a.jsonl", _gw_arrivals())
+    rows.write_rows(tmp_path / "r.jsonl", GW_RX)
+    rows.write_rows(tmp_path / "t.jsonl", GW_TX)
+    rows.write_rows(tmp_path / "at.jsonl",
+                    [dict(_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS),
+                          alias_tx_ids=["hfrnet:HEMP"])])
+    out = tmp_path / "s.jsonl"
+    assert cli.main(["solve", "--arrivals", str(tmp_path / "a.jsonl"),
+                     "--receivers", str(tmp_path / "r.jsonl"),
+                     "--transmitters", str(tmp_path / "t.jsonl"),
+                     "--attributions", str(tmp_path / "at.jsonl"), "--out", str(out)]) == 0
+    assert [s["tx_id"] for s in rows.read_rows(out)] == [""]
+    err = capsys.readouterr().err
+    assert "attribution not applied UACNJ|4.4630 -25.73|" in err and "co-sited with hfrnet:HEMP" in err
+
+
+def test_from_db_picks_the_detector_after_relabelling_at_the_radiod(monkeypatch):
+    # One KFS capture carried under both labels, by two detector versions, at delays in two
+    # different microsecond bins.  Relabelled first, the latest detector keeps one row; judged
+    # on the old labels, both rows would reach KFS-OMNI.
+    a = dict(KFS_LIVE_ROWS[0], reporter_id="KFS-MAIN", detector_version="codar-sounder/0.7.0")
+    b = dict(KFS_LIVE_ROWS[0], reporter_id="KFS/MAIN", detector_version="codar-sounder/0.8.0",
+             delay_ns=KFS_LIVE_ROWS[0]["delay_ns"] + 3_000)
+    _db(monkeypatch, {"arrival": [a, b], "receiver": RX_ROWS})
+    arr, _, _ = cli._from_db(_ns())
+    assert [(r["reporter_id"], r["detector_version"]) for r in arr] == \
+        [("KFS-OMNI", "codar-sounder/0.8.0")]
+
+
+def test_attribution_inputs_pick_the_detector_after_relabelling(monkeypatch):
+    a = dict(KFS_LIVE_ROWS[0], reporter_id="KFS-MAIN", detector_version="codar-sounder/0.7.0")
+    b = dict(KFS_LIVE_ROWS[0], reporter_id="KFS/MAIN", detector_version="codar-sounder/0.8.0",
+             delay_ns=KFS_LIVE_ROWS[0]["delay_ns"] + 3_000)
+    c = _db(monkeypatch, {"arrival": [a, b], "transmitter": TX, "waveform": WF,
+                          "receiver": RX_ROWS})
+    arr, _, _, _ = cli._attribution_inputs(c, 30.0)
+    assert [r["detector_version"] for r in arr] == ["codar-sounder/0.8.0"]

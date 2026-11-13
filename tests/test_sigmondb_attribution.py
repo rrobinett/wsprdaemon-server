@@ -526,3 +526,102 @@ def test_a_candidate_without_period_stays_a_candidate():
     only = [dict(SITES[1], period=None)]
     g = analyse_group("4.7850 -25.73", {"KFS-OMNI": _cluster_rows(40.0, 10, 50)}, only, RX, 2.0)
     assert g["P"] == 500.0                              # no candidate period: engineering's
+
+
+# --- apply_attribution: names reach the ground-wave solver's fixed clusters -----------------
+from sigmondb.attribution import NAMED_STATUSES, apply_attribution  # noqa: E402
+from sigmondb.groundwave import C_M_PER_S, fixed_clusters, ground_wave_solutions, great_circle_m  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_sigmondb_groundwave import _arrivals as _gw_base  # noqa: E402
+
+# UACNJ at its typed-grid centre (FN20mv, from the seed), labelled gpsdo so ground wave applies.
+# hfrnet:HOOK here is a synthetic site about 95 km east of it, not the real radar's position.
+_UACNJ = grid_to_latlon("FN20mv")
+_HOOK = (_UACNJ[0], _UACNJ[1] + 1.13)
+RX_ROWS = [dict(reporter_id="UACNJ", lat=_UACNJ[0], lon=_UACNJ[1], pos_source="gpsdo",
+                pos_sigma_m=10.0, version=1)]
+TX_ROWS = [dict(tx_id="hfrnet:HOOK", lat=_HOOK[0], lon=_HOOK[1], pos_sigma_m=100.0, version=1)]
+HOOK_D_NS = round(great_circle_m(*_UACNJ, *_HOOK) / C_M_PER_S * 1e9) + 7_000   # offset 7 us
+
+
+def _gw_arrivals(rid="UACNJ", centre_ns=HOOK_D_NS, seed=1):
+    """Fixed-delay arrivals at UACNJ, 11-07: 03-09 Z is night there and 15-20 Z day (sun
+    below -12 and above +12 degrees at FN20mv)."""
+    return _gw_base(centre_ns, seed=seed, reporter_id=rid)
+
+
+def _attr(tx, status, rid, d_ns):
+    return dict(tx_id=tx, status=status, mode_policy="default", group_key="4.4630 -25.73",
+                period_ns=1_000_000_000, alias_tx_ids=[], reporter_ids=[rid],
+                cluster_delays_ns=[d_ns])
+
+
+def test_named_statuses_are_exactly_the_default_policys_names():
+    assert NAMED_STATUSES == ("named", "named_two_stations")
+
+
+def test_a_named_cluster_reaches_the_solution_with_offset():
+    arr = _gw_arrivals(rid="UACNJ", centre_ns=HOOK_D_NS)    # fixed day and night, 95 km from HOOK
+    cl = fixed_clusters(arr, RX_ROWS)
+    reasons = apply_attribution(cl, [_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS)])
+    sol = ground_wave_solutions(cl, TX_ROWS, RX_ROWS, "groundwave-3")
+    assert reasons == {} and sol[0]["tx_id"] == "hfrnet:HOOK" and sol[0]["offset_ns"] is not None
+    assert abs(sol[0]["offset_ns"] - 7_000) < 2_000
+
+
+def test_ambiguous_and_gw900_rows_never_name():
+    for a in (_attr("hfrnet:HOOK", "ambiguous", "UACNJ", HOOK_D_NS),
+              _attr("hfrnet:HOOK", "unattributable", "UACNJ", HOOK_D_NS),
+              dict(_attr("hfrnet:HOOK", "fits_gw900", "UACNJ", HOOK_D_NS),
+                   mode_policy="gw_only_900km"),
+              # Even a GW900 row that said "named" must not attach: the policy decides.
+              dict(_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS),
+                   mode_policy="gw_only_900km")):
+        cl = fixed_clusters(_gw_arrivals(rid="UACNJ", centre_ns=HOOK_D_NS), RX_ROWS)
+        apply_attribution(cl, [a])
+        assert cl[0]["tx_ids"] == [""], a
+        sol = ground_wave_solutions(cl, TX_ROWS, RX_ROWS, "groundwave-3")
+        assert sol[0]["tx_id"] == "" and sol[0]["offset_ns"] is None
+
+
+def test_a_name_must_match_reporter_group_and_delay():
+    for a in (_attr("hfrnet:HOOK", "named", "K3LR/D", HOOK_D_NS),
+              dict(_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS), group_key="4.7850 -25.73"),
+              _attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS + 60_000),
+              _attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS + 1_500_000_000)):
+        cl = fixed_clusters(_gw_arrivals(), RX_ROWS)
+        assert apply_attribution(cl, [a]) == {}
+        assert cl[0]["tx_ids"] == [""], a
+    # Modulo the period: a delay whole periods away, or wrapped just below one period, names
+    # the same cluster.
+    for d in (HOOK_D_NS + 2_000_000_000, HOOK_D_NS - 1_000_000_000 + 20_000):
+        cl = fixed_clusters(_gw_arrivals(), RX_ROWS)
+        apply_attribution(cl, [_attr("hfrnet:HOOK", "named", "UACNJ", d)])
+        assert cl[0]["tx_ids"] == ["hfrnet:HOOK"], d
+
+
+def test_aliased_or_doubly_named_cluster_stays_unnamed():
+    cl = fixed_clusters(_gw_arrivals(rid="UACNJ", centre_ns=HOOK_D_NS), RX_ROWS)
+    r = apply_attribution(cl, [dict(_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS),
+                                    alias_tx_ids=["hfrnet:HEMP"])])
+    assert cl[0]["tx_ids"] == [""] and "co-sited with hfrnet:HEMP" in r[cl[0]["cluster_key"]]
+    cl = fixed_clusters(_gw_arrivals(rid="UACNJ", centre_ns=HOOK_D_NS), RX_ROWS)
+    r = apply_attribution(cl, [_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS),
+                               _attr("hfrnet:LOVE", "named", "UACNJ", HOOK_D_NS + 10_000)])
+    assert cl[0]["tx_ids"] == [""] and r[cl[0]["cluster_key"]].startswith("two names")
+
+
+def test_a_twin_cluster_is_never_named():
+    # A named row lists the cluster at D; its 1.632 ms twin sits outside match_tol_ns.
+    arr = _gw_arrivals(rid="UACNJ", centre_ns=HOOK_D_NS) + \
+        _gw_arrivals(rid="UACNJ", centre_ns=HOOK_D_NS + 1_632_000, seed=2)
+    cl = fixed_clusters(arr, RX_ROWS)
+    apply_attribution(cl, [_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS)])
+    assert sorted(c["tx_ids"][0] for c in cl) == ["", "hfrnet:HOOK"]
+
+
+def test_a_cluster_the_station_named_differently_keeps_its_name():
+    cl = fixed_clusters(_gw_base(HOOK_D_NS, reporter_id="UACNJ", tx_id="hfrnet:OTHER"), RX_ROWS)
+    r = apply_attribution(cl, [_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS)])
+    assert cl[0]["tx_ids"] == ["hfrnet:OTHER"] and "station names hfrnet:OTHER" in r[cl[0]["cluster_key"]]

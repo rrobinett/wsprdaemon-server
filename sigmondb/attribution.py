@@ -659,3 +659,63 @@ def attribution_rows(groups, policy, run_at, window_from, window_to, digest):
                 runner_up_spread_ns=(ru[1] * 1e3 if ru and math.isfinite(ru[1]) else None),
                 runner_up_fits=int(bool(ru) and not ru[0]), flags=list(nm["flags"])))
     return out
+
+
+# ---------------------------------------------------------------- names for the solver
+
+# The only statuses that attach a name, and only under the default policy.  The 900 km pass
+# (gw_only_900km) records its fits and never attaches them (Michael, 11-13); its rows read
+# fits_gw900*, and apply_attribution also checks the policy, so a GW900 row that somehow read
+# "named" would still attach nothing.
+NAMED_STATUSES = ("named", "named_two_stations")
+
+
+def _period_gap(a, b, period):
+    d = abs(a - b)
+    if period:
+        d %= period
+        d = min(d, period - d)
+    return d
+
+
+def apply_attribution(clusters, attributions, match_tol_ns=50_000):
+    """Attach names from sigmondb.attribution rows to groundwave.fixed_clusters, in place.
+
+    A cluster (one reporter, one group) takes tx_ids = [tx] when every row that matches it
+    names the one tx and lists no co-sited alias.  A row matches when its mode_policy is
+    "default", its status is in NAMED_STATUSES, its group_key equals the cluster's, and one of
+    its members sits at the cluster's reporter with a cluster delay within match_tol_ns of
+    fixed_delay_ns, modulo period_ns.  Two names, or a name with aliases, leave the cluster
+    unnamed.  A cluster the station already named differently stays as it is.
+    Returns {cluster_key: reason} for each matched cluster left unnamed."""
+    rows = [r for r in attributions
+            if r.get("mode_policy") == "default" and r.get("status") in NAMED_STATUSES]
+    reasons = {}
+    for c in clusters:
+        if len(c["reporter_ids"]) != 1:
+            continue
+        rid = c["reporter_ids"][0]
+        hits = []
+        for r in rows:
+            if r.get("group_key") != c["group_key"]:
+                continue
+            P = r.get("period_ns") or 0
+            if any(st == rid and _period_gap(d, c["fixed_delay_ns"], P) <= match_tol_ns
+                   for st, d in zip(r.get("reporter_ids") or [], r.get("cluster_delays_ns") or [])):
+                hits.append(r)
+        if not hits:
+            continue
+        names = sorted({r["tx_id"] for r in hits})
+        aliases = sorted({a for r in hits for a in (r.get("alias_tx_ids") or [])})
+        own = [t for t in c.get("tx_ids", []) if t]
+        if len(names) > 1:
+            reasons[c["cluster_key"]] = "two names: %s" % ", ".join(names)
+        elif aliases:
+            reasons[c["cluster_key"]] = "named %s but co-sited with %s" % (
+                names[0], ", ".join(aliases))
+        elif own and own != names:
+            reasons[c["cluster_key"]] = "station names %s, attribution names %s" % (
+                ", ".join(own), names[0])
+        else:
+            c["tx_ids"] = [names[0]]
+    return reasons
