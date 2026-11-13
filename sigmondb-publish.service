@@ -1,0 +1,18 @@
+[Unit]
+Description=Build sigmondb_public from sigmondb and replace it on the public servers
+After=clickhouse-server.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=wsprdaemon
+Group=wsprdaemon
+WorkingDirectory=/home/wsprdaemon/wsprdaemon-server
+# CH_PUB_USER, CH_PUB_PASSWORD, CH_PUB_HOSTS (mode 600, owned by wsprdaemon)
+EnvironmentFile=/home/wsprdaemon/.config/sigmondb-public.env
+ExecStart=/opt/wsprdaemon-server/venv/bin/python -m sigmondb publish
+TimeoutStartSec=15min
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sigmondb-publish

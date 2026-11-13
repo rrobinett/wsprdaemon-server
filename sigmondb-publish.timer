@@ -1,0 +1,11 @@
+[Unit]
+Description=Rebuild sigmondb_public every hour
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+Unit=sigmondb-publish.service
+
+[Install]
+WantedBy=timers.target

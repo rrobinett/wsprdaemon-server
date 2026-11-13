@@ -1,7 +1,9 @@
-"""python -m sigmondb: ddl, seed, backfill-codar, backfill-hfdl, load, solve.
+"""python -m sigmondb: ddl, seed, backfill-codar, backfill-hfdl, load, solve, publish.
 
 Credentials come from /etc/wsprdaemon/clickhouse.conf (--conf overrides the path in tests).
-No verb takes a password.  clickhouse_connect is imported only where a verb needs it.
+No verb takes a password.  publish reads the public servers' credentials from the
+environment (CH_PUB_USER, CH_PUB_PASSWORD, CH_PUB_HOSTS), which its unit's
+EnvironmentFile= sets.  clickhouse_connect is imported only where a verb needs it.
 """
 import argparse
 import re
@@ -203,6 +205,28 @@ def cmd_solve(a):
     return 0
 
 
+def cmd_publish(a):
+    """Build sigmondb_public from this host's sigmondb and replace it on every public host.
+    Exit 1 when any host+table failed, 2 when the environment lacks credentials."""
+    import os
+    from sigmondb import publish
+    user, password = os.environ.get("CH_PUB_USER"), os.environ.get("CH_PUB_PASSWORD")
+    hosts = (os.environ.get("CH_PUB_HOSTS") or "").split()
+    if not (user and password and hosts):
+        print("publish: CH_PUB_USER, CH_PUB_PASSWORD and CH_PUB_HOSTS must all be set",
+              file=sys.stderr)
+        return 2
+    built_at = publish.now_utc()
+    tables = publish.build_all(publish.read_source(connect(a.conf)), built_at)
+    fails = publish.publish(tables, hosts, user, password, timeout=a.timeout,
+                            out=lambda s: print(s, flush=True))
+    if fails:
+        print("publish: %d of %d host+table replacements FAILED"
+              % (len(fails), len(hosts) * len(publish.TABLES)), file=sys.stderr)
+        return 1
+    return 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="python -m sigmondb")
     sub = p.add_subparsers(dest="verb", required=True)
@@ -243,6 +267,12 @@ def build_parser():
                         "in lexical order, per reporter and group)")
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_solve)
+    s = sub.add_parser("publish",
+                       help="build sigmondb_public and replace each table whole on every "
+                            "host in CH_PUB_HOSTS")
+    s.add_argument("--conf", default=DEFAULT_CONF, help="this host's sigmondb credentials")
+    s.add_argument("--timeout", type=float, default=30.0, help="seconds per HTTP request")
+    s.set_defaults(fn=cmd_publish)
     return p
 
 
