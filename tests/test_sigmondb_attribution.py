@@ -18,6 +18,7 @@ from sigmondb.attribution import (  # noqa: E402
     candidates_for, cdiff, collapse_colocated, entries, fake_sites, flag_images, flag_rungs,
     flag_twins, gc_km, modes, parse_key, run_attribution, rung_spacing_ms, site_map, sky_km,
     tuple_fit)
+from sigmondb.attribution import null_flag, null_upper_bound  # noqa: E402
 from sigmondb.receivers import grid_to_latlon  # noqa: E402
 
 FX = Path(__file__).parent / "fixtures" / "sigmondb"
@@ -665,3 +666,22 @@ def test_a_fit_without_a_passing_null_test_never_names():
     apply_attribution(cl, [_attr("hfrnet:HOOK", "named_two_stations", "UACNJ", HOOK_D_NS,
                                  p_null=0.05)])
     assert cl[0]["tx_ids"] == ["hfrnet:HOOK"]
+
+
+# ---------------------------------------------------------------- ruling A10: the two-station bound
+
+def test_null_upper_bound_matches_the_closed_form_and_brackets_the_limit():
+    assert null_upper_bound(0, 400) == pytest.approx(1 - 0.05 ** (1 / 400))      # about 0.0075
+    assert 0.025 < null_upper_bound(10, 400) < P_NULL_MAX
+    assert null_upper_bound(14, 400) > P_NULL_MAX            # point 0.035 passes, bound fails
+    assert null_upper_bound(400, 400) == 1.0
+
+
+def test_two_station_fit_needs_the_upper_bound_under_the_limit():
+    f = null_flag(2, 14, 400)
+    assert f == "two-station null bound 5.4% > 5 %"         # ambiguous through the flags path
+    assert null_flag(3, 14, 400) is None                    # three stations keep the point rule
+    assert null_flag(2, 0, 400) is None                     # stays named_two_stations
+    assert null_flag(2, 10, 400) is None
+    assert null_flag(2, 21, 400).startswith("fake sites match as well")   # point estimate still fails
+    assert null_flag(2, 0, 0) is None                       # no fakes: no test, as before

@@ -68,6 +68,7 @@ RUNG_TOL_MS = 0.15
 IMAGE_TOL_MS = 0.4
 COASTAL = frozenset({"KFS-OMNI", "WB6CXC/7", "UACNJ"})   # paths run mostly over sea
 P_NULL_MAX = 0.05           # a name stands only when fakes match this well in at most 5 % of draws
+P_UPPER_CONF = 0.95         # confidence of the one-sided upper bound that a two-station name must clear
 N_FAKE = 400                # fake sites per group, at least 100 km from every candidate
 ATTRIB_VERSION = "attribute-1"
 
@@ -467,6 +468,53 @@ def fake_sites(cands, n, seed, avoid_km=100.0, avoid_from=None):
 
 # ---------------------------------------------------------------- attribution
 
+def _binom_cdf(k, n, p):
+    """P(X <= k) for X ~ Binomial(n, p), summed from log terms (pure Python)."""
+    if p <= 0.0:
+        return 1.0
+    if p >= 1.0:
+        return 1.0 if k >= n else 0.0
+    lp, lq = math.log(p), math.log1p(-p)
+    tot = 0.0
+    for i in range(k + 1):
+        tot += math.exp(math.lgamma(n + 1) - math.lgamma(i + 1) - math.lgamma(n - i + 1)
+                        + i * lp + (n - i) * lq)
+    return min(tot, 1.0)
+
+
+def null_upper_bound(hits: int, n: int, conf: float = P_UPPER_CONF) -> float:
+    """One-sided Clopper-Pearson upper bound, at confidence conf, on the true rate behind
+    hits successes in n draws: the p at which P(X <= hits) falls to 1 - conf.  Bisection on
+    the binomial CDF; no scipy."""
+    if hits >= n:
+        return 1.0
+    lo, hi = hits / n, 1.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if _binom_cdf(hits, n, mid) > 1 - conf:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def null_flag(n, hits, n_fake):
+    """The null test's flag for a fit of n stations that fakes matched in hits of n_fake draws,
+    or None when it passes.  Point estimate above P_NULL_MAX fails any fit.  A two-station fit
+    must also keep the 95 % upper bound under P_NULL_MAX (ruling A10): its p sits near the limit
+    and would flip between hourly runs on sampling noise."""
+    if not n_fake:
+        return None
+    pn = hits / n_fake
+    if pn > P_NULL_MAX:
+        return f"fake sites match as well in {pn:.0%} of draws"
+    if n == 2:
+        ub = null_upper_bound(hits, n_fake)
+        if ub > P_NULL_MAX:
+            return f"two-station null bound {ub:.1%} > 5 %"
+    return None
+
+
 _ORDER = {"named": 0, "named_two_stations": 1, "ambiguous": 2}
 
 
@@ -507,11 +555,8 @@ def attribute_group(g, rxpos, policy, n_fake, seed):
             fbest.append(best_sets(ents, P))
     g["n_fake"] = len(fbest)
 
-    def p_null(n, spread):
-        if not fbest:
-            return float("nan")
-        hit = sum(1 for bs in fbest if any(x[0] >= n and x[1] <= spread for x in bs))
-        return hit / len(fbest)
+    def null_hits(n, spread):
+        return sum(1 for bs in fbest if any(x[0] >= n and x[1] <= spread for x in bs))
 
     used, named = set(), {}
     for n, spread, ob, mem, s in allsets:
@@ -535,12 +580,14 @@ def attribute_group(g, rxpos, policy, n_fake, seed):
         # A spread finer than the model's own tolerance proves nothing more than a fit within it,
         # so fakes count as equally good down to the tuple's mean tolerance.
         floor = statistics.mean(m[4] for m in mem) * 1e3
-        pn = p_null(n, max(spread, floor))
+        hits = null_hits(n, max(spread, floor))
+        pn = hits / len(fbest) if fbest else float("nan")
         flags = []
         if ru and not ru[0]:
             flags.append(f"runner-up {ru[2]['id']} also fits ({ru[1]:.0f} us)")
-        if pn == pn and pn > P_NULL_MAX:
-            flags.append(f"fake sites match as well in {pn:.0%} of draws")
+        nf = null_flag(n, hits, len(fbest))
+        if nf:
+            flags.append(nf)
         status = "ambiguous" if flags else ("named" if n >= 3 else "named_two_stations")
         gmodes = [m for m in mem if m[2] == "G"]
         if gmodes:
