@@ -248,3 +248,13 @@ def test_solve_max_ground_km_and_toml_receivers(tmp_path, monkeypatch):
     assert seen["kw"] == {"max_ground_km": 150.0}
     assert {r["reporter_id"] for r in seen["rx"]} >= {"K3LR/D", "WB6CXC/7"}
     assert len(rows.read_rows(tmp_path / "s.jsonl")) == 1
+
+
+def test_live_and_backfill_rows_of_one_group_both_survive(monkeypatch):
+    t1, t2 = datetime(2026, 11, 7, 3, tzinfo=timezone.utc), datetime(2026, 11, 13, 3, tzinfo=timezone.utc)
+    _db(monkeypatch, {"arrival": [
+        _arr("W2NAF", "4.4630 -25.73", "offline-2026-11", t=t1, delay=1),
+        _arr("W2NAF", "4.4630 -25.73", "codar-sounder/0.7.0", t=t2, delay=2),
+        _arr("W2NAF", "4.4630 -25.73", "codar-sounder/0.7.0", t=t1, delay=3)]})
+    arr, _, _ = cli._from_db(_ns())
+    assert sorted(r["delay_ns"] for r in arr) == [1, 2]   # t1: offline wins; t2: live kept

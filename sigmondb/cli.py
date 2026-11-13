@@ -133,15 +133,17 @@ def cmd_load(a):
 
 
 def _latest_detector(arr):
-    """Keep, per (reporter_id, group_key), only the rows of the latest detector_version.
-    "Latest" is the largest version string in lexical order: right for the dated names in use
-    (offline-2026-11 < offline-2026-12), wrong for names that do not sort by date."""
+    """Keep, per (reporter_id, group_key, time), only the rows of the latest detector_version.
+    Keyed on the capture time too: different captures keep their own version, so live and
+    back-fill rows of one group both count.  Within one capture "latest" is the largest version
+    string in lexical order: right for the dated names in use (offline-2026-11 < offline-2026-12),
+    wrong for names that do not sort by date."""
     best = {}
     for r in arr:
-        k = (r["reporter_id"], r["group_key"])
+        k = (r["reporter_id"], r["group_key"], r["time"])
         if k not in best or r["detector_version"] > best[k]:
             best[k] = r["detector_version"]
-    return [r for r in arr if r["detector_version"] == best[(r["reporter_id"], r["group_key"])]]
+    return [r for r in arr if r["detector_version"] == best[(r["reporter_id"], r["group_key"], r["time"])]]
 
 
 def _utc_naive(t):
