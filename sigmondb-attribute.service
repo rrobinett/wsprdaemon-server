@@ -1,0 +1,15 @@
+[Unit]
+Description=Attribute T6 ground-wave clusters to CODAR transmitters (sigmondb attribution)
+After=clickhouse-server.service
+
+[Service]
+Type=oneshot
+User=wsprdaemon
+Group=wsprdaemon
+WorkingDirectory=/home/wsprdaemon/wsprdaemon-server
+ExecStart=/opt/wsprdaemon-server/venv/bin/python -m sigmondb attribute
+TimeoutStartSec=30min
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sigmondb-attribute

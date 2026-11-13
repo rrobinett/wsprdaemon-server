@@ -1,7 +1,7 @@
 [Unit]
 Description=Build sigmondb_public from sigmondb and replace it on the public servers
-After=clickhouse-server.service network-online.target
-Wants=network-online.target
+After=sigmondb-solve.service clickhouse-server.service network-online.target
+Wants=sigmondb-solve.service network-online.target
 
 [Service]
 Type=oneshot

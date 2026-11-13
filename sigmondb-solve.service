@@ -1,0 +1,16 @@
+[Unit]
+Description=Solve ground-wave timing from the stored clusters and names (sigmondb solve)
+Wants=sigmondb-attribute.service
+After=sigmondb-attribute.service clickhouse-server.service
+
+[Service]
+Type=oneshot
+User=wsprdaemon
+Group=wsprdaemon
+WorkingDirectory=/home/wsprdaemon/wsprdaemon-server
+ExecStart=/opt/wsprdaemon-server/venv/bin/python -m sigmondb solve --from-db --write-db
+TimeoutStartSec=15min
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sigmondb-solve
