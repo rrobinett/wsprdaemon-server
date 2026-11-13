@@ -605,3 +605,44 @@ def test_solve_summary_separates_station_named_from_attributed(monkeypatch, caps
                           "attribution": [_attr("hfrnet:HOOK", "named", "UACNJ", HOOK_D_NS)]})
     assert cli.main(["solve", "--from-db", "--write-db"]) == 0
     assert "solve: 2 clusters, 1 station-named, 1 attributed" in capsys.readouterr().out
+
+
+# --- receiver-positions ----------------------------------------------------------------------
+def _posfile(tmp_path, doc, mode=0o600):
+    import json
+    f = tmp_path / "pos.json"
+    f.write_text(json.dumps(doc))
+    f.chmod(mode)
+    return f
+
+
+def test_cli_receiver_positions_inserts_new_versions_and_prints_no_coordinate(
+        monkeypatch, tmp_path, capsys):
+    c = _db(monkeypatch, {"receiver": [K3LR_RX]})
+    f = _posfile(tmp_path, {"K3LR/D": {"lat": 41.5551, "lon": -80.7777, "pos_sigma_m": 10.0},
+                            "NOPE": {"lat": 2.0, "lon": 3.0, "pos_sigma_m": 10.0}})
+    assert cli.main(["receiver-positions", "--file", str(f)]) == 0
+    out = capsys.readouterr()
+    assert "receiver-positions: 1 updated, 0 unchanged, 1 unknown: NOPE" in out.out
+    for s in (out.out, out.err):
+        assert "41.5551" not in s and "80.7777" not in s
+    ins = [r for t, r in c.inserted if t == "sigmondb.receiver"]
+    assert len(ins) == 1 and ins[0]["version"] == 2 and ins[0]["pos_source"] == "gpsdo"
+    assert any("FROM sigmondb.receiver FINAL" in k["sql"] for k in c.calls)
+
+
+def test_cli_receiver_positions_counts_unchanged_and_inserts_nothing(monkeypatch, tmp_path, capsys):
+    same = dict(K3LR_RX, lat=41.0, lon=-80.0, pos_sigma_m=10.0, pos_source="gpsdo", version=2)
+    c = _db(monkeypatch, {"receiver": [K3LR_RX, same]})
+    f = _posfile(tmp_path, {"K3LR/D": {"lat": 41.0, "lon": -80.0, "pos_sigma_m": 10.0}})
+    assert cli.main(["receiver-positions", "--file", str(f)]) == 0
+    assert "0 updated, 1 unchanged, 0 unknown" in capsys.readouterr().out
+    assert [r for t, r in c.inserted if t == "sigmondb.receiver"] == []
+
+
+def test_cli_receiver_positions_refuses_a_readable_file(monkeypatch, tmp_path):
+    c = _db(monkeypatch, {"receiver": [K3LR_RX]})
+    f = _posfile(tmp_path, {}, 0o644)
+    with pytest.raises(ValueError, match="mode"):
+        cli.main(["receiver-positions", "--file", str(f)])
+    assert c.inserted == []

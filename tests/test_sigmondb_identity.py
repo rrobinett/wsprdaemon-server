@@ -1,8 +1,11 @@
 """sigmondb identity: HFRNet, HFDL systable, receivers seed.  No ClickHouse needed."""
+import json
 import logging
 import os
 import sys
 import shutil
+
+import pytest
 from datetime import date, datetime
 from pathlib import Path
 
@@ -11,7 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sigmondb import ddl  # noqa: E402
 from sigmondb.hfdl_gs import parse_systable  # noqa: E402
 from sigmondb.hfrnet import parse_hfrnet  # noqa: E402
-from sigmondb.receivers import grid_to_latlon, load_receivers  # noqa: E402
+from sigmondb.groundwave import _latest  # noqa: E402
+from sigmondb.receivers import (grid_to_latlon, load_positions, load_receivers,  # noqa: E402
+                                position_rows)
 
 FX = Path(__file__).parent / "fixtures" / "sigmondb"
 SEED = Path(__file__).parent.parent / "sigmondb" / "seed" / "receivers.toml"
@@ -93,10 +98,10 @@ def test_grid_centre():
     assert abs(lat - 38.9375) < 0.01 and abs(lon - (-92.125)) < 0.01
 
 
-def test_receivers_seed_has_six():
+def test_receivers_seed_has_nine():
     rows = load_receivers(SEED)
-    assert len(rows) == 6
-    assert len({r["reporter_id"] for r in rows}) == 6
+    assert len(rows) == 9
+    assert len({r["reporter_id"] for r in rows}) == 9
     assert all(r["lat"] is not None and r["lon"] is not None for r in rows)
     assert all(set(r) == set(ddl.COLUMNS["receiver"]) for r in rows)
     assert all(r["pos_source"] == "typed_grid" for r in rows)
@@ -142,3 +147,54 @@ def test_receivers_seed_carries_grid_sigma():
     rows = {r["reporter_id"]: r for r in load_receivers(SEED)}
     assert abs(rows["K3LR/D"]["pos_sigma_m"] - 4186.11) < 0.01
     assert all(r["pos_sigma_m"] and r["pos_sigma_m"] > 0 for r in rows.values())
+
+
+def test_seed_names_the_radiods_not_the_transporter():
+    ids = {r["reporter_id"] for r in load_receivers(SEED)}
+    assert {"N8UR", "KFS-OMNI", "AC0G/B1A"} <= ids
+    assert not ids & {"KFS-MAIN", "KFS/MAIN"}
+
+
+def _pos(tmp_path, doc, mode=0o600):
+    f = tmp_path / "pos.json"
+    f.write_text(json.dumps(doc))
+    f.chmod(mode)
+    return f
+
+
+def test_position_rows_version_up_and_say_gpsdo(tmp_path):
+    f = _pos(tmp_path, {"K3LR/D": {"lat": 41.0, "lon": -80.0, "pos_sigma_m": 10.0},
+                        "NOPE": {"lat": 1.0, "lon": 1.0, "pos_sigma_m": 10.0}})
+    rows, unknown = position_rows(load_receivers(SEED), load_positions(f), datetime(2026, 11, 14))
+    assert unknown == ["NOPE"] and len(rows) == 1
+    r = rows[0]
+    assert (r["pos_source"], r["version"], r["lat"]) == ("gpsdo", 2, 41.0)
+    assert r["valid_from"] == datetime(2026, 11, 14)
+    assert _latest(load_receivers(SEED) + rows, "reporter_id")["K3LR/D"] is r
+
+
+def test_a_world_readable_positions_file_is_refused(tmp_path):
+    f = _pos(tmp_path, {}, 0o644)
+    with pytest.raises(ValueError, match="mode"):
+        load_positions(f)
+
+
+def test_a_group_readable_positions_file_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="mode"):
+        load_positions(_pos(tmp_path, {}, 0o640))
+
+
+def test_a_position_entry_missing_a_key_is_refused_without_its_values(tmp_path):
+    f = _pos(tmp_path, {"K3LR/D": {"lat": 41.5551, "lon": -80.0}})
+    with pytest.raises(ValueError) as e:
+        load_positions(f)
+    assert "K3LR/D" in str(e.value) and "pos_sigma_m" in str(e.value)
+    assert "41.5551" not in str(e.value) and "80.0" not in str(e.value)
+
+
+def test_a_position_equal_to_the_latest_row_gets_no_new_version(tmp_path):
+    base = load_receivers(SEED)
+    f = _pos(tmp_path, {"K3LR/D": {"lat": 41.0, "lon": -80.0, "pos_sigma_m": 10.0}})
+    first, _ = position_rows(base, load_positions(f), datetime(2026, 11, 14))
+    again, unknown = position_rows(base + first, load_positions(f), datetime(2026, 11, 15))
+    assert again == [] and unknown == []

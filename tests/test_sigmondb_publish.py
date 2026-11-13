@@ -444,3 +444,13 @@ def test_transmitter_offsets_drop_solutions_older_than_the_publish_age():
     assert publish.build_transmitter_offsets(sols, [_tx("hfrnet:A")], built) == []
     sols = [_sol("hfrnet:A", _utc(2026, 11, 12, 10), 1_000_000)]           # 2 h old
     assert [r["tx_id"] for r in publish.build_transmitter_offsets(sols, [], built)] == ["hfrnet:A"]
+
+
+def test_a_gpsdo_receiver_still_publishes_only_grid6():
+    from sigmondb.receivers import grid_to_latlon
+    rx = dict(reporter_id="K3LR/D", lat=41.0123, lon=-80.0456, a_level="A1",
+              pos_source="gpsdo", pos_sigma_m=10.0, valid_from=datetime(2026, 11, 14), version=2)
+    out = publish.build_receivers([rx], 1.0)[0]
+    assert out["grid6"] == publish.latlon_to_grid6(41.0123, -80.0456)
+    assert (out["lat"], out["lon"]) == grid_to_latlon(out["grid6"])
+    assert set(out) == {"reporter_id", "grid6", "lat", "lon", "a_level", "built_at_utc"}

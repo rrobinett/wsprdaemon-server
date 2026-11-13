@@ -1,4 +1,4 @@
-"""python -m sigmondb: ddl, seed, backfill-codar, backfill-hfdl, load, attribute, solve, publish.
+"""python -m sigmondb: ddl, seed, backfill-codar, backfill-hfdl, load, attribute, receiver-positions, solve, publish.
 
 Credentials come from /etc/wsprdaemon/clickhouse.conf (--conf overrides the path in tests).
 No verb takes a password.  publish reads the public servers' credentials from the
@@ -382,6 +382,24 @@ def cmd_attribute(a):
     return 0
 
 
+def cmd_receiver_positions(a):
+    """Insert a new receiver version for each reporter whose GPSDO position the private file
+    gives.  Prints counts and unknown ids; never a coordinate."""
+    from sigmondb.receivers import load_positions, position_rows
+    positions = load_positions(a.file)
+    client = connect(a.conf)
+    now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    rows, unknown = position_rows(_fetch(client, "receiver", ddl.COLUMNS["receiver"]),
+                                  positions, now)
+    if rows:
+        ddl.ensure_schema(client)
+        insert_rows(client, "receiver", rows)
+    known = len(positions) - len(unknown)
+    print("receiver-positions: %d updated, %d unchanged, %d unknown: %s"
+          % (len(rows), known - len(rows), len(unknown), " ".join(unknown)))
+    return 0
+
+
 def _read_receivers(path):
     if str(path).endswith(".toml"):
         from sigmondb.receivers import load_receivers
@@ -498,6 +516,11 @@ def build_parser():
     s.add_argument("--out", help="write JSON Lines here and leave the database alone")
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_attribute)
+    s = sub.add_parser("receiver-positions",
+                       help="write receiver versions with GPSDO positions from a private file")
+    s.add_argument("--file", required=True, help="JSON, mode 600; never printed")
+    s.add_argument("--conf", default=DEFAULT_CONF)
+    s.set_defaults(fn=cmd_receiver_positions)
     s = sub.add_parser("solve", help="fixed ground-wave clusters, named from the latest "
                                       "attribution run; write sigmondb.solution or --out")
     o = s.add_mutually_exclusive_group(required=True)

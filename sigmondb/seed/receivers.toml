@@ -55,3 +55,30 @@ grid = "CN88ll"
 antenna = ""
 receiver_chain = ""
 coherence_group = ""
+
+[[receiver]]
+reporter_id = "N8UR"
+host_id = "n8ur"
+radiod_id = "N8UR-status.local"
+grid = "EM79vr"
+antenna = ""
+receiver_chain = ""
+coherence_group = ""
+
+[[receiver]]
+reporter_id = "KFS-OMNI"
+host_id = "kfs-omni"
+radiod_id = "KFS-OMNI-status.local"
+grid = "CM87tj"
+antenna = ""
+receiver_chain = ""
+coherence_group = ""
+
+[[receiver]]
+reporter_id = "AC0G/B1A"
+host_id = "b2"
+radiod_id = "ac0g-b1-b-status.local"
+grid = "EM38ww"
+antenna = ""
+receiver_chain = ""
+coherence_group = ""

@@ -1,5 +1,7 @@
 """Receiver identity from sigmondb/seed/receivers.toml."""
+import json
 import math
+import os
 import tomllib
 from datetime import datetime
 from pathlib import Path
@@ -63,3 +65,51 @@ def load_receivers(path):
                    valid_from=SEED_VALID_FROM, version=1)
         rows.append(row)
     return rows
+
+
+_POS_KEYS = ("lat", "lon", "pos_sigma_m")
+
+
+def load_positions(path):
+    """GPSDO positions from a private JSON file: {reporter_id: {lat, lon, pos_sigma_m}}.
+    The file must grant nothing to group or other.  Errors name the reporter and the key,
+    never a value."""
+    path = Path(path)
+    mode = os.stat(path).st_mode & 0o777
+    if mode & 0o077:
+        raise ValueError("positions file %s has mode %03o; it must grant nothing to group "
+                         "or other (chmod 600)" % (path, mode))
+    with open(path) as fh:
+        doc = json.load(fh)
+    if not isinstance(doc, dict):
+        raise ValueError("positions file %s: expected a JSON object keyed by reporter id" % path)
+    out = {}
+    for rid, p in doc.items():
+        for k in _POS_KEYS:
+            if not isinstance(p, dict) or p.get(k) is None:
+                raise ValueError("positions entry %s lacks %s" % (rid, k))
+        out[rid] = {k: float(p[k]) for k in _POS_KEYS}
+    return out
+
+
+def position_rows(latest_rows, positions, now):
+    """(new receiver rows, unknown reporter ids).  Each reporter in `positions` that has a row
+    gets a copy of its latest row at the new position, pos_source gpsdo, version + 1.  A reporter
+    without a row goes to the second list and creates none.  An equal position adds no version."""
+    from sigmondb.groundwave import _latest
+    latest = _latest(latest_rows, "reporter_id")
+    now = now.replace(microsecond=0)
+    rows, unknown = [], []
+    for rid, p in positions.items():
+        old = latest.get(rid)
+        if old is None:
+            unknown.append(rid)
+            continue
+        if (old.get("lat"), old.get("lon"), old.get("pos_sigma_m")) == (
+                p["lat"], p["lon"], p["pos_sigma_m"]):
+            continue
+        new = dict(old)
+        new.update(lat=p["lat"], lon=p["lon"], pos_sigma_m=p["pos_sigma_m"],
+                   pos_source="gpsdo", valid_from=now, version=(old.get("version") or 0) + 1)
+        rows.append(new)
+    return rows, unknown
