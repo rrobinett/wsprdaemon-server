@@ -9,6 +9,8 @@ then exchanged with <t> in one step.  hf-timestd's T3 Phase B consumes them
 Every row carries built_at_utc, unix seconds, one value for the whole build.
 
 transmitter_offsets: the latest solution per tx_id (by window_to) that has an offset.
+  confirming_reporters is that solution's reporter_ids, sorted and deduplicated, so a
+  consumer can join trust to the stations that confirmed the offset.
   SIGN.  The solver (groundwave.ground_wave_solutions) writes
   offset_ns = fixed_delay_ns - distance/c, and an arrival's delay_ns is its phase AFTER
   the sweep start on UTC.  So offset_ns is the time the transmitter emitted minus the UTC
@@ -54,7 +56,8 @@ SCHEMAS = {
     "transmitter_offsets": [
         ("tx_id", "String"), ("kind", "String"), ("offset_ms", "Float64"),
         ("sigma_ms", "Float64"), ("last_confirmed_utc", "Float64"),
-        ("n_confirming", "UInt16"), ("built_at_utc", "Float64")],
+        ("n_confirming", "UInt16"), ("confirming_reporters", "Array(String)"),
+        ("built_at_utc", "Float64")],
     "trust": [
         ("reporter_id", "String"), ("a_level", "String"), ("trusted", "UInt8"),
         ("built_at_utc", "Float64")],
@@ -74,7 +77,7 @@ SCHEMAS = {
 # What read_source() takes from wd30's sigmondb, each table read FINAL.
 SOURCE_COLUMNS = {
     "solution": ("tx_id", "solve_id", "window_to", "offset_ns", "offset_sigma_ns",
-                 "n_stations"),
+                 "n_stations", "reporter_ids"),
     "transmitter": ("tx_id", "kind", "network", "name", "status", "lat", "lon",
                     "pos_sigma_m", "valid_from", "version"),
     "receiver": ("reporter_id", "lat", "lon", "a_level", "valid_from", "version"),
@@ -124,7 +127,9 @@ def build_transmitter_offsets(solutions, transmitters, built_at):
             tx_id=tx_id, kind=(txs.get(tx_id) or {}).get("kind") or "unknown",
             offset_ms=emission_minus_utc_ms(s["offset_ns"]),
             sigma_ms=s["offset_sigma_ns"] / 1e6, last_confirmed_utc=k[0],
-            n_confirming=int(s.get("n_stations") or 0), built_at_utc=built_at))
+            n_confirming=int(s.get("n_stations") or 0),
+            confirming_reporters=sorted(set(s.get("reporter_ids") or [])),
+            built_at_utc=built_at))
     return out
 
 

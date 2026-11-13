@@ -211,8 +211,19 @@ def test_transmitter_offsets_take_the_latest_solution_per_tx():
     a = got["hfrnet:A"]
     assert a == dict(tx_id="hfrnet:A", kind="codar", offset_ms=2.5, sigma_ms=0.15,
                      last_confirmed_utc=_utc(2026, 11, 12).timestamp(), n_confirming=2,
-                     built_at_utc=BUILT)
+                     confirming_reporters=[], built_at_utc=BUILT)
     assert got["hfrnet:C"]["kind"] == "oth" and got["hfrnet:C"]["offset_ms"] == -0.5
+
+
+def test_confirming_reporters_are_the_chosen_solutions_reporter_ids():
+    sols = [dict(_sol("hfrnet:A", _utc(2026, 11, 10), 1_000_000), reporter_ids=["OLD"]),
+            dict(_sol("hfrnet:A", _utc(2026, 11, 12), 2_500_000, n=3),
+                 reporter_ids=["W1AW", "AC0G/B4", "W1AW"])]
+    r = publish.build_transmitter_offsets(sols, [_tx("hfrnet:A")], BUILT)[0]
+    assert r["confirming_reporters"] == ["AC0G/B4", "W1AW"]
+    assert r["n_confirming"] == 3
+    assert ("confirming_reporters", "Array(String)") in publish.SCHEMAS["transmitter_offsets"]
+    assert "reporter_ids" in publish.SOURCE_COLUMNS["solution"]
 
 
 def test_a_naive_window_to_counts_as_utc():
