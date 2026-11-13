@@ -82,3 +82,35 @@ def insert_file(client, table, path, batch=50_000):
             flush()
     flush()
     return total
+
+
+def insert_rows(client, table, rows, batch=50_000):
+    """Insert row dicts: the same whitelist, '' fill and None check as insert_file.
+    Every row is checked before the first insert.  Returns the row count."""
+    cols = list(ddl.COLUMNS[table])
+    fill, strict = _fillers(table)
+    bad = {}
+    for row in rows:
+        for c in strict:
+            if row.get(c) is None:
+                bad[c] = bad.get(c, 0) + 1
+    if bad:
+        raise ValueError("sigmondb.%s: None in non-Nullable column(s): %s" % (
+            table, ", ".join("%s (%d rows)" % kv for kv in bad.items())))
+    target = "%s.%s" % (ddl.DATABASE, table)
+    warned, buf, total = set(), [], 0
+    for row in rows:
+        row = whitelist(table, row, warned)
+        t = [_utc(row.get(c)) for c in cols]
+        for i, c in enumerate(cols):
+            if t[i] is None and c in fill:
+                t[i] = fill[c]
+        buf.append(tuple(t))
+        if len(buf) >= batch:
+            client.insert(target, buf, column_names=cols)
+            total += len(buf)
+            buf = []
+    if buf:
+        client.insert(target, buf, column_names=cols)
+        total += len(buf)
+    return total

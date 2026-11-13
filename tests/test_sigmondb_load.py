@@ -28,7 +28,7 @@ class FakeClient:
 
 
 _DEFAULT = {"String": "x", "LowCardinality(String)": "x", "Float64": 1.0, "Float32": 1.0,
-            "UInt32": 1, "UInt16": 1, "Int64": 1, "DateTime": datetime(2026, 11, 8),
+            "UInt32": 1, "UInt16": 1, "UInt8": 1, "Int64": 1, "DateTime": datetime(2026, 11, 8),
             "DateTime64(3)": datetime(2026, 11, 8), "DateTime64(9)": datetime(2026, 11, 8)}
 
 
@@ -139,3 +139,13 @@ def test_none_in_other_non_nullable_raises_before_sending(tmp_path):
 def test_unknown_none_string_does_not_hide_strict_check(tmp_path):
     with pytest.raises(ValueError, match="delay_ns"):
         _loaded(tmp_path, "arrival", [_arrival(delay_ns=None)])
+
+
+def test_insert_rows_checks_everything_before_sending():
+    c = FakeClient()
+    good = valid_row("attribution")
+    bad = dict(good, n_stations=None)
+    with pytest.raises(ValueError, match="n_stations"):
+        load.insert_rows(c, "attribution", [good, bad])
+    assert c.calls == []
+    assert load.insert_rows(c, "attribution", [dict(good, extra="x")]) == 1

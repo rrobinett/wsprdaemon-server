@@ -18,6 +18,9 @@ DATABASE = "sigmondb"
 
 _Z = "ZSTD(3)"
 
+# attribution.status: named, named_two_stations, ambiguous, unattributable.
+# attribution.offset_from: ground_wave, skywave_model, ''.
+
 
 def _codec(typ):
     if typ.startswith("DateTime64"):
@@ -128,6 +131,25 @@ _SPEC = {
         ],
         part="toYYYYMM(window_from)",
         order="cluster_key, solve_id",
+    ),
+    "attribution": dict(
+        cols=[
+            ("run_at", "DateTime"), ("run_id", "String"),
+            ("window_from", "DateTime64(3)"), ("window_to", "DateTime64(3)"),
+            ("group_key", LC), ("period_ns", "Int64"), ("mode_policy", LC),
+            ("tx_id", "String"), ("alias_tx_ids", "Array(String)"),
+            ("status", LC), ("n_stations", "UInt16"),
+            ("reporter_ids", "Array(String)"), ("modes", "Array(String)"),
+            ("cluster_delays_ns", "Array(Int64)"), ("cluster_mad_ns", "Array(Float64)"),
+            ("offset_ns", "Nullable(Int64)"), ("offset_from", LC),
+            ("spread_ns", NF64), ("p_null", NF64), ("n_fake", "UInt32"),
+            ("runner_up_tx_id", "String"), ("runner_up_spread_ns", NF64),
+            ("runner_up_fits", "UInt8"), ("flags", "Array(String)"),
+            ("set_aside", "Map(String, String)"),
+            ("solver_version", LC), ("inputs_digest", "FixedString(64)"),
+        ],
+        part="toYYYYMM(run_at)",
+        order="group_key, mode_policy, tx_id, run_id",
     ),
     "path": dict(
         cols=[

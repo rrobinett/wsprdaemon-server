@@ -174,6 +174,41 @@ ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMM(window_from)
 ORDER BY (cluster_key, solve_id);
 
+CREATE TABLE IF NOT EXISTS sigmondb.attribution
+(
+    `run_at` DateTime CODEC(Delta(4), ZSTD(3)),
+    `run_id` String CODEC(ZSTD(3)),
+    `window_from` DateTime64(3) CODEC(Delta(8), ZSTD(3)),
+    `window_to` DateTime64(3) CODEC(Delta(8), ZSTD(3)),
+    `group_key` LowCardinality(String) CODEC(ZSTD(3)),
+    `period_ns` Int64 CODEC(ZSTD(3)),
+    `mode_policy` LowCardinality(String) CODEC(ZSTD(3)),
+    `tx_id` String CODEC(ZSTD(3)),
+    `alias_tx_ids` Array(String),
+    `status` LowCardinality(String) CODEC(ZSTD(3)),
+    `n_stations` UInt16 CODEC(ZSTD(3)),
+    `reporter_ids` Array(String),
+    `modes` Array(String),
+    `cluster_delays_ns` Array(Int64),
+    `cluster_mad_ns` Array(Float64),
+    `offset_ns` Nullable(Int64) CODEC(ZSTD(3)),
+    `offset_from` LowCardinality(String) CODEC(ZSTD(3)),
+    `spread_ns` Nullable(Float64) CODEC(ZSTD(3)),
+    `p_null` Nullable(Float64) CODEC(ZSTD(3)),
+    `n_fake` UInt32 CODEC(ZSTD(3)),
+    `runner_up_tx_id` String CODEC(ZSTD(3)),
+    `runner_up_spread_ns` Nullable(Float64) CODEC(ZSTD(3)),
+    `runner_up_fits` UInt8 CODEC(ZSTD(3)),
+    `flags` Array(String),
+    `set_aside` Map(String, String),
+    `solver_version` LowCardinality(String) CODEC(ZSTD(3)),
+    `inputs_digest` FixedString(64) CODEC(ZSTD(3)),
+    `ingested_at` DateTime DEFAULT now() CODEC(Delta(4), ZSTD(3))
+)
+ENGINE = ReplacingMergeTree(ingested_at)
+PARTITION BY toYYYYMM(run_at)
+ORDER BY (group_key, mode_policy, tx_id, run_id);
+
 CREATE TABLE IF NOT EXISTS sigmondb.path
 (
     `time` DateTime CODEC(Delta(4), ZSTD(3)),

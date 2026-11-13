@@ -83,3 +83,11 @@ def test_no_nullable_in_order_by():
             continue
         for col in re.findall(r"\w+", m.group(1)):
             assert not re.search(r"`%s`\s+Nullable" % col, sql), (t, col)
+
+
+def test_attribution_key_and_place():
+    a = _norm(ddl.TABLES["attribution"])
+    assert "ORDER BY (group_key, mode_policy, tx_id, run_id)" in a
+    assert "PARTITION BY toYYYYMM(run_at)" in a
+    names = list(ddl.TABLES)
+    assert names.index("solution") < names.index("attribution") < names.index("path")
