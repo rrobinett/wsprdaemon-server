@@ -417,3 +417,102 @@ def test_mutation_nant_skywave_is_found_but_stays_ambiguous():
     nm = next(nm for nm in hits if nm["site"]["id"] in ("hfrnet:NANT", "hfrnet:NAUS"))
     assert nm["status"] == "ambiguous"
     assert abs(cdiff(nm["O"], 300.0, 1000.0)) <= 0.15            # study: 79 us off
+
+
+# ---------------------------------------------------------------- rows
+
+from datetime import datetime  # noqa: E402
+
+from sigmondb.attribution import ATTRIB_VERSION, attribution_rows, inputs_digest  # noqa: E402
+
+RUN_AT = datetime(2026, 11, 13, 12, 0, 0)
+W0, W1 = datetime(2026, 10, 14, 12, 0, 0), datetime(2026, 11, 13, 11, 50, 0)
+
+
+def _kfs_only_rows():
+    """Today's KFS shape: one station, a cluster and its 1.632 ms twin, live."""
+    rows = _cluster_rows(499.444, 5, 100, live=True) + _cluster_rows(501.076, 5, 100, live=True)
+    return _arrivals({"4.7850 -25.73": {"KFS-OMNI": rows}})
+
+
+def test_verdict_groups_become_unattributable_rows():   # one-station group, today's KFS shape
+    gs = run_attribution(_kfs_only_rows(), SITES, RX, DEFAULT, n_fake=20)
+    rows = attribution_rows(gs, DEFAULT, RUN_AT, W0, W1, "0" * 64)
+    assert [r["status"] for r in rows] == ["unattributable"]
+    assert rows[0]["flags"][0].startswith("only 1 T6 station")
+    r = rows[0]
+    assert r["tx_id"] == "" and r["run_id"] == "attr:%s:%s" % (ATTRIB_VERSION, "0" * 12)
+    assert r["mode_policy"] == "default" and r["period_ns"] == 1_000_000_000
+    assert r["offset_ns"] is None and r["p_null"] is None and r["n_fake"] == 0
+    assert any(v.startswith("twin of") for v in r["set_aside"].values())
+    assert (r["run_at"], r["window_from"], r["window_to"]) == (RUN_AT, W0, W1)
+
+
+def test_inputs_digest_is_sha256_of_sorted_keys():
+    import hashlib
+    t = datetime(2026, 11, 7, 3, 0, 0, 250000)
+    a = [{"reporter_id": "B", "group_key": "g", "time": t, "delay_ns": 5},
+         {"reporter_id": "A", "group_key": "g", "time": t, "delay_ns": -2}]
+    want = hashlib.sha256(("A|g|%s|-2\nB|g|%s|5" % (t.isoformat(), t.isoformat())).encode()).hexdigest()
+    assert inputs_digest(a) == want == inputs_digest(list(reversed(a)))
+
+
+def _fit(status, n, o_ground, pn=0.01, runner=None):
+    site = {"id": "hfrnet:TSTA", "lat": 39.5, "lon": -74.0}
+    mem = [("K3LR/D", 0, "G", 300.0, GW_TOL_MS, 500.0), ("W2NAF", 0, "G", 300.01, GW_TOL_MS, 400.0)]
+    if n == 3:
+        mem.append(("UACNJ", 0, "G", 299.99, GW_TOL_MS, 90.0))
+    return {"site": site, "alias": ["hfrnet:TSTZ"], "n": n, "spread": 20.0, "O": 300.004,
+            "O_ground": o_ground, "mem": mem, "runner": runner, "p_null": pn, "flags": [],
+            "status": status}
+
+
+def _group(named, policy):
+    cl = {"D": 302.0, "mad_us": 8.0, "n": 50, "level": 30.0, "flags": []}
+    return {"key": "4.4630 -25.73", "P": 1000.0, "policy": policy.name, "verdict": None,
+            "n_fake": 223, "set_aside": {"N8UR": "no receiver position"},
+            "stations": {"K3LR/D": [cl], "W2NAF": [cl], "UACNJ": [cl]}, "named": named}
+
+
+def test_gw900_rows_never_carry_the_word_named():
+    # Michael, 11-13: the ground-wave-only 900 km pass records its fits and never attaches them.
+    named = [_fit("named", 3, 300.0), _fit("named_two_stations", 2, 300.0),
+             _fit("ambiguous", 2, 300.0)]
+    gw = attribution_rows([_group(named, GW900)], GW900, RUN_AT, W0, W1, "a" * 64)
+    assert [r["status"] for r in gw] == ["fits_gw900", "fits_gw900_two_stations", "ambiguous"]
+    assert not any("named" in r["status"] for r in gw)
+    df = attribution_rows([_group(named, DEFAULT)], DEFAULT, RUN_AT, W0, W1, "a" * 64)
+    assert [r["status"] for r in df] == ["named", "named_two_stations", "ambiguous"]
+
+
+def test_rows_refuse_a_policy_other_than_the_groups():
+    with pytest.raises(ValueError):
+        attribution_rows([_group([_fit("named", 3, 300.0)], GW900)], DEFAULT, RUN_AT, W0, W1,
+                         "a" * 64)
+
+
+def test_named_row_fields():
+    runner = (True, 157.0, {"id": "hfrnet:CEDR"}, None)
+    r = attribution_rows([_group([_fit("named", 3, 300.0021, pn=float("nan"), runner=runner)],
+                                 DEFAULT)], DEFAULT, RUN_AT, W0, W1, "b" * 64)[0]
+    assert r["tx_id"] == "hfrnet:TSTA" and r["alias_tx_ids"] == ["hfrnet:TSTZ"]
+    assert r["n_stations"] == 3 and r["reporter_ids"] == ["K3LR/D", "W2NAF", "UACNJ"]
+    assert r["modes"] == ["G", "G", "G"]
+    assert r["cluster_delays_ns"] == [302_000_000] * 3 and r["cluster_mad_ns"] == [8000.0] * 3
+    assert (r["offset_ns"], r["offset_from"]) == (300_002_100, "ground_wave")
+    assert r["spread_ns"] == 20_000.0 and r["p_null"] is None and r["n_fake"] == 223
+    assert (r["runner_up_tx_id"], r["runner_up_spread_ns"], r["runner_up_fits"]) == \
+        ("hfrnet:CEDR", 157_000.0, 0)
+    assert r["set_aside"] == {"N8UR": "no receiver position"}
+    assert r["solver_version"] == ATTRIB_VERSION and r["inputs_digest"] == "b" * 64
+    sky = attribution_rows([_group([_fit("ambiguous", 2, None)], DEFAULT)], DEFAULT, RUN_AT,
+                           W0, W1, "b" * 64)[0]
+    assert (sky["offset_ns"], sky["offset_from"]) == (300_004_000, "skywave_model")
+    assert sky["runner_up_tx_id"] == "" and sky["runner_up_spread_ns"] is None
+
+
+def test_group_with_no_fit_gets_an_unattributable_row():
+    g = _group([], DEFAULT)
+    rows = attribution_rows([g], DEFAULT, RUN_AT, W0, W1, "c" * 64)
+    assert [(r["status"], r["tx_id"]) for r in rows] == [("unattributable", "")]
+    assert rows[0]["flags"] and rows[0]["n_stations"] == 3

@@ -86,7 +86,9 @@ def insert_file(client, table, path, batch=50_000):
 
 def insert_rows(client, table, rows, batch=50_000):
     """Insert row dicts: the same whitelist, '' fill and None check as insert_file.
-    Every row is checked before the first insert.  Returns the row count."""
+    Every row is checked before the first insert.  Returns the row count.
+    rows may be any iterable; a generator would be spent by the check, so it is listed first."""
+    rows = list(rows)
     cols = list(ddl.COLUMNS[table])
     fill, strict = _fillers(table)
     bad = {}

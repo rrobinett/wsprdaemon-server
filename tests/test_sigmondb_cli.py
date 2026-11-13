@@ -159,18 +159,29 @@ class _Result:
 
 
 class QueryClient:
-    """Records each query; returns `tables[name]` (dicts) as rows in COLUMNS order."""
+    """Records each query; returns `tables[name]` (dicts) as rows of the SELECTed columns.
+    It applies no WHERE: fixtures hold only rows the query would return.  command() is a
+    no-op; insert() records (table, row dict) pairs in `inserted`."""
 
     def __init__(self, tables, tz_kw=True):
         self.tables, self.calls, self.tz_kw = tables, [], tz_kw
+        self.commands, self.inserted = [], []
 
     def query(self, sql, parameters=None, **kw):
         if "query_tz" in kw and not self.tz_kw:
             raise TypeError("query() got an unexpected keyword argument 'query_tz'")
         self.calls.append(dict(sql=sql, parameters=parameters, **kw))
-        name = sql.split(" FROM %s." % ddl.DATABASE)[1].split()[0]
-        cols = ddl.COLUMNS[name]
+        head, tail = sql.split(" FROM %s." % ddl.DATABASE, 1)
+        name = tail.split()[0]
+        cols = [c.strip() for c in head.split("SELECT", 1)[1].split(",")]
+        assert set(cols) <= set(ddl.COLUMNS[name]), cols
         return _Result([tuple(r.get(c) for c in cols) for r in self.tables.get(name, [])])
+
+    def command(self, sql):
+        self.commands.append(sql)
+
+    def insert(self, table, data, column_names=None):
+        self.inserted += [(table, dict(zip(column_names, row))) for row in data]
 
 
 def _db(monkeypatch, tables, tz_kw=True):
@@ -258,3 +269,133 @@ def test_live_and_backfill_rows_of_one_group_both_survive(monkeypatch):
         _arr("W2NAF", "4.4630 -25.73", "codar-sounder/0.7.0", t=t1, delay=3)]})
     arr, _, _ = cli._from_db(_ns())
     assert sorted(r["delay_ns"] for r in arr) == [1, 2]   # t1: offline wins; t2: live kept
+
+
+# --- attribute ------------------------------------------------------------------------------
+import random  # noqa: E402
+
+_T0 = datetime(2026, 11, 10, tzinfo=timezone.utc)
+KFS_ENG = {"radiod": "KFS-OMNI-status.local", "sweep_repetition_hz": "1", "tier": "T6"}
+
+
+def _codar_rows(rid, gkey, D_ms, n, eng=None, seed=1, label=None):
+    """n captures, 10 min apart, one arrival each at D +- 2.5 us, in arrival-table shape."""
+    rnd = random.Random(seed)
+    centre, rate = (float(x) for x in gkey.split()[:2])
+    return [valid_row("arrival", time=_T0 + timedelta(minutes=10 * i), reporter_id=label or rid,
+                      group_key=gkey, centre_hz=centre * 1e6, rate_hz_per_s=rate * 1e3,
+                      delay_ns=int(round((D_ms + rnd.uniform(-0.0025, 0.0025)) * 1e6)),
+                      level_db=20.0, clean_tag="A", u_epoch_ns=230.0,
+                      detector_version="codar-sounder/0.7.0", engineering=dict(eng or {}))
+            for i in range(n)]
+
+
+# KFS-MAIN carries KFS-OMNI's receptions: a cluster and its 1.632 ms twin, as today.
+KFS_LIVE_ROWS = (_codar_rows("KFS", "4.7850 -25.73", 499.444, 100, KFS_ENG, label="KFS-MAIN")
+                 + _codar_rows("KFS", "4.7850 -25.73", 501.076, 100, KFS_ENG, seed=2,
+                               label="KFS/MAIN"))
+N8UR_ROWS = _codar_rows("N8UR", "4.4630 -25.73", 40.0, 50)
+K3LR_ROWS = _codar_rows("K3LR/D", "4.4630 -25.73", 41.0, 50, seed=3)
+_VF = datetime(2026, 11, 9)
+TX = [valid_row("transmitter", tx_id=t, kind="codar", lat=la, lon=lo, pos_source="hfrnet",
+                valid_from=_VF, version=1)
+      for t, la, lo in (("hfrnet:TSTB", 37.0, -123.0), ("hfrnet:TSTA", 39.5, -74.0))]
+WF = [valid_row("waveform", tx_id=t, valid_from=_VF, centre_hz=f, rate_hz_per_s=-25_733.913,
+                period_s=1.0)
+      for t, f in (("hfrnet:TSTB", 4.785e6), ("hfrnet:TSTA", 4.463e6))]
+RX_ROWS = [valid_row("receiver", reporter_id="KFS-OMNI", radiod_id="KFS-OMNI-status.local",
+                     lat=37.5, lon=-122.5, pos_source="gpsdo", valid_from=_VF, version=1)]
+K3LR_RX = valid_row("receiver", reporter_id="K3LR/D", radiod_id="K3LR-status.local",
+                    lat=41.1875, lon=-80.458333, pos_source="typed_grid", valid_from=_VF,
+                    version=1)
+
+
+def test_cli_attribute_writes_both_policies_and_exits_zero_with_nothing_named(monkeypatch, capsys):
+    c = _db(monkeypatch, {"arrival": KFS_LIVE_ROWS, "transmitter": TX, "waveform": WF, "receiver": RX_ROWS})
+    assert cli.main(["attribute", "--n-fake", "20"]) == 0
+    ins = [r for t, r in c.inserted if t == "sigmondb.attribution"]
+    assert {r["mode_policy"] for r in ins} == {"default", "gw_only_900km"}   # 4.785 MHz < 6 MHz
+    assert all(r["status"] == "unattributable" for r in ins)
+    assert "0 named" in capsys.readouterr().out
+    assert any("CREATE TABLE IF NOT EXISTS sigmondb.attribution" in s for s in c.commands)
+    asql = [k for k in c.calls if ".arrival" in k["sql"]][0]
+    for frag in ("FROM sigmondb.arrival FINAL", "u_epoch_ns IS NOT NULL", "u_epoch_ns <= 1000",
+                 "clean_tag = 'A'", "rate_hz_per_s != 0", "INTERVAL {days:Float64} DAY"):
+        assert frag in asql["sql"], frag
+    assert asql["parameters"] == {"days": 30.0}
+    tsql = [k["sql"] for k in c.calls if ".transmitter" in k["sql"]][0]
+    assert "kind = 'codar'" in tsql and "ORDER BY tx_id" in tsql
+
+
+def test_cli_attribute_sets_aside_a_reporter_without_position(monkeypatch, tmp_path):
+    c = _db(monkeypatch, {"arrival": N8UR_ROWS + K3LR_ROWS, "transmitter": TX, "waveform": WF,
+                          "receiver": [K3LR_RX]})
+    assert cli.main(["attribute", "--n-fake", "20", "--out", str(tmp_path / "a.jsonl")]) == 0
+    out = rows.read_rows(tmp_path / "a.jsonl")
+    assert out and all(r["set_aside"]["N8UR"] == "no receiver position" for r in out)
+    assert c.inserted == [] and c.commands == []          # --out leaves the database alone
+
+
+def test_kfs_main_rows_count_as_the_kfs_omni_radiod():
+    eng = {"radiod": "KFS-OMNI-status.local", "sweep_repetition_hz": "1"}
+    arr = [dict(_arr("KFS-MAIN", "g", "v"), engineering=eng), dict(_arr("KFS/MAIN", "g", "v"), engineering=eng)]
+    out = cli._at_radiod(arr, [dict(valid_row("receiver"), reporter_id="KFS-OMNI",
+                                    radiod_id="KFS-OMNI-status.local")])
+    assert {r["reporter_id"] for r in out} == {"KFS-OMNI"}
+    assert {r["carried_by"] for r in out} == {"KFS-MAIN", "KFS/MAIN"}
+    assert {r["reporter_id"] for r in arr} == {"KFS-MAIN", "KFS/MAIN"}    # inputs untouched
+
+
+def test_at_radiod_leaves_an_unmatched_arrival_alone():
+    arr = [dict(_arr("W2NAF", "g", "v"), engineering={"radiod": "elsewhere.local"}),
+           _arr("K3LR/D", "g", "v")]                       # engineering absent (None)
+    out = cli._at_radiod(arr, [dict(valid_row("receiver"), reporter_id="KFS-OMNI",
+                                    radiod_id="KFS-OMNI-status.local")])
+    assert [r["reporter_id"] for r in out] == ["W2NAF", "K3LR/D"]
+    assert all("carried_by" not in r for r in out)
+
+
+def test_solve_from_db_counts_kfs_main_at_its_radiod(monkeypatch):
+    _db(monkeypatch, {"arrival": KFS_LIVE_ROWS[:3], "receiver": RX_ROWS})
+    arr, _, _ = cli._from_db(_ns())
+    assert {r["reporter_id"] for r in arr} == {"KFS-OMNI"}
+
+
+def test_cli_attribute_with_no_arrivals_writes_nothing_and_exits_zero(monkeypatch):
+    c = _db(monkeypatch, {"transmitter": TX, "waveform": WF, "receiver": RX_ROWS})
+    assert cli.main(["attribute", "--n-fake", "20"]) == 0
+    assert [t for t, _ in c.inserted if t == "sigmondb.attribution"] == []
+
+
+def test_cli_attribute_database_error_propagates(monkeypatch):
+    c = _db(monkeypatch, {"arrival": KFS_LIVE_ROWS, "transmitter": TX, "waveform": WF,
+                          "receiver": RX_ROWS})
+
+    def boom(*a, **k):
+        raise RuntimeError("insert failed")
+
+    c.insert = boom
+    try:
+        cli.main(["attribute", "--n-fake", "20"])
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a database error must reach systemd")
+
+
+def test_attribution_inputs_sites_and_receivers(monkeypatch):
+    old_tx = dict(TX[0], lat=0.0, lon=0.0, valid_from=datetime(2026, 1, 1))
+    nowf = valid_row("transmitter", tx_id="hfrnet:NOWF", kind="codar", lat=1.0, lon=1.0,
+                     valid_from=_VF, version=1)
+    nopos = valid_row("receiver", reporter_id="NOPOS", valid_from=_VF, version=1)
+    c = _db(monkeypatch, {"arrival": KFS_LIVE_ROWS[:2], "transmitter": [TX[1], nowf, old_tx, TX[0]],
+                          "waveform": WF, "receiver": RX_ROWS + [K3LR_RX, nopos]})
+    arr, sites, rxpos, coh = cli._attribution_inputs(c, 30.0)
+    assert [s["id"] for s in sites] == ["hfrnet:TSTA", "hfrnet:TSTB"]     # stable order; NOWF out
+    assert sites[1] == {"id": "hfrnet:TSTB", "lat": 37.0, "lon": -123.0, "freq": 4.785e6,
+                        "rate": -25_733.913, "period": 1.0}
+    assert rxpos == {"KFS-OMNI": (37.5, -122.5, "gpsdo"),
+                     "K3LR/D": (41.1875, -80.458333, "typed_grid")}
+    assert set(coh) == {"KFS-OMNI", "K3LR/D"}
+    assert {a["reporter_id"] for a in arr} == {"KFS-OMNI"}
+    assert all(a["live"] for a in arr) and arr[0]["sweep_repetition_hz"] == "1"

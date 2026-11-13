@@ -18,7 +18,9 @@ DATABASE = "sigmondb"
 
 _Z = "ZSTD(3)"
 
-# attribution.status: named, named_two_stations, ambiguous, unattributable.
+# attribution.status: named, named_two_stations, ambiguous, unattributable; the
+# gw_only_900km pass writes fits_gw900 and fits_gw900_two_stations in place of the named
+# pair, since its fits never attach names (Michael, 11-13).
 # attribution.offset_from: ground_wave, skywave_model, ''.
 
 

@@ -149,3 +149,10 @@ def test_insert_rows_checks_everything_before_sending():
         load.insert_rows(c, "attribution", [good, bad])
     assert c.calls == []
     assert load.insert_rows(c, "attribution", [dict(good, extra="x")]) == 1
+
+
+def test_insert_rows_takes_a_generator():
+    c = FakeClient()
+    good = valid_row("attribution")
+    assert load.insert_rows(c, "attribution", (dict(good) for _ in range(3))) == 3
+    assert len(c.calls) == 1 and len(c.calls[0][1]) == 3

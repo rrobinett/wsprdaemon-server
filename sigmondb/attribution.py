@@ -45,6 +45,8 @@ Choices, stated once:
   100 km from every real candidate) says how often geometry alone yields an equally tight
   match.  A name only stands when real sites beat the fakes.
 """
+import calendar
+import hashlib
 import math
 import random
 import statistics
@@ -66,6 +68,7 @@ IMAGE_TOL_MS = 0.4
 COASTAL = frozenset({"KFS-OMNI", "WB6CXC/7", "UACNJ"})   # paths run mostly over sea
 P_NULL_MAX = 0.05           # a name stands only when fakes match this well in at most 5 % of draws
 N_FAKE = 400                # fake sites per group, at least 100 km from every candidate
+ATTRIB_VERSION = "attribute-1"
 
 
 @dataclass(frozen=True)
@@ -554,6 +557,13 @@ def attribute_group(g, rxpos, policy, n_fake, seed):
     g["verdict"] = None
 
 
+def _epoch(t):
+    """Whole seconds: a number as given, a naive-UTC datetime by calendar, never local time."""
+    if hasattr(t, "timetuple"):
+        return calendar.timegm(t.utctimetuple() if t.tzinfo else t.timetuple())
+    return int(t)
+
+
 def run_attribution(arrivals, sites, rxpos, policy, n_fake=N_FAKE, coherence=None):
     """Run one path policy over every sweep group in the arrivals.
 
@@ -567,7 +577,7 @@ def run_attribution(arrivals, sites, rxpos, policy, n_fake=N_FAKE, coherence=Non
     eng = {}
     for a in arrivals:
         gk = a["group_key"]
-        by[gk][a["reporter_id"]].append((int(a["time"]), a["delay_ns"] / 1e6,
+        by[gk][a["reporter_id"]].append((_epoch(a["time"]), a["delay_ns"] / 1e6,
                                          float(a["level_db"]), bool(a["live"])))
         sr = a.get("sweep_repetition_hz")
         if sr:
@@ -581,3 +591,71 @@ def run_attribution(arrivals, sites, rxpos, policy, n_fake=N_FAKE, coherence=Non
     for g in groups:
         attribute_group(g, rxpos, policy, n_fake, zlib.crc32(g["key"].encode()))
     return groups
+
+
+# ---------------------------------------------------------------- rows
+
+def inputs_digest(arrivals):
+    """sha256 hex over the sorted reporter|group|time|delay lines, as groundwave._key builds
+    them.  The digest names the inputs, so an hourly run on unchanged data repeats its run_id."""
+    lines = sorted("%s|%s|%s|%d" % (a["reporter_id"], a["group_key"], a["time"].isoformat(),
+                                    a["delay_ns"]) for a in arrivals)
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+
+
+# Michael, 11-13: the ground-wave-only 900 km pass records its fits and never attaches names.
+# So its rows never carry the word "named"; apply_attribution reads only "named" statuses.
+_STATUS_AS = {GW900.name: {"named": "fits_gw900", "named_two_stations": "fits_gw900_two_stations"}}
+
+
+def _ns(ms):
+    return int(round(ms * 1e6))
+
+
+def attribution_rows(groups, policy, run_at, window_from, window_to, digest):
+    """sigmondb.attribution rows for one policy's groups.
+
+    One row per fit in g["named"], best first, and one unattributable row (tx_id '', flags =
+    [why]) per group with a verdict or with no fit.  Every row carries its group's set_aside and
+    the eligible fake-site count (n_fake) beside p_null, so a reader sees the sampling
+    uncertainty.  run_id hashes the inputs: a run on changed inputs adds rows beside the old
+    ones, so readers take the latest run per (group_key, mode_policy) by argMax(run_at), not
+    FINAL."""
+    as_ = _STATUS_AS.get(policy.name, {})
+    out = []
+    for g in groups:
+        if g.get("policy", policy.name) != policy.name:
+            raise ValueError("group %s ran under %s, not %s" % (g["key"], g["policy"], policy.name))
+        base = {"run_at": run_at, "run_id": "attr:%s:%s" % (ATTRIB_VERSION, digest[:12]),
+                "window_from": window_from, "window_to": window_to, "group_key": g["key"],
+                "period_ns": _ns(g["P"]), "mode_policy": policy.name,
+                "n_fake": g.get("n_fake", 0), "set_aside": dict(g.get("set_aside", {})),
+                "solver_version": ATTRIB_VERSION, "inputs_digest": digest}
+        if g.get("verdict") or not g["named"]:
+            usable = sorted(st for st, cl in g["stations"].items()
+                            if any(not _set_aside(c) for c in cl))
+            why = g.get("verdict") or "no candidate site fits two or more stations within tolerance"
+            out.append(dict(base, tx_id="", alias_tx_ids=[], status="unattributable",
+                            n_stations=len(usable), reporter_ids=usable, modes=[],
+                            cluster_delays_ns=[], cluster_mad_ns=[], offset_ns=None,
+                            offset_from="", spread_ns=None, p_null=None, runner_up_tx_id="",
+                            runner_up_spread_ns=None, runner_up_fits=0, flags=[why]))
+            continue
+        for nm in g["named"]:
+            cls = [g["stations"][m[0]][m[1]] for m in nm["mem"]]
+            ground = nm["O_ground"] is not None
+            ru = nm["runner"]
+            pn = nm["p_null"]
+            out.append(dict(
+                base, tx_id=nm["site"]["id"], alias_tx_ids=list(nm["alias"]),
+                status=as_.get(nm["status"], nm["status"]), n_stations=nm["n"],
+                reporter_ids=[m[0] for m in nm["mem"]], modes=[m[2] for m in nm["mem"]],
+                cluster_delays_ns=[_ns(c["D"]) for c in cls],
+                cluster_mad_ns=[c["mad_us"] * 1e3 for c in cls],
+                offset_ns=_ns(nm["O_ground"] if ground else nm["O"]),
+                offset_from="ground_wave" if ground else "skywave_model",
+                spread_ns=nm["spread"] * 1e3, p_null=pn if pn == pn else None,
+                runner_up_tx_id=ru[2]["id"] if ru else "",
+                runner_up_spread_ns=(ru[1] * 1e3 if ru and math.isfinite(ru[1]) else None),
+                runner_up_fits=int(bool(ru) and not ru[0]), flags=list(nm["flags"])))
+    return out

@@ -1,4 +1,4 @@
-"""python -m sigmondb: ddl, seed, backfill-codar, backfill-hfdl, load, solve, publish.
+"""python -m sigmondb: ddl, seed, backfill-codar, backfill-hfdl, load, attribute, solve, publish.
 
 Credentials come from /etc/wsprdaemon/clickhouse.conf (--conf overrides the path in tests).
 No verb takes a password.  publish reads the public servers' credentials from the
@@ -8,12 +8,12 @@ EnvironmentFile= sets.  clickhouse_connect is imported only where a verb needs i
 import argparse
 import re
 import sys
-from datetime import date, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from sigmondb import ddl
 from sigmondb.groundwave import fixed_clusters, ground_wave_solutions
-from sigmondb.load import insert_file
+from sigmondb.load import insert_file, insert_rows
 from sigmondb.rows import read_rows, write_rows
 
 DEFAULT_CONF = "/etc/wsprdaemon/clickhouse.conf"
@@ -153,25 +153,60 @@ def _utc_naive(t):
     return t
 
 
+def _fetch(client, table, cols, where="", params=None):
+    """SELECT cols FROM sigmondb.<table> FINAL <where>, as dicts, every time naive UTC.
+    FINAL so a re-ingested row counts once."""
+    cols = list(cols)
+    sql = "SELECT %s FROM %s.%s FINAL %s" % (", ".join(cols), ddl.DATABASE, table, where)
+    try:
+        res = client.query(sql, parameters=params, query_tz="UTC")
+    except TypeError:   # clickhouse-connect without query_tz: the conversion below still holds
+        res = client.query(sql, parameters=params)
+    out = [dict(zip(cols, r)) for r in res.result_rows]
+    for r in out:
+        for c in ("time", "valid_from", "window_from", "window_to"):
+            if c in r:
+                r[c] = _utc_naive(r[c])
+    return out
+
+
+def _latest(rows, key):
+    """The latest row per rows[key], by (valid_from, version); first-seen order kept."""
+    best = {}
+    for r in rows:
+        k = r[key]
+        rank = (r.get("valid_from") or datetime.min, r.get("version") or 0)
+        if k not in best or rank > best[k][0]:
+            best[k] = (rank, r)
+    return [r for _, r in best.values()]
+
+
+def _at_radiod(arrivals, receivers):
+    """Count each arrival at the receiver whose radiod heard it.
+
+    When engineering['radiod'] equals a receiver row's radiod_id, the arrival takes that row's
+    reporter_id and keeps its old label as carried_by.  A transporter such as KFS-MAIN runs no
+    radiod (Michael, 11-13), so its rows count at KFS-OMNI, never as a second station.  In
+    memory only: the arrival rows in the database keep their labels.  Returns new dicts."""
+    by_radiod = {r["radiod_id"]: r["reporter_id"] for r in receivers if r.get("radiod_id")}
+    out = []
+    for a in arrivals:
+        rid = by_radiod.get((a.get("engineering") or {}).get("radiod"))
+        if rid and rid != a["reporter_id"]:
+            a = dict(a, reporter_id=rid, carried_by=a["reporter_id"])
+        out.append(a)
+    return out
+
+
 def _from_db(a):
     """(arrivals, transmitters, receivers) from the registry, every table read FINAL so a
     re-ingested row counts once.  Arrivals: anchored only; by default the latest
-    detector_version per (reporter_id, group_key); --detector-version picks one instead."""
+    detector_version per (reporter_id, group_key, time); --detector-version picks one instead.
+    Each arrival counts at the receiver whose radiod heard it (_at_radiod)."""
     client = connect(a.conf)
 
     def fetch(table, where="", params=None):
-        cols = list(ddl.COLUMNS[table])
-        sql = "SELECT %s FROM %s.%s FINAL %s" % (", ".join(cols), ddl.DATABASE, table, where)
-        try:
-            res = client.query(sql, parameters=params, query_tz="UTC")
-        except TypeError:   # clickhouse-connect without query_tz: the conversion below still holds
-            res = client.query(sql, parameters=params)
-        out = [dict(zip(cols, r)) for r in res.result_rows]
-        for r in out:
-            for c in ("time", "valid_from", "window_from", "window_to"):
-                if c in r:
-                    r[c] = _utc_naive(r[c])
-        return out
+        return _fetch(client, table, ddl.COLUMNS[table], where, params)
 
     where = "WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000"
     if a.detector_version:
@@ -179,7 +214,95 @@ def _from_db(a):
                     {"dv": a.detector_version})
     else:
         arr = _latest_detector(fetch("arrival", where))
-    return arr, fetch("transmitter"), fetch("receiver")
+    rx = fetch("receiver")
+    return _at_radiod(arr, _latest(rx, "reporter_id")), fetch("transmitter"), rx
+
+
+_ATTR_ARRIVAL_COLS = ("time", "reporter_id", "group_key", "delay_ns", "level_db",
+                      "detector_version", "engineering")
+_ATTR_WHERE = ("WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000 AND clean_tag = 'A' "
+               "AND rate_hz_per_s != 0 AND time > now() - INTERVAL {days:Float64} DAY")
+
+
+def _attribution_inputs(client, days):
+    """(arrivals, sites, rxpos, coherence) for attribution.run_attribution.
+
+    arrivals: T6-anchored, CLEAN 'A', chirped, within `days`; the latest detector per capture;
+    live when engineering carries sweep_repetition_hz; counted at their radiod.
+    sites: the latest codar transmitter row per tx_id with a position, one site per waveform
+    (latest per centre); a transmitter with no waveform drops out.  Sorted by tx_id, so ties
+    break the same way every run.
+    rxpos: reporter_id -> (lat, lon, pos_source) from the latest receiver row with a position;
+    coherence: reporter_id -> coherence_group for the same rows."""
+    arr = _latest_detector(_fetch(client, "arrival", _ATTR_ARRIVAL_COLS, _ATTR_WHERE,
+                                  {"days": float(days)}))
+    for r in arr:
+        eng = r.get("engineering") or {}
+        r["live"] = "sweep_repetition_hz" in eng
+        if eng.get("sweep_repetition_hz"):
+            r["sweep_repetition_hz"] = eng["sweep_repetition_hz"]
+    tx = _latest(_fetch(client, "transmitter", ddl.COLUMNS["transmitter"],
+                        "WHERE kind = 'codar' ORDER BY tx_id"), "tx_id")
+    wf = _fetch(client, "waveform", ddl.COLUMNS["waveform"], "ORDER BY tx_id")
+    wf_by = {}
+    for w in _latest([dict(w, _k=(w["tx_id"], w["centre_hz"])) for w in wf], "_k"):
+        if w.get("period_s"):
+            wf_by.setdefault(w["tx_id"], []).append(w)
+    sites = []
+    for t in sorted(tx, key=lambda t: t["tx_id"]):
+        if t.get("lat") is None or t.get("lon") is None:
+            continue
+        for w in sorted(wf_by.get(t["tx_id"], []), key=lambda w: w["centre_hz"]):
+            sites.append({"id": t["tx_id"], "lat": t["lat"], "lon": t["lon"],
+                          "freq": w["centre_hz"], "rate": w["rate_hz_per_s"],
+                          "period": w["period_s"]})
+    rx = _latest(_fetch(client, "receiver", ddl.COLUMNS["receiver"]), "reporter_id")
+    placed = [r for r in rx if r.get("lat") is not None and r.get("lon") is not None]
+    rxpos = {r["reporter_id"]: (r["lat"], r["lon"], r.get("pos_source") or "") for r in placed}
+    coherence = {r["reporter_id"]: r.get("coherence_group") or "" for r in placed}
+    return _at_radiod(arr, rx), sites, rxpos, coherence
+
+
+def cmd_attribute(a):
+    """Name the CODAR radar behind each sweep group's clusters, under the default path policy
+    and then the ground-wave-only 900 km pass, and write every fit to sigmondb.attribution
+    (or to --out as JSON Lines, leaving the database alone).  Exits 0 when nothing gets named;
+    a database error propagates, so systemd records a failure."""
+    from sigmondb import attribution as at
+    client = connect(a.conf)
+    arr, sites, rxpos, coherence = _attribution_inputs(client, a.days)
+    if not arr:
+        print("attribute: no arrivals in the last %g days; nothing written" % a.days)
+        if a.out:
+            write_rows(a.out, [])
+        return 0
+    run_at = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    times = [r["time"] for r in arr]
+    digest = at.inputs_digest(arr)
+    rows = []
+    for policy in (at.DEFAULT, at.GW900):
+        groups = at.run_attribution(arr, sites, rxpos, policy, n_fake=a.n_fake,
+                                    coherence=coherence)
+        mine = at.attribution_rows(groups, policy, run_at, min(times), max(times), digest)
+        count = lambda pred: sum(1 for r in mine if pred(r["status"]))  # noqa: E731
+        line = "attribute %s: %d groups, %d named, %d ambiguous, %d unattributable" % (
+            policy.name, len(groups), count(lambda s: s.startswith("named")),
+            count(lambda s: s == "ambiguous"), count(lambda s: s == "unattributable"))
+        if policy is at.GW900:
+            line += ", %d fits_gw900 (never named)" % count(lambda s: s.startswith("fits_gw900"))
+        print(line)
+        for r in mine:
+            if r["status"].startswith(("named", "fits_gw900")):
+                print("  %s %s %s: %d stations, offset %d ns (%s), p_null %s" % (
+                    r["group_key"], r["tx_id"], r["status"], r["n_stations"], r["offset_ns"],
+                    r["offset_from"], "n/a" if r["p_null"] is None else "%.3f" % r["p_null"]))
+        rows += mine
+    if a.out:
+        print("attribution: %d rows to %s" % (write_rows(a.out, rows), a.out))
+        return 0
+    ddl.ensure_schema(client)
+    print("attribution: %d rows" % insert_rows(client, "attribution", rows))
+    return 0
 
 
 def _read_receivers(path):
@@ -251,6 +374,15 @@ def build_parser():
     s.add_argument("--dir", required=True)
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_load)
+    s = sub.add_parser("attribute",
+                       help="name the CODAR radar behind each cluster; write sigmondb.attribution")
+    s.add_argument("--days", type=float, default=30.0,
+                   help="arrivals from the last DAYS days (default 30)")
+    s.add_argument("--n-fake", type=int, default=400,
+                   help="fake sites per group for the null test (default 400)")
+    s.add_argument("--out", help="write JSON Lines here and leave the database alone")
+    s.add_argument("--conf", default=DEFAULT_CONF)
+    s.set_defaults(fn=cmd_attribute)
     s = sub.add_parser("solve")
     s.add_argument("--out", required=True)
     g = s.add_mutually_exclusive_group(required=True)
