@@ -1,5 +1,7 @@
 """sigmondb identity: HFRNet, HFDL systable, receivers seed.  No ClickHouse needed."""
 import json
+import math
+import struct
 import logging
 import os
 import sys
@@ -15,8 +17,8 @@ from sigmondb import ddl  # noqa: E402
 from sigmondb.hfdl_gs import parse_systable  # noqa: E402
 from sigmondb.hfrnet import parse_hfrnet  # noqa: E402
 from sigmondb.groundwave import _latest  # noqa: E402
-from sigmondb.receivers import (grid_to_latlon, load_positions, load_receivers,  # noqa: E402
-                                position_rows)
+from sigmondb.receivers import (ROUNDING_SIGMA_M, grid_to_latlon, load_positions,  # noqa: E402
+                                load_receivers, position_rows)
 
 FX = Path(__file__).parent / "fixtures" / "sigmondb"
 SEED = Path(__file__).parent.parent / "sigmondb" / "seed" / "receivers.toml"
@@ -173,6 +175,37 @@ def test_position_rows_version_up_and_say_gpsdo(tmp_path):
     assert _latest(load_receivers(SEED) + rows, "reporter_id")["K3LR/D"] is r
 
 
+def test_position_rows_round_to_a_hundredth_of_a_degree(tmp_path):
+    # wd30 answers anonymous queries, so sigmondb.receiver never holds a house-level position
+    # (Michael, 2026-11-14: 0.01 degree, about 1 km).
+    f = _pos(tmp_path, {"K3LR/D": {"lat": 41.123456, "lon": -80.987654, "pos_sigma_m": 5.0}})
+    rows, _ = position_rows(load_receivers(SEED), load_positions(f), datetime(2026, 11, 14))
+    r = rows[0]
+    assert (r["lat"], r["lon"]) == (41.12, -80.99)
+    assert r["pos_sigma_m"] == pytest.approx(math.hypot(5.0, ROUNDING_SIGMA_M))
+
+
+def test_position_rows_write_nothing_finer_than_a_hundredth(tmp_path):
+    doc = {"K3LR/D": {"lat": 41.0049999, "lon": -80.0050001, "pos_sigma_m": 1.0},
+           "W2NAF": {"lat": -12.3456789, "lon": 179.999999, "pos_sigma_m": 1.0}}
+    rows, _ = position_rows(load_receivers(SEED), load_positions(_pos(tmp_path, doc)),
+                            datetime(2026, 11, 14))
+    assert len(rows) == 2
+    for r in rows:
+        for k in ("lat", "lon"):
+            assert r[k] * 100 == pytest.approx(round(r[k] * 100), abs=1e-9)
+
+
+def test_position_rows_a_rounded_repeat_adds_no_version(tmp_path):
+    doc = {"K3LR/D": {"lat": 41.123456, "lon": -80.987654, "pos_sigma_m": 5.0}}
+    first, _ = position_rows(load_receivers(SEED), load_positions(_pos(tmp_path, doc)),
+                             datetime(2026, 11, 14))
+    doc["K3LR/D"]["lat"] = 41.1234   # moves inside the same 0.01-degree cell
+    again, _ = position_rows(load_receivers(SEED) + first,
+                             load_positions(_pos(tmp_path, doc)), datetime(2026, 11, 15))
+    assert again == []
+
+
 def test_a_world_readable_positions_file_is_refused(tmp_path):
     f = _pos(tmp_path, {}, 0o644)
     with pytest.raises(ValueError, match="mode"):
@@ -202,8 +235,10 @@ def test_a_position_equal_to_the_latest_row_gets_no_new_version(tmp_path):
 
 def test_a_sigma_read_back_as_float32_is_unchanged(tmp_path):
     base = load_receivers(SEED)
+    # What the database hands back for the widened sigma: hypot(12.3, ROUNDING_SIGMA_M), float32.
+    stored = struct.unpack("f", struct.pack("f", math.hypot(12.3, ROUNDING_SIGMA_M)))[0]
     old = dict(_latest(base, "reporter_id")["K3LR/D"], lat=41.0, lon=-80.0,
-               pos_sigma_m=12.300000190734863, pos_source="gpsdo", version=2)
+               pos_sigma_m=stored, pos_source="gpsdo", version=2)
     f = _pos(tmp_path, {"K3LR/D": {"lat": 41.0, "lon": -80.0, "pos_sigma_m": 12.3}})
     rows, _ = position_rows(base + [old], load_positions(f), datetime(2026, 11, 15))
     assert rows == []

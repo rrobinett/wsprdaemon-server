@@ -1,4 +1,5 @@
 """python -m sigmondb verbs.  No ClickHouse: clickhouse_connect is stubbed."""
+import math
 import os
 import sys
 import types
@@ -10,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sigmondb import cli, ddl, rows  # noqa: E402
+from sigmondb.receivers import ROUNDING_SIGMA_M  # noqa: E402
 from test_sigmondb_load import valid_row  # noqa: E402
 
 
@@ -682,7 +684,8 @@ def test_cli_receiver_positions_inserts_new_versions_and_prints_no_coordinate(
 
 
 def test_cli_receiver_positions_counts_unchanged_and_inserts_nothing(monkeypatch, tmp_path, capsys):
-    same = dict(K3LR_RX, lat=41.0, lon=-80.0, pos_sigma_m=10.0, pos_source="gpsdo", version=2)
+    same = dict(K3LR_RX, lat=41.0, lon=-80.0, pos_sigma_m=math.hypot(10.0, ROUNDING_SIGMA_M),
+                pos_source="gpsdo", version=2)
     c = _db(monkeypatch, {"receiver": [K3LR_RX, same]})
     f = _posfile(tmp_path, {"K3LR/D": {"lat": 41.0, "lon": -80.0, "pos_sigma_m": 10.0}})
     assert cli.main(["receiver-positions", "--file", str(f)]) == 0

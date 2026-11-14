@@ -69,6 +69,13 @@ def load_receivers(path):
 
 
 _POS_KEYS = ("lat", "lon", "pos_sigma_m")
+# wd30 answers anonymous queries, so sigmondb.receiver holds no house-level position: a GPSDO
+# fix enters rounded to POS_DECIMALS (0.01 degree, about 1 km; Michael, 2026-11-14), and the
+# precise value stays only in the private positions file.  Rounding to that cell leaves an
+# error of about ROUNDING_SIGMA_M rms (0.01/sqrt(12) degree per axis, both axes), which
+# pos_sigma_m carries so the solvers weigh it.
+POS_DECIMALS = 2
+ROUNDING_SIGMA_M = 400.0
 _POS_LIMITS = {"lat": (-90.0, 90.0), "lon": (-180.0, 180.0), "pos_sigma_m": (0.0, math.inf)}
 
 
@@ -112,17 +119,21 @@ def load_positions(path):
 
 def position_rows(latest_rows, positions, now):
     """(new receiver rows, unknown reporter ids).  Each reporter in `positions` that has a row
-    gets a copy of its latest row at the new position, pos_source gpsdo, version + 1.  A reporter
-    without a row goes to the second list and creates none.  An equal position adds no version."""
+    gets a copy of its latest row at the new position, rounded to POS_DECIMALS, with
+    pos_sigma_m widened by ROUNDING_SIGMA_M, pos_source gpsdo, version + 1.  A reporter without
+    a row goes to the second list and creates none.  An equal rounded position adds no
+    version."""
     from sigmondb.groundwave import _latest
     latest = _latest(latest_rows, "reporter_id")
     now = now.replace(microsecond=0)
     rows, unknown = [], []
-    for rid, p in positions.items():
+    for rid, precise in positions.items():
         old = latest.get(rid)
         if old is None:
             unknown.append(rid)
             continue
+        p = dict(lat=round(precise["lat"], POS_DECIMALS), lon=round(precise["lon"], POS_DECIMALS),
+                 pos_sigma_m=math.hypot(precise["pos_sigma_m"], ROUNDING_SIGMA_M))
         if (old.get("lat"), old.get("lon"), _f32(old.get("pos_sigma_m"))) == (
                 p["lat"], p["lon"], _f32(p["pos_sigma_m"])):
             continue
