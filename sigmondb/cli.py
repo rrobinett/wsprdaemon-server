@@ -265,7 +265,7 @@ def _from_db(a, client=None):
     def fetch(table, where="", params=None):
         return _fetch(client, table, ddl.COLUMNS[table], where, params)
 
-    where = ("WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000 "
+    where = ("WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000 AND origin = 't6_anchor' "
              "AND time > now() - INTERVAL {hours:UInt32} HOUR")
     params = {"hours": _hours(a.days)}
     if a.detector_version:
@@ -283,7 +283,7 @@ def _from_db(a, client=None):
 
 _ATTR_ARRIVAL_COLS = ("time", "reporter_id", "group_key", "delay_ns", "level_db",
                       "detector_version", "engineering")
-_ATTR_WHERE = ("WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000 AND clean_tag = 'A' "
+_ATTR_WHERE = ("WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000 AND origin = 't6_anchor' AND clean_tag = 'A' "
                "AND rate_hz_per_s != 0 AND time > now() - INTERVAL {hours:UInt32} HOUR")
 
 

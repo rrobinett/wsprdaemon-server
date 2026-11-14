@@ -81,6 +81,10 @@ def fixed_clusters(arrivals, receivers, gap_ns=120_000, min_captures=6, max_sd_n
         u = r.get("u_epoch_ns")
         if u is None or u > U_MAX_NS:
             continue
+        # Only a T6-anchored arrival is a ground-wave ruler.  hfdl-recorder (1f92973) labels rows with the
+        # station's own tier; a "t6" row (T6 held, anchor never matched) can carry a sub-us sigma too.
+        if r.get("origin", "t6_anchor") != "t6_anchor":
+            continue
         rid = r["reporter_id"]
         if not r.get("rate_hz_per_s"):
             dropped[rid]["unswept signal"] += 1

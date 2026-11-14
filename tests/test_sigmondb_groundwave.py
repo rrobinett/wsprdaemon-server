@@ -31,7 +31,8 @@ def _arrivals(centre, n=40, spread=2_000, night_h=(3, 9), day_h=(15, 20), u=230.
         c = centre if (night or day_centre is None) else day_centre
         out.append(dict(time=t, reporter_id=reporter_id, tx_id=tx_id, group_key="4.4630 -25.73",
                         rate_hz_per_s=rate,
-                        delay_ns=round(c + rnd.uniform(-spread, spread) / 2), u_epoch_ns=u))
+                        delay_ns=round(c + rnd.uniform(-spread, spread) / 2), u_epoch_ns=u,
+                        origin="t6_anchor"))
     return out
 
 
@@ -89,6 +90,14 @@ def test_drifting_cluster_is_not_fixed():
 def test_unanchored_rows_never_count():
     assert fixed_clusters(_arrivals(5_047_000, u=None), RX) == []
     assert fixed_clusters(_arrivals(5_047_000, u=5000.0), RX) == []
+
+
+def test_rows_labelled_by_a_tier_other_than_the_t6_anchor_never_count():
+    # hfdl-recorder 1f92973: a "t6" row (T6 held, anchor never matched) carries T6's sub-us sigma
+    rows = [dict(r, origin="t6") for r in _arrivals(5_047_000)]
+    assert fixed_clusters(rows, RX) == []
+    rows = [dict(r, origin="t6_anchor") for r in _arrivals(5_047_000)]
+    assert fixed_clusters(rows, RX) != []
 
 
 def test_wb6cxc_afternoon_utc_is_not_night():
