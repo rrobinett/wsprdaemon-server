@@ -86,3 +86,37 @@ def test_refresh_always_applies_and_never_spreads_rows(built):
     assert "} catch (e) {" in html.split("function refresh()")[1].split("function prepare")[0]
     assert "...TABLES_READ.flatMap" not in html
     assert "maxBuiltAt(d, TABLES_READ)" in html
+
+
+# A claude.ai artifact sandbox blocks fetches to outside servers, so a review copy carries a
+# snapshot of the public tables; the default build stays live.
+def _snapshot(tmp_path):
+    snap = {"taken_utc": "2026-11-14T03:10Z",
+            "tables": {"heard": {"meta": [{"name": "n_24h", "type": "UInt32"}], "data": [{"n_24h": 3}]}},
+            "atlas": {"type": "Topology", "objects": {}, "arcs": []}}
+    p = tmp_path / "snap.json"
+    p.write_text(__import__("json").dumps(snap))
+    return p
+
+
+def test_default_build_carries_no_snapshot(built):
+    html, _ = built
+    assert "SNAPSHOT" not in html
+
+
+def test_snapshot_build_answers_fetches_from_the_snapshot(tmp_path):
+    out = tmp_path / "t.html"
+    subprocess.run([sys.executable, BUILD, "--snapshot", str(_snapshot(tmp_path)), str(out)],
+                   check=True, capture_output=True)
+    html = out.read_text()
+    assert "const SNAPSHOT = " in html and '"n_24h": 3' in html
+    assert html.index("const SNAPSHOT = ") < html.index("function parseHash")   # shim runs first
+    assert '"Snapshot of " + SNAPSHOT.taken_utc' in html and '"taken_utc": "2026-11-14T03:10Z"' in html
+
+
+def test_snapshot_must_be_a_snapshot(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text("{}")
+    run = subprocess.run([sys.executable, BUILD, "--snapshot", str(bad), str(tmp_path / "t.html")],
+                         capture_output=True, text=True)
+    assert run.returncode != 0
