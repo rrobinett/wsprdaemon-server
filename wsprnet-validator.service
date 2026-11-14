@@ -1,0 +1,37 @@
+# /etc/systemd/system/wsprnet-validator.service
+#
+# Hourly check: which spots that stations sent to the WD servers never
+# reached wsprnet.org (wsprdaemon.spots vs the scraped wspr.rx).  Read-only
+# against both spot tables; writes only its own results:
+#   wsprdaemon.wsprnet_validation, wsprdaemon.wsprnet_missing,
+#   view wsprdaemon.wsprnet_missing_current,
+#   /var/lib/wsprdaemon/wsprnet_validator/latest.txt
+# and logs one WARNING per reporter losing or duplicating spots.
+# See wsprnet_validator.py.
+#
+# Operator setup (one WD server is enough; wd30 runs it):
+#   1. ln -s ~wsprdaemon/wsprdaemon-server/wsprnet_validator.py \
+#          /usr/local/bin/wsprnet_validator.py
+#   2. Credentials: reuses /etc/default/wsprnet-forwarder
+#      (CLICKHOUSE_USER / CLICKHOUSE_PASSWORD); /etc/default/wsprnet-validator
+#      overrides it if present.
+#   3. systemctl daemon-reload && systemctl enable --now wsprnet-validator.timer
+[Unit]
+Description=wsprnet.org delivery check (wsprdaemon-server)
+Documentation=https://github.com/rrobinett/wsprdaemon-server
+After=network-online.target clickhouse-server.service
+
+[Service]
+Type=oneshot
+User=wsprdaemon
+Group=wsprdaemon
+EnvironmentFile=-/etc/default/wsprnet-forwarder
+EnvironmentFile=-/etc/default/wsprnet-validator
+StateDirectory=wsprdaemon/wsprnet_validator
+ExecStart=/opt/wsprdaemon-server/venv/bin/python \
+    /usr/local/bin/wsprnet_validator.py run
+Nice=10
+TimeoutStartSec=20min
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wsprnet-validator

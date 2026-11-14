@@ -593,3 +593,45 @@ holds, drops them, and counts them as delivered.
 **Before widening beyond one station**, two things are relations, not code:
 attribution (we post under operators' callsigns from our IP) and wsprnet's
 rate limiting from a single address.
+
+## wsprnet.org delivery check (`wsprnet_validator.py`)
+
+Every station's WSPR spots reach the WD servers (`wsprdaemon.spots`) and,
+separately, wsprnet.org — directly (WD client, hs-uploader) or via
+`wsprnet_forwarder.py`.  The scraper copies wsprnet back into `wspr.rx`, so a
+spot in the first and not the second is one the station meant to report and
+wsprnet never recorded.  Until 2026-11-14 nothing compared them, and the
+WSPRnet audit of 2026-11-13 found hs-uploader losing 7-15 % and the WD client
+duplicating 0.5 %, months after both began.
+
+Runs hourly on wd30 (`wsprnet-validator.timer`, oneshot, ~3 s against
+26 h of data).  Each run re-judges `[now-30h, now-4h)` in whole hours, so a
+late scrape replaces an earlier "missing"; the newest 4 h are never judged.
+
+- **Match key = the forwarder's:** reporter (rx_sign, mapped through
+  `wsprnet_reporter` + the overrides file in `reporter_for()` order), minute,
+  wsprnet band code (integer MHz), tx_sign without angle brackets; `<...>` is
+  never expected.  Multi-receiver rows collapse to one expected spot.
+- **Tables:** `wsprdaemon.wsprnet_validation` per (hour, reporter):
+  wd_spots / on_wsprnet / missing / extra_on_wsprnet / dup_identical /
+  dup_diff_snr; `wsprdaemon.wsprnet_missing` one row per missing spot;
+  read it through the view `wsprnet_missing_current`.  Missing rows are
+  inserted before the summary, whose `checked_at` publishes them.
+- **Status:** `absent` (< 10 % found: uploads off, or posting under another
+  call — look at `extra_on_wsprnet` of the call it might use) is not an
+  alert unless the reporter was `reporting` the 24 h before.  Alerts
+  (journal WARNING + `/var/lib/wsprdaemon/wsprnet_validator/latest.txt`):
+  > 2 % missing or > 1 % identical duplicates over the newest 6 settled hours.
+- **Baseline, 2026-11-13 16:00 .. 11-14 18:00 UTC:** almost every reporting
+  station 0.01-0.7 % missing; the floor is spots wsprnet rejects on purpose
+  (no grid, bad call), which count as missing.  `extra_on_wsprnet` large =
+  the reporter also runs another decoder (WD4ELG) or another receiver posts
+  under its call.
+
+```bash
+wsprnet_validator.py run --dry-run           # judge now, print, write nothing
+wsprnet_validator.py report --hours 24       # from stored results
+wsprnet_validator.py missing --reporter AB4EJ --hours 24
+```
+
+Tests: `tests/test_wsprnet_validator.py` (no ClickHouse needed).
