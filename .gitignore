@@ -5,3 +5,4 @@ __pycache__/
 files.zip
 *.log
 tar-bulk-loader-state.json
+sigmondb/www/dist/

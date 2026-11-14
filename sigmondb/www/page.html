@@ -1,0 +1,677 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HF Transmitter Map</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one column; count tiles, then the map with its controls and side panel, then the tables. */
+:root {
+  --bg: #f6f7f5; --surface: #fcfcfb; --ink: #111413; --ink-2: #4d5350; --ink-3: #7d8480;
+  --rule: #dde1dd; --land: #e9ece8; --land-edge: #c9cfca; --sea: #f2f5f6;
+  --band-long: #2a78d6; --band-mid: #eb6834; --band-short: #1baf7a;
+  --tier-t5: #6f7672; --focus: #2a78d6;
+  --stage-2: var(--band-long); --stage-3: var(--band-mid); --stage-4: var(--band-short); --midpoint: var(--band-mid);
+  --f-display: "Instrument Sans", "Segoe UI", system-ui, sans-serif;
+  --f-body: "Instrument Sans", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #141615; --surface: #1a1a19; --ink: #eef0ec; --ink-2: #b9beb8; --ink-3: #8a908b;
+  --rule: #303431; --land: #242826; --land-edge: #3a403c; --sea: #181a19;
+  --band-long: #3987e5; --band-mid: #d95926; --band-short: #199e70; --tier-t5: #9aa19c; --focus: #3987e5;
+  color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #141615; --surface: #1a1a19; --ink: #eef0ec; --ink-2: #b9beb8; --ink-3: #8a908b;
+  --rule: #303431; --land: #242826; --land-edge: #3a403c; --sea: #181a19;
+  --band-long: #3987e5; --band-mid: #d95926; --band-short: #199e70; --tier-t5: #9aa19c; --focus: #3987e5;
+  color-scheme: dark }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.5 var(--f-body); }
+.wrap { max-width: 1180px; margin: 0 auto; padding-block: 28px 56px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 28px; grid-template-columns: minmax(0, 1fr); }
+header { display: grid; gap: 6px; }
+h1 { font: 600 clamp(24px, 3.4vw, 32px)/1.15 var(--f-display); margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+h2 { font: 600 18px/1.3 var(--f-display); margin: 0 0 8px; text-wrap: balance; }
+h3 { font: 600 15px/1.3 var(--f-display); margin: 0; }
+.lede { color: var(--ink-2); max-width: 68ch; margin: 0; }
+.meta { font: 12px/1.4 var(--f-mono); color: var(--ink-3); letter-spacing: 0.02em; }
+.status { font-size: 13.5px; color: var(--ink); border-left: 3px solid var(--band-mid); padding: 4px 10px; background: var(--surface); }
+.status:empty { display: none; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 12px 14px; display: grid; gap: 2px; min-width: 0; }
+.tile .k { font: 500 11px/1.3 var(--f-body); text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-3); }
+.tile .v { font: 500 26px/1.1 var(--f-mono); font-variant-numeric: tabular-nums; }
+.tile .s { font-size: 12.5px; color: var(--ink-2); }
+.panel { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 14px; display: grid; gap: 10px; min-width: 0; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center; font-size: 13.5px; }
+.seg { display: inline-flex; border: 1px solid var(--rule); border-radius: 5px; overflow: hidden; }
+.seg button { font: 500 13.5px/1 var(--f-body); color: var(--ink-2); background: var(--surface); border: 0; padding: 8px 14px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--rule); }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+.seg button:focus-visible, .linkish:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+fieldset.classes { border: 0; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; }
+fieldset.classes legend { float: left; font: 500 11px/1.3 var(--f-body); text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-3); margin-right: 4px; padding: 0; }
+.classes label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+.classes input:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.fam { color: var(--ink-3); font-size: 12.5px; }
+.key { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 12.5px; color: var(--ink-2); align-items: center; }
+.key svg { vertical-align: middle; }
+.mapgrid { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 900px) { .mapgrid { grid-template-columns: minmax(0, 1fr) 330px; } }
+.mapbox { position: relative; overflow: hidden; border-radius: 4px; background: var(--sea); touch-action: none; }
+.mapbox svg { display: block; width: 100%; height: auto; }
+.notice { position: absolute; left: 12px; right: 12px; top: 12px; background: var(--surface); border: 1px solid var(--rule);
+  border-radius: 4px; padding: 8px 10px; font-size: 13px; color: var(--ink); pointer-events: none; }
+.notice[hidden] { display: none; }
+.side { border-left: 1px solid var(--rule); padding-left: 14px; display: grid; gap: 10px; align-content: start; font-size: 13.5px; min-width: 0; }
+@media (max-width: 899px) { .side { border-left: 0; padding-left: 0; border-top: 1px solid var(--rule); padding-top: 12px; } }
+.side p { margin: 0; }
+.side .sub { color: var(--ink-2); }
+.side table { font-size: 12.5px; }
+.side .clear { justify-self: start; }
+.hint { font-size: 12px; color: var(--ink-3); }
+#tip { position: absolute; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--rule);
+  border-radius: 4px; padding: 7px 9px; font-size: 12.5px; line-height: 1.4; max-width: 280px; box-shadow: 0 2px 10px rgb(0 0 0 / 0.12); }
+#tip b { font-weight: 600; } #tip .m { font-family: var(--f-mono); font-size: 11.5px; color: var(--ink-2); }
+.tables { display: grid; gap: 22px; grid-template-columns: minmax(0, 1fr); }
+.tscroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+th, td { text-align: left; padding: 7px 10px 7px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font: 500 11px/1.3 var(--f-body); text-transform: uppercase; letter-spacing: 0.07em; color: var(--ink-3); }
+td.n, td.mono { font-family: var(--f-mono); font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pill { display: inline-block; font: 500 11px/1 var(--f-mono); padding: 3px 6px; border-radius: 3px; border: 1px solid var(--ink-2); color: var(--ink); white-space: nowrap; }
+.pill.solid { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+.swatch { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: 0; border: 1.5px solid transparent; }
+.empty { color: var(--ink-3); font-style: italic; }
+.nocase { text-transform: none; }
+.linkish { font: inherit; color: var(--ink); background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline; text-decoration-color: var(--rule); text-underline-offset: 3px; text-align: left; }
+.linkish:hover { text-decoration-color: var(--ink-2); }
+details summary { cursor: pointer; font: 600 15px/1.3 var(--f-display); }
+details summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.foot { font-size: 12.5px; color: var(--ink-3); display: grid; gap: 4px; }
+.foot a { color: var(--ink-2); }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="meta" id="asof">Reading the public data…</div>
+    <h1>HF transmitters the fleet hears</h1>
+    <p class="lede">Every known transmitter, every fleet station, and every path a station has measured.  The Timing view shows how far each transmitter has risen towards a confirmed timing offset.  The Ionosphere view shows where skywave paths sample the ionosphere, and what they measured there.</p>
+    <div class="status" id="status" role="status"></div>
+  </header>
+
+  <section class="tiles" id="tiles" aria-label="Counts"></section>
+
+  <section class="panel" aria-label="Map">
+    <div class="controls">
+      <div class="seg" role="group" aria-label="View">
+        <button type="button" data-view="timing" aria-pressed="true">Timing</button>
+        <button type="button" data-view="ionosphere" aria-pressed="false">Ionosphere</button>
+      </div>
+      <fieldset class="classes" id="classes"><legend>Class</legend></fieldset>
+    </div>
+    <div class="key" id="key"></div>
+    <div class="mapgrid">
+      <div class="mapbox" id="mapbox"><svg id="map" role="img" aria-label="Map of transmitters, fleet stations and the paths between them"></svg><div class="notice" id="notice" hidden></div><div id="tip" hidden></div></div>
+      <aside class="side" id="side" aria-live="polite"></aside>
+    </div>
+    <div class="hint">Drag to pan, scroll or pinch to zoom.  Click a transmitter, group or station to narrow the map to it; click empty map or press Escape to restore the full view.  The address then links to what you see.  Alaska and Hawaii appear as insets; transmitters outside this projection, such as Puerto Rico's, appear only in the transmitter table.</div>
+  </section>
+
+  <section class="tables">
+    <div><h2 id="paths-h">Paths heard</h2><div class="tscroll"><table id="t-paths"></table></div></div>
+    <div><h2>Stations</h2><div class="tscroll"><table id="t-stations"></table></div></div>
+    <details><summary id="groups-sum">Groups</summary><p class="hint">A group gathers sites that share one centre frequency and sweep rate.  Until attribution names the site, an arrival goes to its group, never to a guessed site.</p><div class="tscroll"><table id="t-groups"></table></div></details>
+    <details><summary id="tx-sum">All known transmitters</summary><div class="tscroll"><table id="t-tx"></table></div></details>
+  </section>
+
+  <footer class="foot">
+    <div>Data: the public, read-only tables of sigmondb_public, rebuilt hourly from what fleet stations measure.  Transmitter positions come from the <a href="https://hfradar.ioos.us/hfrnet/sitediag/stationList.php">HFRNet national station list</a>.</div>
+    <div>Station positions show the centre of each 6-character grid square, never the exact site.  Skywave midpoints derive from those centres.</div>
+    <div>Stages: 1 known, not heard; 2 heard by at least one station; 3 heard on T6 within ground-wave range; 4 offset confirmed.  T6: arrivals timed against a TS-1 PPS pulse injected at the receiver.</div>
+    <div>"Ground-wave range" and "skywave" go by distance alone for now: within 150 km at 12 MHz and above, 200 km between 6 and 12 MHz, 250 km below 6 MHz.  A diurnal stability test will replace this.</div>
+  </footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js" integrity="sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/topojson/3.0.2/topojson.min.js" integrity="sha384-9dCJK6nh7skY14HrcvlLYlFga9/MehJjL9ONWRflmiXNRuf8p2jiF4Y5PR881PTq" crossorigin="anonymous"></script>
+<!-- LOGIC -->
+<script>
+"use strict";
+const ATLAS_URL = "https://cdn.jsdelivr.net/npm/us-atlas@3.0.1/states-10m.json";
+const STORE_KEY = "sigmondb-public-map-v1";
+const REFRESH_MS = 10 * 60 * 1000;
+const W = 975, H = 610;
+const proj = d3.geoAlbersUsa().scale(1300).translate([W / 2, H / 2]);
+const geo = d3.geoPath(proj);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const $ = id => document.getElementById(id);
+
+// Class and family for rows from a publisher that predates those columns.
+const CLASS_OF_KIND = { codar: "ocean radar", oth: "over-the-horizon radar", ionosonde: "chirp ionosonde" };
+const STAGE = { 1: "Known, not heard", 2: "Heard", 3: "Heard on T6 within ground-wave range", 4: "Offset confirmed" };
+const PATH_WORD = { ground_range: "ground-wave range", skywave: "skywave" };
+const isHfdl = t => t.kind === "hfdl" || String(t.tx_id || "").startsWith("hfdl:") || t.class === "HFDL ground station";
+
+// ---- state
+let state = parseHash(location.hash);
+let cache = readStore();
+let D = null;                 // prepared data, or null when no endpoint has answered
+let load = { error: null, stale: false, asOfMs: null };
+let missingTables = new Set();
+let selNotFound = null;
+let atlas = null, atlasError = null;
+let inflight = null;
+
+function readStore() {
+  try { const c = JSON.parse(localStorage.getItem(STORE_KEY)); return c && c.data ? c : null; } catch (e) { return null; }
+}
+function writeStore(c) {
+  try { const s = JSON.stringify(c); if (s.length < 3e6) localStorage.setItem(STORE_KEY, s); } catch (e) { /* no storage here */ }
+}
+
+// A table the publisher has not created yet answers 404 with ClickHouse code 60
+// (UNKNOWN_TABLE).  That is a plain "no data yet", not an outage: hand logic.js an empty table.
+let pendingMissing = new Set();
+async function publicFetch(url, opts) {
+  const resp = await fetch(url, opts);
+  if (resp.ok || resp.status !== 404) return resp;
+  let text = "";
+  try { text = await resp.text(); } catch (e) { /* fall through */ }
+  const code = resp.headers && resp.headers.get && resp.headers.get("X-ClickHouse-Exception-Code");
+  if (code !== "60" && !/UNKNOWN_TABLE/.test(text)) return { ok: false };
+  const m = /sigmondb_public\.(\w+)/.exec(decodeURIComponent(url));
+  if (m) pendingMissing.add(m[1]);
+  return { ok: true, json: async () => ({ meta: [], data: [] }) };
+}
+
+async function refresh() {
+  if (inflight) return inflight;
+  inflight = (async () => {
+    pendingMissing = new Set();
+    const before = cache && cache.asOfMs;
+    const res = await loadAll(publicFetch, cache, Date.now());
+    if (res.data && !res.stale && res.asOfMs !== before) {
+      cache = { data: res.data, asOfMs: res.asOfMs, missing: [...pendingMissing] };
+      writeStore(cache);
+    }
+    if (cache && res.data === cache.data) missingTables = new Set(cache.missing || []);
+    load = res;
+    D = res.data ? prepare(res.data) : null;
+  })();
+  try { await inflight; } finally { inflight = null; }
+}
+
+function prepare(raw) {
+  const d = {};
+  for (const t of TABLES_READ) d[t] = Array.isArray(raw[t]) ? raw[t] : [];
+  d.transmitters = d.transmitters.filter(t => !isHfdl(t)).map(t => Object.assign({}, t, {
+    class: t.class || CLASS_OF_KIND[t.kind] || "unknown",
+    family: t.family || (t.kind === "codar" ? "CODAR SeaSonde" : "unspecified"),
+  }));
+  d.groups = d.groups.filter(g => !String(g.group_id).startsWith("hfdl")).map(g => Object.assign({}, g, {
+    class: g.class || "unknown", family: g.family || "unspecified", members: g.members || [],
+  }));
+  d.txById = new Map(d.transmitters.map(t => [t.tx_id, t]));
+  d.grById = new Map(d.groups.map(g => [g.group_id, g]));
+  const known = id => d.txById.has(id) || d.grById.has(id);
+  d.heard = d.heard.filter(r => known(r.target_id));
+  d.ionosphere_hourly = d.ionosphere_hourly.filter(r => known(r.target_id));
+  d.transmitter_offsets = d.transmitter_offsets.filter(o => d.txById.has(o.tx_id));
+  d.rxById = new Map(d.receivers.map(r => [r.reporter_id, r]));
+  d.trustBy = Object.fromEntries(d.trust.map(t => [t.reporter_id, t]));
+  d.offsetBy = new Map(d.transmitter_offsets.map(o => [o.tx_id, o]));
+  d.builtAt = Math.max(0, ...TABLES_READ.flatMap(t => d[t].map(r => r.built_at_utc || 0)));
+  // Projected positions: transmitters at their listed position, groups as a ring around their members.
+  d.txXY = new Map();
+  for (const t of d.transmitters) {
+    const p = t.lat != null && t.lon != null ? proj([t.lon, t.lat]) : null;
+    if (p) d.txXY.set(t.tx_id, p);
+  }
+  d.grRing = new Map();
+  for (const g of d.groups) {
+    const pts = g.members.map(id => d.txXY.get(id)).filter(Boolean);
+    if (!pts.length) continue;
+    const cx = d3.mean(pts, p => p[0]), cy = d3.mean(pts, p => p[1]);
+    d.grRing.set(g.group_id, { c: [cx, cy], r: d3.max(pts, p => Math.hypot(p[0] - cx, p[1] - cy)) + 9 });
+  }
+  d.rxXY = new Map();
+  for (const r of d.receivers) {
+    const p = r.lat != null && r.lon != null ? proj([r.lon, r.lat]) : null;
+    if (p) d.rxXY.set(r.reporter_id, p);
+  }
+  d.stageBy = new Map();
+  for (const t of d.transmitters) d.stageBy.set(t.tx_id, stageOf(t.tx_id, d));
+  for (const g of d.groups) d.stageBy.set(g.group_id, stageOf(g.group_id, d));
+  // Each skywave path's midpoints, from its latest hour.
+  d.mids = new Map();
+  for (const r of d.ionosphere_hourly) {
+    const key = r.reporter_id + "\u0000" + r.target_id;
+    const cur = d.mids.get(key);
+    if (Array.isArray(r.midpoints) && r.midpoints.length && (!cur || r.hour_utc > cur.hour)) d.mids.set(key, { hour: r.hour_utc, pts: r.midpoints });
+  }
+  return d;
+}
+
+// ---- small formatters
+const nameOf = id => { const t = D.txById.get(id); if (t) return t.name || id; const g = D.grById.get(id); return g ? g.name || id : id; };
+const fmtN = n => n == null ? "—" : Number(n).toLocaleString("en-US");
+const fmtF = (v, k) => v == null || !isFinite(v) ? "—" : Number(v).toFixed(k);
+const fmtUtc = s => s ? new Date(s * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC" : "—";
+const fmtPct = v => v == null ? "no arrivals in 24 h" : Math.round(v * 100) + " %";
+const pathWord = p => (PATH_WORD[p] || p) + ", by distance";
+const stageColour = s => s >= 2 ? `var(--stage-${s})` : "var(--surface)";
+const swatch = s => `<span class="swatch" style="background:${stageColour(s)};border-color:${s >= 2 ? stageColour(s) : "var(--ink-3)"}"></span>`;
+const pill = (t, solid) => `<span class="pill${solid ? " solid" : ""}">${esc(t)}</span>`;
+const selBtn = (type, id, label) => `<button type="button" class="linkish" data-sel="${esc(type)}" data-id="${esc(id)}">${esc(label)}</button>`;
+const targetType = id => D.grById.has(id) ? "group" : "tx";
+const tierText = rid => {
+  const a = (D.rxById.get(rid) || D.trustBy[rid] || {}).a_level || "";
+  return `T6 share ${fmtPct(t6Share(rid, D.heard))} · ruler ${a ? esc(a) : "unstated"}`;
+};
+const counts = r => `24 h: ${fmtN(r.n_24h)} arrivals, ${fmtN(r.t6_24h)} on T6 · 7 d: ${fmtN(r.n_7d)}, ${fmtN(r.t6_7d)} on T6`;
+
+// ---- map scaffolding
+const svg = d3.select("#map").attr("viewBox", `0 0 ${W} ${H}`);
+const root = svg.append("g");
+const gStates = root.append("g"), gHulls = root.append("g"), gLinks = root.append("g"), gGroups = root.append("g"),
+  gTx = root.append("g"), gMid = root.append("g"), gSt = root.append("g");
+const tip = $("tip"), box = $("mapbox");
+function showTip(ev, html) {
+  tip.innerHTML = html; tip.hidden = false;
+  const r = box.getBoundingClientRect(), tw = tip.offsetWidth, th = tip.offsetHeight;
+  let x = ev.clientX - r.left + 14, y = ev.clientY - r.top + 14;
+  if (x + tw > r.width - 4) x = ev.clientX - r.left - tw - 14;
+  if (y + th > r.height - 4) y = ev.clientY - r.top - th - 14;
+  tip.style.left = Math.max(4, x) + "px"; tip.style.top = Math.max(4, y) + "px";
+}
+const hideTip = () => { tip.hidden = true; };
+let k = 1;
+
+function select(type, id) {
+  const same = state.sel && state.sel.type === type && state.sel.id === id;
+  setState(Object.assign({}, state, { sel: same ? null : { type, id } }));
+}
+function setState(next) {
+  state = next;
+  const h = formatHash(state);
+  if (location.hash !== h) location.hash = h;   // hashchange runs apply()
+  else apply();
+}
+
+// ---- drawing
+function drawStates() {
+  if (!atlas) return;
+  gStates.selectAll("path").data(topojson.feature(atlas, atlas.objects.states).features).join("path")
+    .attr("d", geo).attr("fill", "var(--land)").attr("stroke", "var(--land-edge)").attr("stroke-width", 0.6)
+    .attr("vector-effect", "non-scaling-stroke");
+}
+
+function draw() {
+  hideTip();
+  const notice = $("notice");
+  if (!D) {
+    for (const g of [gHulls, gLinks, gGroups, gTx, gMid, gSt]) g.selectAll("*").remove();
+    notice.hidden = false;
+    notice.textContent = "No data to draw: " + (load.error || "no public endpoint has answered yet") + ".";
+    return;
+  }
+  const ion = state.view === "ionosphere";
+  const vis = visible(state, D);
+  const s = 1 / Math.sqrt(k);
+  const msgs = [];
+  if (atlasError) msgs.push("The state outlines did not load (" + atlasError + "); markers still show.");
+  if (!D.heard.length) msgs.push("No paths published yet.  Transmitters and stations show; paths appear once the hourly publisher writes them.");
+  else if (ion && !D.ionosphere_hourly.length) msgs.push("No skywave measurements published yet.");
+  notice.hidden = !msgs.length; notice.textContent = msgs.join("  ");
+
+  // Targets that stay bright: the visible set, plus the member sites of a visible group.
+  const bright = new Set(vis.targets);
+  for (const id of vis.targets) { const g = D.grById.get(id); if (g) g.members.forEach(m => bright.add(m)); }
+  const classOk = c => !state.classes || state.classes.includes(c);
+  const fade = on => on ? 1 : 0.15;
+
+  // Paths (Timing): station to transmitter, or to the group's ring.
+  const endOf = (rxp, id) => {
+    const p = D.txXY.get(id); if (p) return p;
+    const ring = D.grRing.get(id); if (!ring) return null;
+    const dx = ring.c[0] - rxp[0], dy = ring.c[1] - rxp[1], dd = Math.hypot(dx, dy);
+    return dd > ring.r ? [ring.c[0] - dx / dd * ring.r, ring.c[1] - dy / dd * ring.r] : ring.c;
+  };
+  const links = ion ? [] : vis.rows.map(r => {
+    const a = D.rxXY.get(r.reporter_id); if (!a) return null;
+    const b = endOf(a, r.target_id); return b ? { r, a, b } : null;
+  }).filter(Boolean);
+  gLinks.selectAll("line").data(links, l => l.r.reporter_id + "|" + l.r.target_id + "|" + l.r.path).join("line")
+    .attr("x1", l => l.a[0]).attr("y1", l => l.a[1]).attr("x2", l => l.b[0]).attr("y2", l => l.b[1])
+    .attr("stroke", "var(--ink-2)").attr("stroke-width", 1.8).attr("vector-effect", "non-scaling-stroke")
+    .attr("stroke-dasharray", l => l.r.path === "ground_range" ? null : "6 4")
+    .on("mousemove", (ev, l) => showTip(ev, `<b>${esc(l.r.reporter_id)} hears ${esc(nameOf(l.r.target_id))}</b><br>${esc(pathWord(l.r.path))} · <span class="m">${fmtN(Math.round(l.r.distance_km))} km · ${fmtF(l.r.centre_mhz, 3)} MHz</span><br>${counts(l.r)}<br>Last heard ${fmtUtc(l.r.last_utc)}`))
+    .on("mouseleave", hideTip)
+    .on("click", (ev, l) => { ev.stopPropagation(); select(targetType(l.r.target_id), l.r.target_id); });
+
+  // Groups: a dashed ring around the member sites (Timing only; Ionosphere draws hulls).
+  const groups = ion ? [] : D.groups.filter(g => D.grRing.has(g.group_id) && classOk(g.class));
+  gGroups.selectAll("circle").data(groups, g => g.group_id).join("circle")
+    .attr("cx", g => D.grRing.get(g.group_id).c[0]).attr("cy", g => D.grRing.get(g.group_id).c[1]).attr("r", g => D.grRing.get(g.group_id).r)
+    .attr("fill", "transparent").attr("stroke", g => D.stageBy.get(g.group_id) >= 2 ? `var(--stage-${D.stageBy.get(g.group_id)})` : "var(--ink-3)")
+    .attr("stroke-width", 1.6).attr("stroke-dasharray", "3 3").attr("vector-effect", "non-scaling-stroke")
+    .attr("opacity", g => fade(vis.targets.has(g.group_id))).style("cursor", "pointer")
+    .on("mousemove", (ev, g) => showTip(ev, `<b>${esc(g.name)}</b><br>Group of ${g.members.length} sites · ${esc(STAGE[D.stageBy.get(g.group_id)])}<br><span class="m">${esc(g.members.join(" "))}</span>`))
+    .on("mouseleave", hideTip)
+    .on("click", (ev, g) => { ev.stopPropagation(); select("group", g.group_id); });
+
+  // Transmitters: coloured by stage in Timing, plain and faint in Ionosphere.
+  const txs = D.transmitters.filter(t => D.txXY.has(t.tx_id) && classOk(t.class));
+  gTx.selectAll("circle").data(txs, t => t.tx_id).join("circle")
+    .attr("cx", t => D.txXY.get(t.tx_id)[0]).attr("cy", t => D.txXY.get(t.tx_id)[1])
+    .attr("r", t => (ion ? 3 : 3.5 + 0.5 * D.stageBy.get(t.tx_id)) * s)
+    .attr("fill", t => ion ? "var(--ink-3)" : stageColour(D.stageBy.get(t.tx_id)))
+    .attr("stroke", t => ion || D.stageBy.get(t.tx_id) >= 2 ? "var(--surface)" : "var(--ink-3)")
+    .attr("stroke-width", 1.5).attr("vector-effect", "non-scaling-stroke")
+    .attr("opacity", t => ion ? 0.45 * fade(bright.has(t.tx_id)) : fade(bright.has(t.tx_id))).style("cursor", "pointer")
+    .on("mousemove", (ev, t) => showTip(ev, txTip(t)))
+    .on("mouseleave", hideTip)
+    .on("click", (ev, t) => { ev.stopPropagation(); select("tx", t.tx_id); });
+
+  // Ionosphere: one marker per named-transmitter skywave path at its midpoint; a faint hull per group path.
+  const sky = ion ? vis.rows.filter(r => r.path === "skywave") : [];
+  const marks = [], hulls = [];
+  for (const r of sky) {
+    const m = D.mids.get(r.reporter_id + "\u0000" + r.target_id);
+    if (!m) continue;
+    const pts = m.pts.map(p => proj([p[1], p[0]])).filter(Boolean);
+    if (!pts.length) continue;
+    if (D.grById.has(r.target_id)) hulls.push({ r, pts: hull(pts) });
+    else marks.push({ r, p: pts[0] });
+  }
+  gHulls.selectAll("path").data(hulls, h => h.r.reporter_id + "|" + h.r.target_id).join("path")
+    .attr("d", h => h.pts.length >= 3 ? "M" + h.pts.join("L") + "Z" : "M" + h.pts.join("L"))
+    .attr("fill", "var(--midpoint)").attr("fill-opacity", 0.15).attr("stroke", "var(--midpoint)").attr("stroke-opacity", 0.35)
+    .attr("stroke-width", 10).attr("stroke-linecap", "round").attr("stroke-linejoin", "round")
+    .attr("vector-effect", "non-scaling-stroke").style("cursor", "pointer")
+    .on("mousemove", (ev, h) => showTip(ev, `<b>${esc(h.r.reporter_id)} → ${esc(nameOf(h.r.target_id))}</b><br>Skywave midpoints of the group's ${h.pts.length > 1 ? "sites" : "site"}; attribution has not named the site yet<br>${counts(h.r)}`))
+    .on("mouseleave", hideTip)
+    .on("click", (ev, h) => { ev.stopPropagation(); select("group", h.r.target_id); });
+  gMid.selectAll("rect").data(marks, m => m.r.reporter_id + "|" + m.r.target_id).join("rect")
+    .attr("x", m => m.p[0] - 4.5 * s).attr("y", m => m.p[1] - 4.5 * s).attr("width", 9 * s).attr("height", 9 * s).attr("rx", 1.5 * s)
+    .attr("fill", "var(--midpoint)").attr("stroke", "var(--surface)").attr("stroke-width", 1.5).attr("vector-effect", "non-scaling-stroke")
+    .style("cursor", "pointer")
+    .on("mousemove", (ev, m) => showTip(ev, `<b>Midpoint: ${esc(m.r.reporter_id)} → ${esc(nameOf(m.r.target_id))}</b><br><span class="m">${fmtN(Math.round(m.r.distance_km))} km · ${fmtF(m.r.centre_mhz, 3)} MHz</span><br>${counts(m.r)}`))
+    .on("mouseleave", hideTip)
+    .on("click", (ev, m) => { ev.stopPropagation(); select("tx", m.r.target_id); });
+
+  // Stations: diamonds at grid-square centres; stations sharing a square stack their labels.
+  const sts = D.receivers.filter(r => D.rxXY.has(r.reporter_id));
+  const stackIdx = new Map(), seen = new Map();
+  for (const r of sts) { const key = r.grid6 || r.reporter_id; const i = seen.get(key) || 0; stackIdx.set(r.reporter_id, i); seen.set(key, i + 1); }
+  const st = gSt.selectAll("g.st").data(sts, r => r.reporter_id).join(enter => {
+    const e = enter.append("g").attr("class", "st").style("cursor", "pointer");
+    e.append("rect"); e.append("text");
+    return e;
+  });
+  st.attr("transform", r => { const p = D.rxXY.get(r.reporter_id); return `translate(${p[0]},${p[1]}) scale(${s})`; })
+    .attr("opacity", r => fade(vis.reporters.has(r.reporter_id)))
+    .on("mousemove", (ev, r) => showTip(ev, `<b>${esc(r.reporter_id)}</b> · <span class="m">${esc(r.grid6)}</span><br>${tierText(r.reporter_id)}`))
+    .on("mouseleave", hideTip)
+    .on("click", (ev, r) => { ev.stopPropagation(); select("station", r.reporter_id); });
+  st.select("rect").attr("x", -6).attr("y", -6).attr("width", 12).attr("height", 12).attr("transform", "rotate(45)")
+    .attr("fill", r => (t6Share(r.reporter_id, D.heard) || 0) > 0 ? "var(--ink)" : "var(--surface)")
+    .attr("stroke", r => (t6Share(r.reporter_id, D.heard) || 0) > 0 ? "var(--surface)" : "var(--ink)")
+    .attr("stroke-width", 2).attr("stroke-dasharray", r => t6Share(r.reporter_id, D.heard) == null ? "2 1.5" : null)
+    .style("display", r => stackIdx.get(r.reporter_id) ? "none" : null);
+  st.select("text").attr("x", 11).attr("y", r => 4 + 13 * stackIdx.get(r.reporter_id)).attr("text-anchor", "start")
+    .text(r => r.reporter_id)
+    .attr("font-family", "var(--f-mono)").attr("font-size", 11.5).attr("fill", "var(--ink)")
+    .attr("paint-order", "stroke").attr("stroke", "var(--sea)").attr("stroke-width", 3).attr("stroke-linejoin", "round");
+}
+
+function txTip(t) {
+  const st = D.stageBy.get(t.tx_id), o = D.offsetBy.get(t.tx_id);
+  return `<b>${esc(t.name || t.tx_id)}</b> · <span class="m">${esc(t.tx_id)}</span><br>${esc(t.class)} · ${esc(t.family)}` +
+    (t.centre_mhz != null ? `<br><span class="m">${fmtF(t.centre_mhz, 4)} MHz · ${fmtF(t.rate_khz_s, 2)} kHz/s</span>` : "") +
+    `<br>Stage ${st}: ${esc(STAGE[st])}` + (o ? `<br>Offset ${fmtF(o.offset_ms, 3)} ± ${fmtF(o.sigma_ms, 3)} ms` : "");
+}
+
+// ---- side panel
+function drawSide() {
+  const side = $("side");
+  if (!D) { side.innerHTML = `<p class="empty">Nothing to show until a public endpoint answers.</p>`; return; }
+  const ion = state.view === "ionosphere";
+  const sel = state.sel;
+  const vis = visible(state, D);
+  let html = "";
+  if (!sel) {
+    html = ion
+      ? `<h3>Ionosphere</h3><p class="sub">Each orange square marks the midpoint of a skywave path to a named transmitter; a faint outline covers a group's possible midpoints.  Click one, or a station, to see what the path measured hour by hour.</p>`
+      : `<h3>Timing</h3><p class="sub">Transmitters take the colour of their stage of evidence.  Solid lines run within ground-wave range, dashed ones by skywave.  Click a transmitter, group or station for its listeners, counts and offset.</p>`;
+  } else if (sel.type === "station") {
+    const r = D.rxById.get(sel.id) || {};
+    const t = D.trustBy[sel.id];
+    html = `<h3>${esc(sel.id)}</h3><p class="sub mono">${esc(r.grid6 || "")}</p>` +
+      `<p>Timing: ${tierText(sel.id)}.  ${t && t.trusted == 1 ? "A GPSDO governs its ruler, so it can confirm offsets." : "Its ruler is not stated as GPSDO-governed, so it cannot confirm offsets."}</p>`;
+    html += ion ? ionoRows(vis.rows) : stationTargets(vis.rows);
+  } else {
+    html = ion ? targetHead(sel) + ionoRows(vis.rows) : targetHead(sel) + targetListeners(sel, vis.rows);
+  }
+  if (ion) html += `<p class="hint">Virtual height and layer come once offsets exist.</p>`;
+  if (sel) html += `<button type="button" class="linkish clear" data-clear="1">Show everything</button>`;
+  side.innerHTML = html;
+}
+
+function targetHead(sel) {
+  const id = sel.id, st = D.stageBy.get(id);
+  if (sel.type === "group") {
+    const g = D.grById.get(id);
+    return `<h3>${esc(g.name || id)}</h3><p class="sub">Group of ${g.members.length} sites · ${esc(g.class)} · ${esc(g.family)}<br>` +
+      `<span class="mono">${fmtF(g.centre_mhz, 4)} MHz · ${fmtF(g.rate_khz_s, 2)} kHz/s</span>${g.both_coasts == 1 ? " · sites on both coasts; nearer coast used" : ""}</p>` +
+      `<p>${swatch(st)}Stage ${st}: ${esc(STAGE[st])}</p><p class="sub">Members: ${g.members.map(m => D.txById.has(m) ? selBtn("tx", m, m) : esc(m)).join(", ")}</p>` +
+      `<p class="sub">Offset: a group holds no single offset until attribution names its site.</p>`;
+  }
+  const t = D.txById.get(id), o = D.offsetBy.get(id);
+  return `<h3>${esc(t.name || id)}</h3><p class="sub"><span class="mono">${esc(id)}</span> · ${esc(t.class)} · ${esc(t.family)}` +
+    (t.centre_mhz != null ? `<br><span class="mono">${fmtF(t.centre_mhz, 4)} MHz · ${fmtF(t.rate_khz_s, 2)} kHz/s</span>` : "") +
+    (D.txXY.has(id) ? "" : "<br>Outside the map projection or without a position") + `</p>` +
+    `<p>${swatch(st)}Stage ${st}: ${esc(STAGE[st])}</p>` +
+    `<p>Offset: ${o ? `<span class="mono">${fmtF(o.offset_ms, 3)} ± ${fmtF(o.sigma_ms, 3)} ms</span>, confirmed by ${fmtN(o.n_confirming)} station${o.n_confirming == 1 ? "" : "s"}${o.confirming_reporters && o.confirming_reporters.length ? " (" + o.confirming_reporters.map(esc).join(", ") + ")" : ""}.  Positive means the transmitter runs late of UTC.` : "not yet known."}</p>`;
+}
+
+function targetListeners(sel, rows) {
+  if (!rows.length) return `<p class="empty">No fleet station has heard it yet.</p>`;
+  const body = rows.slice().sort((a, b) => a.distance_km - b.distance_km).map(r =>
+    `<tr><td>${selBtn("station", r.reporter_id, r.reporter_id)}</td><td>${esc(pathWord(r.path))}<br><span class="mono">${fmtN(Math.round(r.distance_km))} km</span></td>` +
+    `<td class="n">${fmtN(r.n_24h)} / ${fmtN(r.t6_24h)}<br>${fmtN(r.n_7d)} / ${fmtN(r.t6_7d)}</td><td>${canPin(r, D.trustBy) ? pill("could pin", true) : "—"}</td></tr>`).join("");
+  return `<h3>Listeners</h3><div class="tscroll"><table><thead><tr><th>Station</th><th>Path</th><th>All / T6<br>24 h, 7 d</th><th>Pin</th></tr></thead><tbody>${body}</tbody></table></div>` +
+    `<p class="hint">A station could pin the offset when its ruler is GPSDO-governed, its path lies within ground-wave range, and it holds T6 arrivals in the last 7 days.  The solver keeps its own admission rules.</p>`;
+}
+
+function stationTargets(rows) {
+  if (!rows.length) return `<p class="empty">No paths published for this station yet.</p>`;
+  const body = rows.slice().sort((a, b) => b.n_24h - a.n_24h).map(r =>
+    `<tr><td>${selBtn(targetType(r.target_id), r.target_id, nameOf(r.target_id))}</td><td>${esc(pathWord(r.path))}<br><span class="mono">${fmtN(Math.round(r.distance_km))} km</span></td>` +
+    `<td class="n">${fmtN(r.n_24h)} / ${fmtN(r.t6_24h)}<br>${fmtN(r.n_7d)} / ${fmtN(r.t6_7d)}</td></tr>`).join("");
+  return `<h3>Transmitters heard</h3><div class="tscroll"><table><thead><tr><th>Transmitter</th><th>Path</th><th>All / T6<br>24 h, 7 d</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function ionoRows(rows) {
+  const sky = rows.filter(r => r.path === "skywave");
+  if (!sky.length) return `<p class="empty">No skywave paths here.</p>`;
+  const since = D.builtAt - 86400;
+  const mv = (m, q, k) => m == null ? "—" : `${fmtF(m, k)} <span class="hint">(${fmtF(q, k)})</span>`;
+  let html = "";
+  for (const r of sky) {
+    const hrs = D.ionosphere_hourly.filter(h => h.reporter_id === r.reporter_id && h.target_id === r.target_id && h.hour_utc >= since)
+      .sort((a, b) => b.hour_utc - a.hour_utc);
+    html += `<h3>${esc(r.reporter_id)} → ${esc(nameOf(r.target_id))}</h3>`;
+    if (!hrs.length) { html += `<p class="empty">No hourly measurements in the last 24 h.</p>`; continue; }
+    html += `<div class="tscroll"><table><thead><tr><th>Hour UTC</th><th>n</th><th>Doppler Hz</th><th>S4</th><th><span class="nocase">σφ</span> rad</th><th>Level dB</th></tr></thead><tbody>` +
+      hrs.map(h => `<tr><td class="mono">${new Date(h.hour_utc * 1000).toISOString().slice(11, 13)}Z</td><td class="n">${fmtN(h.n)}</td>` +
+        `<td class="n">${mv(h.doppler_med, h.doppler_iqr, 2)}</td><td class="n">${mv(h.s4_med, h.s4_iqr, 2)}</td>` +
+        `<td class="n">${mv(h.sphi_med, h.sphi_iqr, 2)}</td><td class="n">${mv(h.level_med, h.level_iqr, 1)}</td></tr>`).join("") +
+      `</tbody></table></div>`;
+  }
+  return html + `<p class="hint">Each cell: the hour's median, with its interquartile range in brackets.  "—" means no arrival in that hour carried the measure.</p>`;
+}
+
+// ---- tiles, controls, key, tables
+function drawHeader() {
+  const parts = [];
+  if (D && D.builtAt) parts.push("Data published " + fmtUtc(D.builtAt));
+  if (load.asOfMs) parts.push("read " + fmtUtc(load.asOfMs / 1000));
+  $("asof").textContent = parts.length ? parts.join(" · ") : "No data read yet";
+  const msgs = [];
+  if (!D) msgs.push("No data: " + (load.error || "no public endpoint has answered") + ".  The page will try again.");
+  else if (load.stale) msgs.push(`Stale: showing the answer read ${Math.round((Date.now() - load.asOfMs) / 60000)} min ago, because ${load.error}.`);
+  if (D) {
+    const empty = ["heard", "groups", "ionosphere_hourly"].filter(t => !D[t].length);
+    if (empty.length) msgs.push("No data yet in " + empty.join(", ") + (empty.some(t => missingTables.has(t)) ? " (not yet published)" : "") + ".");
+  }
+  if (selNotFound) msgs.push(`The linked selection ${selNotFound} was not found in the current data, so the map shows everything.`);
+  $("status").innerHTML = msgs.map(esc).join("<br>");
+}
+
+function drawTiles() {
+  if (!D) { $("tiles").innerHTML = ""; return; }
+  const stageN = n => D.transmitters.filter(t => D.stageBy.get(t.tx_id) === n).length;
+  const gr = D.heard.filter(r => r.path === "ground_range").length;
+  const t6st = D.receivers.filter(r => (t6Share(r.reporter_id, D.heard) || 0) > 0).length;
+  const tiles = [
+    ["Transmitters", D.transmitters.length, `${stageN(2) + stageN(3) + stageN(4)} heard · ${stageN(1)} not yet`],
+    ["Groups", D.groups.length, "sites sharing one frequency and sweep"],
+    ["Fleet stations", D.receivers.length, `${t6st} with T6 arrivals in 24 h`],
+    ["Paths heard", D.heard.length, `${gr} ground-wave range · ${D.heard.length - gr} skywave`],
+    ["Offsets confirmed", D.transmitter_offsets.length, "transmitters at stage 4"],
+  ];
+  $("tiles").innerHTML = tiles.map(([kk, v, s]) =>
+    `<div class="tile"><span class="k">${kk}</span><span class="v">${fmtN(v)}</span><span class="s">${esc(s)}</span></div>`).join("");
+}
+
+function drawControls() {
+  for (const b of document.querySelectorAll("[data-view]")) b.setAttribute("aria-pressed", String(b.dataset.view === state.view));
+  const fs = $("classes");
+  fs.querySelectorAll("label, .empty").forEach(n => n.remove());
+  if (!D) return;
+  const fams = new Map();
+  for (const t of [...D.transmitters, ...D.groups]) {
+    if (!fams.has(t.class)) fams.set(t.class, new Set());
+    fams.get(t.class).add(t.family);
+  }
+  const classes = [...fams.keys()].sort();
+  for (const c of classes) {
+    const n = D.transmitters.filter(t => t.class === c).length;
+    const lab = document.createElement("label");
+    lab.innerHTML = `<input type="checkbox" value="${esc(c)}"${!state.classes || state.classes.includes(c) ? " checked" : ""}> ${esc(c)} <span class="fam">${esc([...fams.get(c)].sort().join(", "))} · ${n}</span>`;
+    fs.appendChild(lab);
+  }
+}
+
+function drawKey() {
+  const dot = (fill, stroke) => `<svg width="12" height="12" viewBox="-6 -6 12 12"><circle r="4" fill="${fill}" stroke="${stroke}" stroke-width="1.5"/></svg>`;
+  const diamond = (fill, stroke, dash) => `<svg width="16" height="16" viewBox="-8 -8 16 16"><rect x="-4.5" y="-4.5" width="9" height="9" transform="rotate(45)" fill="${fill}" stroke="${stroke}" stroke-width="1.6" ${dash ? 'stroke-dasharray="2 1.5"' : ""}/></svg>`;
+  const line = dash => `<svg width="28" height="10" viewBox="0 0 28 10"><line x1="1" y1="5" x2="27" y2="5" stroke="var(--ink-2)" stroke-width="1.8" ${dash ? `stroke-dasharray="${dash}"` : ""}/></svg>`;
+  const ring = `<svg width="16" height="16" viewBox="-8 -8 16 16"><circle r="6" fill="none" stroke="var(--ink-3)" stroke-width="1.4" stroke-dasharray="3 2"/></svg>`;
+  const sq = `<svg width="12" height="12" viewBox="-6 -6 12 12"><rect x="-4.5" y="-4.5" width="9" height="9" rx="1.5" fill="var(--midpoint)"/></svg>`;
+  const area = `<svg width="18" height="12" viewBox="0 0 18 12"><path d="M2 10 L8 2 L16 6 Z" fill="var(--midpoint)" fill-opacity="0.15" stroke="var(--midpoint)" stroke-opacity="0.6"/></svg>`;
+  const stations = [`${diamond("var(--ink)", "var(--surface)")} station with T6 arrivals`, `${diamond("var(--surface)", "var(--ink)")} station, no T6`, `${diamond("var(--surface)", "var(--ink-3)", true)} station, nothing heard in 24 h`];
+  const items = state.view === "ionosphere"
+    ? [`${sq} skywave midpoint, named transmitter`, `${area} midpoints of a group's sites`, `${dot("var(--ink-3)", "var(--surface)")} transmitter`, ...stations]
+    : [`${dot("var(--surface)", "var(--ink-3)")} 1 known, not heard`, `${dot("var(--stage-2)", "var(--surface)")} 2 heard`,
+       `${dot("var(--stage-3)", "var(--surface)")} 3 T6 within ground-wave range`, `${dot("var(--stage-4)", "var(--surface)")} 4 offset confirmed`,
+       `${ring} group`, `${line()} ground-wave range`, `${line("6 4")} skywave`, ...stations];
+  $("key").innerHTML = items.map(x => `<span>${x}</span>`).join("");
+}
+
+function drawTables() {
+  if (!D) { for (const id of ["t-paths", "t-stations", "t-groups", "t-tx"]) $(id).innerHTML = ""; return; }
+  const vis = visible(state, D);
+  $("paths-h").textContent = state.sel ? `Paths heard: ${state.sel.id}` : "Paths heard";
+  const rows = vis.rows.slice().sort((a, b) => a.reporter_id.localeCompare(b.reporter_id) || b.n_24h - a.n_24h);
+  $("t-paths").innerHTML = rows.length
+    ? `<thead><tr><th>Station</th><th>Hears</th><th>Path</th><th>km</th><th>MHz</th><th>24 h all / T6</th><th>7 d all / T6</th><th>Last heard</th><th>Could pin</th></tr></thead><tbody>` +
+      rows.map(r => `<tr><td class="mono">${selBtn("station", r.reporter_id, r.reporter_id)}</td><td>${selBtn(targetType(r.target_id), r.target_id, nameOf(r.target_id))}</td>` +
+        `<td>${esc(pathWord(r.path))}</td><td class="n">${fmtN(Math.round(r.distance_km))}</td><td class="n">${fmtF(r.centre_mhz, 3)}</td>` +
+        `<td class="n">${fmtN(r.n_24h)} / ${fmtN(r.t6_24h)}</td><td class="n">${fmtN(r.n_7d)} / ${fmtN(r.t6_7d)}</td><td class="n">${fmtUtc(r.last_utc)}</td>` +
+        `<td>${canPin(r, D.trustBy) ? pill("yes", true) : "—"}</td></tr>`).join("") + "</tbody>"
+    : `<tbody><tr><td class="empty">${D.heard.length ? "No paths match this selection and filter." : "No paths published yet."}</td></tr></tbody>`;
+
+  const rx = D.receivers.slice().sort((a, b) => a.reporter_id.localeCompare(b.reporter_id));
+  $("t-stations").innerHTML = rx.length
+    ? `<thead><tr><th>Station</th><th>Grid</th><th>T6 share, 24 h</th><th>Ruler</th><th>Can confirm offsets</th><th>Paths</th></tr></thead><tbody>` +
+      rx.map(r => `<tr><td class="mono">${selBtn("station", r.reporter_id, r.reporter_id)}</td><td class="mono">${esc(r.grid6)}</td>` +
+        `<td class="n">${esc(fmtPct(t6Share(r.reporter_id, D.heard)))}</td><td class="mono">${esc(r.a_level || "unstated")}</td>` +
+        `<td>${D.trustBy[r.reporter_id] && D.trustBy[r.reporter_id].trusted == 1 ? pill("yes", true) : "no"}</td>` +
+        `<td class="n">${D.heard.filter(h => h.reporter_id === r.reporter_id).length}</td></tr>`).join("") + "</tbody>"
+    : `<tbody><tr><td class="empty">No stations published.</td></tr></tbody>`;
+
+  $("groups-sum").textContent = `Groups (${D.groups.length})`;
+  $("t-groups").innerHTML = D.groups.length
+    ? `<thead><tr><th>Group</th><th>Stage</th><th>MHz</th><th>kHz/s</th><th>Coast</th><th>Sites</th></tr></thead><tbody>` +
+      D.groups.slice().sort((a, b) => a.centre_mhz - b.centre_mhz).map(g => `<tr><td>${selBtn("group", g.group_id, g.name || g.group_id)}</td>` +
+        `<td>${swatch(D.stageBy.get(g.group_id))}${D.stageBy.get(g.group_id)}</td><td class="n">${fmtF(g.centre_mhz, 4)}</td><td class="n">${fmtF(g.rate_khz_s, 2)}</td>` +
+        `<td>${esc(g.coast)}${g.both_coasts == 1 ? " (both)" : ""}</td><td class="mono">${esc(g.members.join(" "))}</td></tr>`).join("") + "</tbody>"
+    : `<tbody><tr><td class="empty">No groups published yet.</td></tr></tbody>`;
+
+  const classOk = c => !state.classes || state.classes.includes(c);
+  const txs = D.transmitters.filter(t => classOk(t.class))
+    .sort((a, b) => D.stageBy.get(b.tx_id) - D.stageBy.get(a.tx_id) || (a.centre_mhz || 0) - (b.centre_mhz || 0) || a.tx_id.localeCompare(b.tx_id));
+  $("tx-sum").textContent = `All known transmitters (${txs.length})`;
+  $("t-tx").innerHTML = `<thead><tr><th>Transmitter</th><th>Name</th><th>Class, family</th><th>Stage</th><th>MHz</th><th>kHz/s</th><th>Status</th><th>On map</th></tr></thead><tbody>` +
+    txs.map(t => `<tr><td class="mono">${selBtn("tx", t.tx_id, t.tx_id)}</td><td>${esc(t.name)}</td><td>${esc(t.class)}<br><span class="hint">${esc(t.family)}</span></td>` +
+      `<td>${swatch(D.stageBy.get(t.tx_id))}${D.stageBy.get(t.tx_id)}</td><td class="n">${fmtF(t.centre_mhz, 4)}</td><td class="n">${fmtF(t.rate_khz_s, 2)}</td>` +
+      `<td>${esc(t.status)}</td><td>${D.txXY.has(t.tx_id) ? "yes" : t.lat == null ? "no position" : "outside the map"}</td></tr>`).join("") + "</tbody>";
+}
+
+// ---- the cycle: read the hash, load (cached under an hour), resolve, draw
+async function apply() {
+  state = parseHash(location.hash);
+  await refresh();
+  selNotFound = null;
+  if (D && state.sel) {
+    const r = resolve(state, D);
+    if (r.missing) {
+      selNotFound = `${state.sel.type}=${state.sel.id}`;
+      state = r.state;
+      try { history.replaceState(null, "", formatHash(state)); } catch (e) { /* sandboxed frame */ }
+    }
+  }
+  render();
+}
+function render() {
+  drawHeader(); drawControls(); drawKey(); drawTiles(); draw(); drawSide(); drawTables();
+}
+
+// ---- events
+const zoom = d3.zoom().scaleExtent([1, 14]).translateExtent([[-40, -40], [W + 40, H + 40]])
+  .on("zoom", ev => { k = ev.transform.k; root.attr("transform", ev.transform); hideTip(); if (D) draw(); });
+svg.call(zoom);
+svg.on("click", () => { if (state.sel) setState(Object.assign({}, state, { sel: null })); });
+document.addEventListener("keydown", ev => { if (ev.key === "Escape" && state.sel) setState(Object.assign({}, state, { sel: null })); });
+document.addEventListener("click", ev => {
+  const b = ev.target.closest && ev.target.closest("[data-view], [data-sel], [data-clear]");
+  if (!b) return;
+  if (b.dataset.view) setState(Object.assign({}, state, { view: b.dataset.view }));
+  else if (b.dataset.clear) setState(Object.assign({}, state, { sel: null }));
+  else select(b.dataset.sel, b.dataset.id);
+});
+$("classes").addEventListener("change", () => {
+  const boxes = [...$("classes").querySelectorAll("input")];
+  let on = boxes.filter(b => b.checked).map(b => b.value);
+  if (!on.length) { boxes.forEach(b => { b.checked = true; }); on = boxes.map(b => b.value); }
+  setState(Object.assign({}, state, { classes: on.length === boxes.length ? null : on }));
+});
+window.addEventListener("hashchange", apply);
+setInterval(apply, REFRESH_MS);
+
+fetch(ATLAS_URL).then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+  .then(a => { atlas = a; drawStates(); }, e => { atlasError = e.message || "unreachable"; if (D) draw(); });
+render();
+apply();
+</script>
+</body>
+</html>
