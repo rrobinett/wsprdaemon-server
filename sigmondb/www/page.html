@@ -200,6 +200,11 @@ function refresh() {
       load = res;
       if (res.data && (!D || D.raw !== res.data)) D = prepare(res.data);
       else if (!res.data) D = null;
+    } catch (e) {
+      // prepare() or storage failed: say so in the status line, never stay on "Reading…".
+      D = null;
+      load = { error: "the page could not use the public data (" + (e && e.message || e) + ")",
+               stale: false, asOfMs: null, missing: [], loading: false };
     } finally { inflight = null; }
     apply();
   })();
@@ -225,7 +230,7 @@ function prepare(raw) {
   d.rxById = new Map(d.receivers.map(r => [r.reporter_id, r]));
   d.trustBy = Object.fromEntries(d.trust.map(t => [t.reporter_id, t]));
   d.offsetBy = new Map(d.transmitter_offsets.map(o => [o.tx_id, o]));
-  d.builtAt = Math.max(0, ...TABLES_READ.flatMap(t => d[t].map(r => r.built_at_utc || 0)));
+  d.builtAt = maxBuiltAt(d, TABLES_READ);
   // Projected positions: transmitters at their listed position, groups as a ring around their members.
   d.txXY = new Map();
   for (const t of d.transmitters) {

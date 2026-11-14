@@ -201,12 +201,17 @@ test("code 60 on db2 but data on wd1 gives wd1's data", async () => {
 });
 
 test("a table is missing only if every endpoint that answered said 60", async () => {
-  // db2 never answers (down); wd1 and wd2 both say 60: missing.
-  const f = (url) => tableOf(url) !== "groups" ? okResp([{x: 1}])
-    : url.startsWith("https://db2.wspr.live/") ? Promise.reject(new Error("down")) : chResp("60");
+  // every endpoint says 60: missing.
+  const f = (url) => tableOf(url) !== "groups" ? okResp([{x: 1}]) : chResp("60");
   const r = await L.loadAll(f, null, 0);
   assert.equal(r.error, null);
   assert.deepEqual(r.missing, ["groups"]);
+  // db2 is unreachable while wd1 and wd2 say 60: a failed read, not missing.
+  const dn = (url) => tableOf(url) !== "groups" ? okResp([{x: 1}])
+    : url.startsWith("https://db2.wspr.live/") ? Promise.reject(new Error("down")) : chResp("60");
+  const rd = await L.loadAll(dn, null, 0);
+  assert.equal(rd.data, null);
+  assert.match(rd.error, /groups/);
   // db2 sends another 404 (no code 60): a failed endpoint, so groups is not missing and the load fails.
   const g = (url) => tableOf(url) !== "groups" ? okResp([{x: 1}])
     : url.startsWith("https://db2.wspr.live/") ? chResp(null) : chResp("60");
@@ -226,4 +231,22 @@ test("a missing core table is an error that names it", async () => {
   assert.equal(r.data, null);
   assert.match(r.error, /transmitters/);
   assert.match(r.error, /not published/);
+});
+
+test("code 60 on one endpoint plus timeouts elsewhere is a failed read, not missing", async () => {
+  const never = () => new Promise(() => {});
+  const f = (url) => tableOf(url) !== "groups" ? okResp([{x: 1}])
+    : url.startsWith(L.ENDPOINTS[0]) ? chResp("60") : never();
+  const r = await L.loadAll(f, null, 0, 20);
+  assert.equal(r.data, null);
+  assert.deepEqual(r.missing, []);
+  assert.match(r.error, /groups/);
+  await assert.rejects(() => L.fetchTable((u) => (u.startsWith(L.ENDPOINTS[0]) ? chResp("60") : never()), "groups", 20),
+    /groups/);
+});
+
+test("maxBuiltAt loops over 200k rows without a RangeError", () => {
+  const rows = Array.from({length: 200000}, (_, i) => ({built_at_utc: i}));
+  assert.equal(L.maxBuiltAt({a: rows, b: [{}], c: [{built_at_utc: 5}]}, ["a", "b", "c", "absent"]), 199999);
+  assert.equal(L.maxBuiltAt({}, ["a"]), 0);
 });

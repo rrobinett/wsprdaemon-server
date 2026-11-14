@@ -118,7 +118,7 @@ AGG_QUERIES = {
         "countIf(time > now() - INTERVAL 24 HOUR AND origin = 't6_anchor') AS t6_24h, "
         "count() AS n_7d, countIf(origin = 't6_anchor') AS t6_7d, "
         "min(time) AS first_t, max(time) AS last_t "
-        "FROM sigmondb.arrival WHERE time > now() - INTERVAL 7 DAY AND " + _NOT_HFDL +
+        "FROM sigmondb.arrival FINAL WHERE time > now() - INTERVAL 7 DAY AND " + _NOT_HFDL +
         " GROUP BY reporter_id, tx_id, group_key"),
     "ionosphere": (
         ("reporter_id", "tx_id", "group_key", "centre_hz", "rate_hz_per_s", "hour", "n",
@@ -130,7 +130,7 @@ AGG_QUERIES = {
         "quantilesIf(0.25, 0.5, 0.75)(s4, isNotNull(s4)) AS sq, "
         "quantilesIf(0.25, 0.5, 0.75)(sigma_phi_rad, isNotNull(sigma_phi_rad)) AS pq, "
         "quantilesIf(0.25, 0.5, 0.75)(level_db, isNotNull(level_db)) AS lq "
-        "FROM sigmondb.arrival WHERE time > now() - INTERVAL 24 HOUR AND " + _NOT_HFDL +
+        "FROM sigmondb.arrival FINAL WHERE time > now() - INTERVAL 24 HOUR AND " + _NOT_HFDL +
         " GROUP BY reporter_id, tx_id, group_key, hour"),
 }
 
@@ -393,26 +393,45 @@ def build_ionosphere(source, built_at, out=print):
     return [rows[k] for k in sorted(rows)]
 
 
-def build_all(source, built_at):
-    """{table: rows} for every table in TABLES order."""
-    groups, heard = build_groups_heard(source, built_at)
-    return {
+def _optional(tables, names, build, out):
+    """Run a map builder on its own.  A failure logs one line and leaves its tables OUT of
+    `tables`, so publish() skips them and the public hosts keep their last copy."""
+    try:
+        got = build()
+    except Exception as e:
+        out("%s: build FAILED, not published this run: %s: %s" % (
+            "/".join(names), type(e).__name__, e))
+        return
+    for n, rows in zip(names, got):
+        tables[n] = rows
+
+
+def build_all(source, built_at, out=print):
+    """{table: rows} in TABLES order.  groups, heard and ionosphere_hourly are left out when
+    their aggregate was not read or their builder fails; the core tables always build."""
+    core = {
         "transmitter_offsets": build_transmitter_offsets(
             source["solution"], source["transmitter"], built_at),
         "trust": build_trust(source["receiver"], built_at),
         "receivers": build_receivers(source["receiver"], built_at),
         "transmitters": build_transmitters(
             source["transmitter"], built_at, source.get("waveform", ())),
-        "groups": groups,
-        "heard": heard,
         "t3_calibration": [],
-        "ionosphere_hourly": build_ionosphere(source, built_at),
     }
+    extra = {}
+    if "agg:heard" in source:
+        _optional(extra, ("groups", "heard"),
+                  lambda: build_groups_heard(source, built_at, out), out)
+    if "agg:ionosphere" in source:
+        _optional(extra, ("ionosphere_hourly",),
+                  lambda: (build_ionosphere(source, built_at, out),), out)
+    core.update(extra)
+    return {t: core[t] for t in TABLES if t in core}
 
 
-def read_source(client):
+def read_source(client, out=print):
     """{solution, transmitter, receiver} rows from wd30's sigmondb, every table FINAL."""
-    out = {}
+    log, out = out, {}
 
     def run(sql):
         try:
@@ -425,7 +444,13 @@ def read_source(client):
             ", ".join(cols), table, SOURCE_WHERE.get(table, ""))
         out[table] = [dict(zip(cols, r)) for r in run(sql).result_rows]
     for name, (cols, sql) in AGG_QUERIES.items():
-        out["agg:" + name] = [dict(zip(cols, r)) for r in run(sql).result_rows]
+        try:
+            out_rows = [dict(zip(cols, r)) for r in run(sql).result_rows]
+        except Exception as e:   # the map must not stop the core tables
+            log("agg:%s: read FAILED, table(s) not published this run: %s: %s" % (
+                name, type(e).__name__, e))
+            continue
+        out["agg:" + name] = out_rows
     return out
 
 
@@ -508,8 +533,10 @@ def publish(tables, hosts, user, password, urlopen=None, out=print, timeout=30.0
     for host in hosts:
         ch = ChHttp(host, user, password, timeout=timeout, urlopen=urlopen)
         for table in TABLES:
+            if table not in tables:   # not built this run: the host keeps its last copy
+                continue
             try:
-                n = replace_table(ch, table, tables.get(table, []))
+                n = replace_table(ch, table, tables[table])
                 out("%s %s: %d rows" % (host, table, n))
             except Exception as e:
                 msg = ch.scrub(str(e) if isinstance(e, PublishError)

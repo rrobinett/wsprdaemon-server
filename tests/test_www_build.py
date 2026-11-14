@@ -77,3 +77,12 @@ def test_build_refuses_unsafe_standalone_url(tmp_path):
     run = subprocess.run([sys.executable, BUILD, "--standalone-url", "https://x/</script>", str(tmp_path / "t.html")],
                          capture_output=True, text=True)
     assert run.returncode != 0
+
+
+def test_refresh_always_applies_and_never_spreads_rows(built):
+    """page.html has no browser test: read the built text.  refresh() must catch a prepare()
+    failure into load.error and still reach apply(); builtAt must not spread rows."""
+    html, _ = built
+    assert "} catch (e) {" in html.split("function refresh()")[1].split("function prepare")[0]
+    assert "...TABLES_READ.flatMap" not in html
+    assert "maxBuiltAt(d, TABLES_READ)" in html

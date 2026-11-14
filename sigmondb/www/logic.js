@@ -162,24 +162,32 @@ function fetchOnce(fetchFn, url, timeoutMs) {
 }
 
 // One table, whole, from the first endpoint that has it.  Returns {rows} or {missing: true};
-// missing only when every endpoint that answered said code 60.  Anything else that is not
-// data counts as a failed endpoint, and the next one is tried.
+// missing only when EVERY endpoint said code 60.  A timeout, an unreachable endpoint or any
+// other non-data answer counts as a failed endpoint (the next one is tried), and one failed
+// endpoint without data makes the whole read fail.
 async function fetchTable(fetchFn, table, timeoutMs = FETCH_TIMEOUT_MS) {
   const q = "SELECT * FROM sigmondb_public." + table + " FORMAT JSON";
-  let last = "no endpoint", said60 = 0, otherAnswer = false;
+  let last = "no endpoint", said60 = 0;
   for (const base of ENDPOINTS) {
     try {
       const body = await fetchOnce(fetchFn, base + "?query=" + encodeURIComponent(q), timeoutMs);
       if (body === MISSING) { said60++; last = base + " has no such table"; continue; }
-      if (!body || !Array.isArray(body.data)) { otherAnswer = true; last = base + " sent no data"; continue; }
+      if (!body || !Array.isArray(body.data)) { last = base + " sent no data"; continue; }
       return {rows: coerceRows(body.data, body.meta)};
     } catch (e) {
-      if (e.message === "error answer") otherAnswer = true;
       last = base + (e.message === "timeout" ? " timed out" : e.message === "error answer" ? " sent an error" : " unreachable");
     }
   }
-  if (said60 && !otherAnswer) return {missing: true};
+  if (said60 && said60 === ENDPOINTS.length) return {missing: true};
   throw new Error(table + ": " + last);
+}
+
+// The newest built_at_utc over the given tables of d, by loop: spreading every row into
+// Math.max throws RangeError near 1e5 rows.
+function maxBuiltAt(d, tables) {
+  let m = 0;
+  for (const t of tables) for (const r of d[t] || []) { const b = r.built_at_utc || 0; if (b > m) m = b; }
+  return m;
 }
 
 async function loadAll(fetchFn, cache, nowMs, timeoutMs = FETCH_TIMEOUT_MS) {
@@ -204,6 +212,6 @@ async function loadAll(fetchFn, cache, nowMs, timeoutMs = FETCH_TIMEOUT_MS) {
 }
 
 if (typeof module !== "undefined") {
-  module.exports = {FETCH_TIMEOUT_MS, ENDPOINTS, TABLES_READ, OPTIONAL_TABLES, fetchTable, parseHash, formatHash, resolve, stageOf, canPin,
+  module.exports = {FETCH_TIMEOUT_MS, ENDPOINTS, TABLES_READ, OPTIONAL_TABLES, fetchTable, maxBuiltAt, parseHash, formatHash, resolve, stageOf, canPin,
     t6Share, visible, hull, loadAll};
 }

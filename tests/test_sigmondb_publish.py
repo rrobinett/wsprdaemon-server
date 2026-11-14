@@ -416,9 +416,13 @@ def test_every_schema_carries_built_at_utc():
 H1, H2 = "http://10.112.0.10:8123", "http://10.112.0.20:8123"
 
 
-def _tables():
+def _core_tables():
     return dict(transmitter_offsets=[dict(tx_id="hfrnet:A", built_at_utc=BUILT)],
                 trust=[], receivers=[], transmitters=[], t3_calibration=[])
+
+
+def _tables():
+    return dict(_core_tables(), groups=[], heard=[], ionosphere_hourly=[])
 
 
 def test_first_run_creates_then_renames():
@@ -678,3 +682,72 @@ def test_publish_creates_new_tables():
     fails = publish.publish(tables, [H1], "sigmondb_publisher", PASSWORD,
                             urlopen=Router({H1: srv}), out=lambda s: None)
     assert fails == [] and "groups" in srv.tables and "heard" in srv.tables
+
+
+# --- the map must not stop the core tables -------------------------------------------------
+
+CORE = ("transmitter_offsets", "trust", "receivers", "transmitters", "t3_calibration")
+
+
+class _AggFails(FakeSource):
+    def __init__(self, failing, **tables):
+        super().__init__(**tables)
+        self.failing = failing
+
+    def query(self, sql, parameters=None, query_tz=None):
+        if any("/* agg:%s */" % f in sql for f in self.failing):
+            raise RuntimeError("query timed out")
+        return super().query(sql, parameters, query_tz)
+
+
+def _core_src(cls=FakeSource, *a):
+    kw = dict(solution=[_sol("hfrnet:A", _utc(2026, 11, 12), 1_000_000)],
+              transmitter=[_tx("hfrnet:A")], receiver=[_rx("W1AW")])
+    return cls(*a, **kw)
+
+
+def test_failing_aggregate_read_still_yields_core_tables():
+    logs = []
+    src = _core_src(_AggFails, ("heard", "ionosphere"))
+    source = publish.read_source(src, out=logs.append)
+    assert "agg:heard" not in source and "agg:ionosphere" not in source
+    assert len(logs) == 2 and "agg:heard" in logs[0] and "RuntimeError" in logs[0]
+    tables = publish.build_all(source, BUILT, out=logs.append)
+    assert set(tables) == set(CORE)
+
+
+def test_one_failing_aggregate_leaves_only_its_tables_out():
+    src = _core_src(_AggFails, ("ionosphere",))
+    tables = publish.build_all(publish.read_source(src, out=lambda s: None), BUILT)
+    assert set(tables) == set(CORE) | {"groups", "heard"}
+
+
+def test_a_failing_builder_leaves_only_its_tables_out(monkeypatch):
+    def boom(*a, **k):
+        raise ValueError("odd row")
+    source = publish.read_source(_core_src(), out=lambda s: None)
+    logs = []
+    monkeypatch.setattr(publish, "build_groups_heard", boom)
+    t = publish.build_all(source, BUILT, out=logs.append)
+    assert set(t) == set(CORE) | {"ionosphere_hourly"}
+    assert len(logs) == 1 and "groups/heard" in logs[0] and "ValueError: odd row" in logs[0]
+    monkeypatch.undo()
+    monkeypatch.setattr(publish, "build_ionosphere", boom)
+    t = publish.build_all(source, BUILT, out=lambda s: None)
+    assert set(t) == set(CORE) | {"groups", "heard"}
+
+
+def test_publish_skips_absent_tables_and_leaves_their_copy():
+    srv = FakeServer(tables={"groups": [{"group_id": "old"}]})
+    out = []
+    fails = publish.publish(_core_tables(), [H1], "sigmondb_publisher", PASSWORD,
+                            urlopen=Router({H1: srv}), out=out.append)
+    assert fails == []
+    assert len(out) == len(CORE)
+    assert srv.tables["groups"] == [{"group_id": "old"}]
+    assert "heard" not in srv.tables and "ionosphere_hourly" not in srv.tables
+
+
+def test_agg_queries_read_final():
+    for name, (cols, sql) in publish.AGG_QUERIES.items():
+        assert "FROM sigmondb.arrival FINAL WHERE" in sql
