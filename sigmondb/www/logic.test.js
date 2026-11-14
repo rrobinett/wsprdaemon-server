@@ -143,3 +143,34 @@ test("query falls back and keeps the last answer", async () => {
   assert.equal(none.data, null);
   assert.ok(none.error);
 });
+
+test("loadAll coerces quoted numeric columns", async () => {
+  const f = () => Promise.resolve({ok: true, json: () => Promise.resolve({
+    meta: [{name: "reporter_id", type: "String"}, {name: "n_24h", type: "UInt64"},
+      {name: "t6_24h", type: "Nullable(Int64)"}, {name: "x", type: "Float64"}],
+    data: [{reporter_id: "R1", n_24h: "6", t6_24h: "3", x: "1.5"}, {reporter_id: "R1", n_24h: "4", t6_24h: null, x: null}],
+  })});
+  const r = await L.loadAll(f, null, 0);
+  const row = r.data.heard[0];
+  assert.equal(row.n_24h, 6);
+  assert.equal(row.x, 1.5);
+  assert.equal(r.data.heard[1].t6_24h, null);
+  assert.equal(row.reporter_id, "R1");
+  assert.equal(L.t6Share("R1", r.data.heard), 0.3);
+});
+
+test("loadAll times out a silent endpoint and falls through", async () => {
+  assert.equal(L.FETCH_TIMEOUT_MS, 10000);
+  let signalled = false;
+  const f = (url, opts) => {
+    if (url.startsWith("https://db2.wspr.live/")) {
+      opts.signal.addEventListener("abort", () => { signalled = true; });
+      return new Promise(() => {});
+    }
+    return okResp([{x: 1}]);
+  };
+  const r = await L.loadAll(f, null, 0, 20);
+  assert.equal(r.error, null);
+  assert.deepEqual(r.data.heard, [{x: 1}]);
+  assert.equal(signalled, true);
+});

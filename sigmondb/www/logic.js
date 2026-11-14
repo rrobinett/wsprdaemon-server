@@ -122,29 +122,54 @@ function hull(points) {
   return build(pts).concat(build(pts.slice().reverse()));
 }
 
-async function fetchTable(fetchFn, table) {
+const FETCH_TIMEOUT_MS = 10000;
+const NUMERIC_TYPE = /^(Nullable\()?(U?Int\d+|Float\d+)\)?$/;
+
+function coerceRows(rows, meta) {
+  const cols = (meta || []).filter((m) => NUMERIC_TYPE.test(m.type)).map((m) => m.name);
+  if (!cols.length) return rows;
+  for (const row of rows) {
+    for (const c of cols) if (row[c] !== null && row[c] !== undefined) row[c] = Number(row[c]);
+  }
+  return rows;
+}
+
+function fetchOnce(fetchFn, url, timeoutMs) {
+  const ctl = new AbortController();
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => { ctl.abort(); reject(new Error("timeout")); }, timeoutMs);
+  });
+  const work = (async () => {
+    const resp = await fetchFn(url, {signal: ctl.signal});
+    if (!resp || !resp.ok) throw new Error("error answer");
+    return resp.json();
+  })();
+  work.catch(() => {});
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function fetchTable(fetchFn, table, timeoutMs) {
   const q = "SELECT * FROM sigmondb_public." + table + " FORMAT JSON";
   let last = "no endpoint";
   for (const base of ENDPOINTS) {
     try {
-      const resp = await fetchFn(base + "?query=" + encodeURIComponent(q));
-      if (!resp || !resp.ok) { last = base + " answered with an error"; continue; }
-      const body = await resp.json();
+      const body = await fetchOnce(fetchFn, base + "?query=" + encodeURIComponent(q), timeoutMs);
       if (!body || !Array.isArray(body.data)) { last = base + " sent no data"; continue; }
-      return body.data;
+      return coerceRows(body.data, body.meta);
     } catch (e) {
-      last = base + " unreachable";
+      last = base + (e.message === "timeout" ? " timed out" : " unreachable");
     }
   }
   throw new Error(table + ": " + last);
 }
 
-async function loadAll(fetchFn, cache, nowMs) {
+async function loadAll(fetchFn, cache, nowMs, timeoutMs = FETCH_TIMEOUT_MS) {
   if (cache && cache.data && nowMs - cache.asOfMs < CACHE_MAX_AGE_MS) {
     return {data: cache.data, asOfMs: cache.asOfMs, stale: false, error: null};
   }
   try {
-    const rows = await Promise.all(TABLES_READ.map((t) => fetchTable(fetchFn, t)));
+    const rows = await Promise.all(TABLES_READ.map((t) => fetchTable(fetchFn, t, timeoutMs)));
     const data = {};
     TABLES_READ.forEach((t, i) => { data[t] = rows[i]; });
     return {data, asOfMs: nowMs, stale: false, error: null};
@@ -156,6 +181,6 @@ async function loadAll(fetchFn, cache, nowMs) {
 }
 
 if (typeof module !== "undefined") {
-  module.exports = {ENDPOINTS, TABLES_READ, parseHash, formatHash, resolve, stageOf, canPin,
+  module.exports = {FETCH_TIMEOUT_MS, ENDPOINTS, TABLES_READ, parseHash, formatHash, resolve, stageOf, canPin,
     t6Share, visible, hull, loadAll};
 }
