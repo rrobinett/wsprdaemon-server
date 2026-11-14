@@ -36,6 +36,11 @@ class FakeSource:
 
     def query(self, sql, parameters=None, query_tz=None):
         self.sql.append(sql)
+        m = re.match(r"\s*/\* agg:(\w+) \*/", sql)
+        if m:
+            cols = publish.AGG_QUERIES[m.group(1)][0]
+            return _Result([tuple(r.get(c) for c in cols)
+                            for r in self.tables.get("agg:" + m.group(1), [])])
         m = re.match(r"\s*SELECT (.+?) FROM sigmondb\.(\w+) FINAL", sql)
         cols = [c.strip() for c in m.group(1).split(",")]
         return _Result([tuple(r.get(c) for c in cols) for r in self.tables.get(m.group(2), [])])
@@ -322,8 +327,8 @@ def test_build_all_reads_final_and_t3_calibration_is_empty():
     tables = publish.build_all(publish.read_source(src), BUILT)
     assert list(tables) == list(publish.TABLES)
     assert tables["t3_calibration"] == []
-    assert [len(tables[t]) for t in publish.TABLES] == [1, 1, 1, 1, 0]
-    assert all(" FINAL" in s for s in src.sql)
+    assert [len(tables[t]) for t in publish.TABLES] == [1, 1, 1, 1, 0, 0, 0]
+    assert all(" FINAL" in s for s in src.sql if not s.startswith("/* agg:"))
     for t in publish.TABLES:
         for r in tables[t]:
             assert r["built_at_utc"] == BUILT
@@ -488,3 +493,120 @@ def test_a_gpsdo_receiver_still_publishes_only_grid6():
     assert out["grid6"] == publish.latlon_to_grid6(41.0123, -80.0456)
     assert (out["lat"], out["lon"]) == grid_to_latlon(out["grid6"])
     assert set(out) == {"reporter_id", "grid6", "lat", "lon", "a_level", "built_at_utc"}
+
+
+# --- groups and heard -------------------------------------------------------------------------
+
+def _codar_fixture():
+    return dict(
+        transmitter=[_tx("hfrnet:PREY", lat=29.0, lon=-95.0),     # Texas: East by lon > -100
+                     _tx("hfrnet:CALI", lat=34.0, lon=-120.0)],   # California: West
+        waveform=[_wf("hfrnet:PREY", _utc(2026, 11, 1), 4_450_500.0, -25_730.0),
+                  _wf("hfrnet:CALI", _utc(2026, 11, 1), 4_450_500.0, -25_730.0)])
+
+
+def _heard_row(reporter="W1AW", tx_id="", key="4.4505 -25.73", centre=4_450_500.0,
+               rate=-25_730.0, **kw):
+    r = dict(reporter_id=reporter, tx_id=tx_id, group_key=key, centre_hz=centre,
+             rate_hz_per_s=rate, n_24h=5, t6_24h=1, n_7d=30, t6_7d=4,
+             first_t=_utc(2026, 11, 8), last_t=_utc(2026, 11, 14))
+    r.update(kw)
+    return r
+
+
+def _src(heard, receivers, **extra):
+    base = _codar_fixture()
+    base.update(extra)
+    return dict(solution=[], receiver=receivers, **{"agg:heard": heard}, **base)
+
+
+def test_heard_group_path():
+    lat, lon = publish.grid_to_latlon("EM38ww")
+    src = _src([_heard_row()], [_rx("K0X", lat=lat, lon=lon)])
+    src["agg:heard"][0]["reporter_id"] = "K0X"
+    groups, heard = publish.build_groups_heard(src, BUILT)
+    assert len(groups) == 1
+    g = groups[0]
+    assert g["group_id"] == "4.4505 -25.73 E" and g["class"] == "ocean radar"
+    assert g["family"] == "CODAR SeaSonde" and g["members"] == ["hfrnet:PREY"]
+    assert g["name"] == "4.4505 MHz, -25.73 kHz/s (east coast)"
+    assert g["coast"] == "E" and g["both_coasts"] == 1 and g["built_at_utc"] == BUILT
+    assert len(heard) == 1
+    h = heard[0]
+    assert h["target_type"] == "group" and h["target_id"] == g["group_id"]
+    assert h["path"] == "skywave" and h["n_7d"] == 30 and h["t6_7d"] == 4
+    assert h["n_24h"] == 5 and h["t6_24h"] == 1
+    assert h["first_utc"] == _utc(2026, 11, 8).timestamp()
+    assert h["centre_mhz"] == pytest.approx(4.4505)
+
+
+def test_heard_named_tx_path():
+    # station ~40 km from PREY, 13.5 MHz
+    lat, lon = publish.grid_to_latlon("EL29ho")
+    src = _src([_heard_row(reporter="K0X", tx_id="hfrnet:PREY", key="13.5000 -50",
+                           centre=13_500_000.0, rate=-50_000.0)],
+               [_rx("K0X", lat=lat, lon=lon)],
+               transmitter=[_tx("hfrnet:PREY", lat=lat + 0.36, lon=lon)])
+    groups, heard = publish.build_groups_heard(src, BUILT)
+    assert groups == []
+    h = heard[0]
+    assert h["target_type"] == "tx" and h["target_id"] == "hfrnet:PREY"
+    assert h["path"] == "ground_range" and 30 < h["distance_km"] < 50
+
+
+def test_heard_skips_reporter_without_position(capsys):
+    src = _src([_heard_row(reporter="NOPOS")], [_rx("OTHER")])
+    groups, heard = publish.build_groups_heard(src, BUILT)
+    assert heard == []
+    assert "skipped" in capsys.readouterr().out
+
+
+def test_heard_skips_tx_without_position_and_unmatched_group():
+    lat, lon = publish.grid_to_latlon("EM38ww")
+    src = _src([_heard_row(reporter="K0X", tx_id="hfrnet:NOPOS"),
+                _heard_row(reporter="K0X", key="9.0 -1", centre=9e6, rate=-1.0)],
+               [_rx("K0X", lat=lat, lon=lon)],
+               transmitter=[_tx("hfrnet:NOPOS", lat=None, lon=None)])
+    assert publish.build_groups_heard(src, BUILT) == ([], [])
+
+
+def test_heard_distance_uses_grid6_centre():
+    from sigmondb.groundwave import great_circle_m
+    true_lat, true_lon = 38.9101, -94.3333
+    g = publish.latlon_to_grid6(true_lat, true_lon)
+    clat, clon = publish.grid_to_latlon(g)
+    src = _src([_heard_row(reporter="K0X")], [_rx("K0X", lat=true_lat, lon=true_lon)])
+    _, heard = publish.build_groups_heard(src, BUILT)
+    want = great_circle_m(clat, clon, 29.0, -95.0) / 1000.0
+    true = great_circle_m(true_lat, true_lon, 29.0, -95.0) / 1000.0
+    assert heard[0]["distance_km"] == pytest.approx(want)
+    assert abs(want - true) > 0.5
+
+
+def test_heard_merges_rows_of_one_named_tx():
+    lat, lon = publish.grid_to_latlon("EM38ww")
+    rows = [_heard_row(reporter="K0X", tx_id="hfrnet:PREY", key="a", n_7d=10, t6_7d=1),
+            _heard_row(reporter="K0X", tx_id="hfrnet:PREY", key="b", n_7d=5, t6_7d=2)]
+    _, heard = publish.build_groups_heard(_src(rows, [_rx("K0X", lat=lat, lon=lon)]), BUILT)
+    assert len(heard) == 1 and heard[0]["n_7d"] == 15 and heard[0]["t6_7d"] == 3
+
+
+def test_agg_queries_exclude_hfdl():
+    assert publish.AGG_QUERIES
+    for name, (cols, sql) in publish.AGG_QUERIES.items():
+        assert sql.startswith("/* agg:%s */" % name)
+        assert "startsWith(group_key, 'hfdl')" in sql and "'hfdl:%'" in sql
+
+
+def test_read_source_runs_agg_queries():
+    src = FakeSource(**{"agg:heard": [_heard_row()]})
+    out = publish.read_source(src)
+    assert out["agg:heard"][0]["n_7d"] == 30
+
+
+def test_publish_creates_new_tables():
+    srv = FakeServer()
+    tables = dict(_tables(), groups=[], heard=[])
+    fails = publish.publish(tables, [H1], "sigmondb_publisher", PASSWORD,
+                            urlopen=Router({H1: srv}), out=lambda s: None)
+    assert fails == [] and "groups" in srv.tables and "heard" in srv.tables

@@ -46,11 +46,13 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-from sigmondb.groundwave import _latest
+from sigmondb.groundwave import _latest, great_circle_m
+from sigmondb.paths import match_group, path_kind
 from sigmondb.receivers import grid_to_latlon
 
 DATABASE = "sigmondb_public"
-TABLES = ("transmitter_offsets", "trust", "receivers", "transmitters", "t3_calibration")
+TABLES = ("transmitter_offsets", "trust", "receivers", "transmitters", "groups", "heard",
+          "t3_calibration")
 NF64 = "Nullable(Float64)"
 SCHEMAS = {
     "transmitter_offsets": [
@@ -69,6 +71,16 @@ SCHEMAS = {
         ("status", "String"), ("lat", NF64), ("lon", NF64), ("pos_sigma_m", NF64),
         ("class", "String"), ("family", "String"), ("centre_mhz", NF64),
         ("rate_khz_s", NF64), ("built_at_utc", "Float64")],
+    "groups": [
+        ("group_id", "String"), ("class", "String"), ("family", "String"),
+        ("name", "String"), ("centre_mhz", "Float64"), ("rate_khz_s", "Float64"),
+        ("coast", "String"), ("both_coasts", "UInt8"), ("members", "Array(String)"),
+        ("built_at_utc", "Float64")],
+    "heard": [
+        ("reporter_id", "String"), ("target_id", "String"), ("target_type", "String"),
+        ("path", "String"), ("distance_km", "Float64"), ("centre_mhz", "Float64"),
+        ("n_24h", "UInt32"), ("t6_24h", "UInt32"), ("n_7d", "UInt32"), ("t6_7d", "UInt32"),
+        ("first_utc", "Float64"), ("last_utc", "Float64"), ("built_at_utc", "Float64")],
     "t3_calibration": [
         ("station", "String"), ("reference", "String"), ("hour_utc", "UInt8"),
         ("n", "UInt32"), ("rms_z", "Float64"), ("floor_fraction", "Float64"),
@@ -85,6 +97,22 @@ SOURCE_COLUMNS = {
     "waveform": ("tx_id", "centre_hz", "rate_hz_per_s", "valid_from"),
 }
 SOURCE_WHERE = {"solution": "WHERE offset_ns IS NOT NULL AND tx_id != ''"}
+
+# Aggregates read_source runs on wd30: name -> (columns, SQL).  HFDL stays out of every one.
+_NOT_HFDL = "NOT startsWith(group_key, 'hfdl') AND tx_id NOT LIKE 'hfdl:%'"
+AGG_QUERIES = {
+    "heard": (
+        ("reporter_id", "tx_id", "group_key", "centre_hz", "rate_hz_per_s",
+         "n_24h", "t6_24h", "n_7d", "t6_7d", "first_t", "last_t"),
+        "/* agg:heard */ SELECT reporter_id, tx_id, group_key, "
+        "any(centre_hz) AS centre_hz, any(rate_hz_per_s) AS rate_hz_per_s, "
+        "countIf(time > now() - INTERVAL 24 HOUR) AS n_24h, "
+        "countIf(time > now() - INTERVAL 24 HOUR AND origin = 't6_anchor') AS t6_24h, "
+        "count() AS n_7d, countIf(origin = 't6_anchor') AS t6_7d, "
+        "min(time) AS first_t, max(time) AS last_t "
+        "FROM sigmondb.arrival WHERE time > now() - INTERVAL 7 DAY AND " + _NOT_HFDL +
+        " GROUP BY reporter_id, tx_id, group_key"),
+}
 
 
 # --- conversions ----------------------------------------------------------------------------
@@ -182,12 +210,17 @@ def class_family(kind, network):
     return CLASS_OF[kind], "unspecified"
 
 
-def build_transmitters(transmitters, built_at, waveforms=()):
+def _latest_waveforms(waveforms):
     latest_wf = {}
     for w in waveforms or ():
         cur = latest_wf.get(w["tx_id"])
         if cur is None or w["valid_from"] > cur["valid_from"]:
             latest_wf[w["tx_id"]] = w
+    return latest_wf
+
+
+def build_transmitters(transmitters, built_at, waveforms=()):
+    latest_wf = _latest_waveforms(waveforms)
     out = []
     for tx_id, t in sorted(_latest(transmitters or [], "tx_id").items()):
         sig = t.get("pos_sigma_m")
@@ -206,8 +239,107 @@ def build_transmitters(transmitters, built_at, waveforms=()):
     return out
 
 
+COAST_NAME = {"E": "east coast", "W": "west coast"}
+
+
+def build_index(source):
+    """What resolve_target needs: station grid6 centres by reporter, codar transmitters joined
+    to their latest waveform, and every transmitter by id."""
+    stations = {}
+    for rid, r in _latest(source.get("receiver") or [], "reporter_id").items():
+        if r.get("lat") is None or r.get("lon") is None:
+            continue
+        stations[rid] = grid_to_latlon(latlon_to_grid6(r["lat"], r["lon"]))
+    txs = _latest(source.get("transmitter") or [], "tx_id")
+    wfs = _latest_waveforms(source.get("waveform"))
+    codar = []
+    for tx_id, t in sorted(txs.items()):
+        w = wfs.get(tx_id)
+        if t.get("kind") != "codar" or w is None or t.get("lat") is None or t.get("lon") is None:
+            continue
+        codar.append({"tx_id": tx_id, "network": t.get("network") or "",
+                      "lat": t["lat"], "lon": t["lon"],
+                      "centre_hz": float(w["centre_hz"]),
+                      "rate_hz_per_s": float(w["rate_hz_per_s"])})
+    return {"stations": stations, "codar": codar, "txs": txs}
+
+
+def resolve_target(row, index):
+    """Where one aggregate row points, or None to skip it.  A named tx_id targets that tx;
+    an empty one goes through match_group and targets a group, never a site.  The station
+    position is its grid6 centre.  Extra key "group" holds the match_group result (or None)."""
+    station = index["stations"].get(row.get("reporter_id"))
+    if station is None:
+        return None
+    centre = row.get("centre_hz")
+    if row.get("tx_id"):
+        t = index["txs"].get(row["tx_id"])
+        if t is None or t.get("lat") is None or t.get("lon") is None:
+            return None
+        pos = (t["lat"], t["lon"])
+        return {"target_id": row["tx_id"], "target_type": "tx",
+                "distance_km": great_circle_m(station[0], station[1], *pos) / 1000.0,
+                "centre_hz": centre, "station": station, "member_positions": [pos],
+                "group": None}
+    rate = row.get("rate_hz_per_s")
+    if centre is None or rate is None:
+        return None
+    m = match_group(row.get("group_key") or "", centre, rate, station, index["codar"])
+    if m is None:
+        return None
+    by_id = {s["tx_id"]: s for s in index["codar"]}
+    return {"target_id": m["group_id"], "target_type": "group",
+            "distance_km": m["nearest_km"], "centre_hz": centre, "station": station,
+            "member_positions": [(by_id[i]["lat"], by_id[i]["lon"]) for i in m["members"]],
+            "group": m}
+
+
+def build_groups_heard(source, built_at, out=print):
+    """(groups rows, heard rows) from the heard aggregate."""
+    index = build_index(source)
+    by_id = {s["tx_id"]: s for s in index["codar"]}
+    groups, heard, skipped = {}, {}, 0
+    for row in source.get("agg:heard") or []:
+        tgt = resolve_target(row, index)
+        if tgt is None:
+            skipped += 1
+            continue
+        m = tgt["group"]
+        if m is not None and tgt["target_id"] not in groups:
+            rate = float(row["rate_hz_per_s"])
+            cls, family = class_family("codar", by_id[m["members"][0]]["network"])
+            groups[tgt["target_id"]] = {
+                "group_id": tgt["target_id"], "class": cls, "family": family,
+                "name": "%.4f MHz, %+.2f kHz/s (%s)" % (
+                    row["centre_hz"] / 1e6, rate / 1e3, COAST_NAME[m["coast"]]),
+                "centre_mhz": row["centre_hz"] / 1e6, "rate_khz_s": rate / 1e3,
+                "coast": m["coast"], "both_coasts": 1 if m["both_coasts"] else 0,
+                "members": list(m["members"]), "built_at_utc": built_at}
+        first, last = _unix(row["first_t"]), _unix(row["last_t"])
+        key = (row["reporter_id"], tgt["target_id"])
+        h = heard.get(key)
+        if h is None:
+            heard[key] = {
+                "reporter_id": key[0], "target_id": key[1],
+                "target_type": tgt["target_type"],
+                "path": path_kind(tgt["distance_km"], tgt["centre_hz"]),
+                "distance_km": tgt["distance_km"], "centre_mhz": tgt["centre_hz"] / 1e6,
+                "n_24h": int(row["n_24h"]), "t6_24h": int(row["t6_24h"]),
+                "n_7d": int(row["n_7d"]), "t6_7d": int(row["t6_7d"]),
+                "first_utc": first, "last_utc": last, "built_at_utc": built_at}
+        else:   # one tx heard under several group_keys
+            for c in ("n_24h", "t6_24h", "n_7d", "t6_7d"):
+                h[c] += int(row[c])
+            h["first_utc"], h["last_utc"] = min(h["first_utc"], first), max(h["last_utc"], last)
+    if skipped:
+        out("groups/heard: skipped %d path(s) with no station position, no candidate "
+            "or no transmitter position" % skipped)
+    return ([groups[k] for k in sorted(groups)], [heard[k] for k in sorted(heard)])
+
+
 def build_all(source, built_at):
     """{table: rows} for every table in TABLES order."""
+    groups, heard = build_groups_heard(source, built_at)
     return {
         "transmitter_offsets": build_transmitter_offsets(
             source["solution"], source["transmitter"], built_at),
@@ -215,6 +347,8 @@ def build_all(source, built_at):
         "receivers": build_receivers(source["receiver"], built_at),
         "transmitters": build_transmitters(
             source["transmitter"], built_at, source.get("waveform", ())),
+        "groups": groups,
+        "heard": heard,
         "t3_calibration": [],
     }
 
@@ -222,14 +356,19 @@ def build_all(source, built_at):
 def read_source(client):
     """{solution, transmitter, receiver} rows from wd30's sigmondb, every table FINAL."""
     out = {}
+
+    def run(sql):
+        try:
+            return client.query(sql, query_tz="UTC")
+        except TypeError:   # clickhouse-connect without query_tz; _unix() treats naive as UTC
+            return client.query(sql)
+
     for table, cols in SOURCE_COLUMNS.items():
         sql = "SELECT %s FROM sigmondb.%s FINAL %s" % (
             ", ".join(cols), table, SOURCE_WHERE.get(table, ""))
-        try:
-            res = client.query(sql, query_tz="UTC")
-        except TypeError:   # clickhouse-connect without query_tz; _unix() treats naive as UTC
-            res = client.query(sql)
-        out[table] = [dict(zip(cols, r)) for r in res.result_rows]
+        out[table] = [dict(zip(cols, r)) for r in run(sql).result_rows]
+    for name, (cols, sql) in AGG_QUERIES.items():
+        out["agg:" + name] = [dict(zip(cols, r)) for r in run(sql).result_rows]
     return out
 
 
