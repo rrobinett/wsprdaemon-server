@@ -67,7 +67,8 @@ SCHEMAS = {
     "transmitters": [
         ("tx_id", "String"), ("kind", "String"), ("network", "String"), ("name", "String"),
         ("status", "String"), ("lat", NF64), ("lon", NF64), ("pos_sigma_m", NF64),
-        ("built_at_utc", "Float64")],
+        ("class", "String"), ("family", "String"), ("centre_mhz", NF64),
+        ("rate_khz_s", NF64), ("built_at_utc", "Float64")],
     "t3_calibration": [
         ("station", "String"), ("reference", "String"), ("hour_utc", "UInt8"),
         ("n", "UInt32"), ("rms_z", "Float64"), ("floor_fraction", "Float64"),
@@ -81,6 +82,7 @@ SOURCE_COLUMNS = {
     "transmitter": ("tx_id", "kind", "network", "name", "status", "lat", "lon",
                     "pos_sigma_m", "valid_from", "version"),
     "receiver": ("reporter_id", "lat", "lon", "a_level", "valid_from", "version"),
+    "waveform": ("tx_id", "centre_hz", "rate_hz_per_s", "valid_from"),
 }
 SOURCE_WHERE = {"solution": "WHERE offset_ns IS NOT NULL AND tx_id != ''"}
 
@@ -165,15 +167,42 @@ def build_receivers(receivers, built_at):
     return out
 
 
-def build_transmitters(transmitters, built_at):
+CLASS_OF = {"codar": "ocean radar", "oth": "over-the-horizon radar",
+            "ionosonde": "chirp ionosonde", "unknown": "unknown",
+            "hfdl": "HFDL ground station"}
+
+
+def class_family(kind, network):
+    """(class, family) for a transmitter kind.  Every codar row in sigmondb comes from a
+    SeaSonde line, so that family is named; other kinds stay unspecified."""
+    if kind not in CLASS_OF:
+        return "unknown", "unspecified"
+    if kind == "codar":
+        return CLASS_OF[kind], "CODAR SeaSonde"
+    return CLASS_OF[kind], "unspecified"
+
+
+def build_transmitters(transmitters, built_at, waveforms=()):
+    latest_wf = {}
+    for w in waveforms or ():
+        cur = latest_wf.get(w["tx_id"])
+        if cur is None or w["valid_from"] > cur["valid_from"]:
+            latest_wf[w["tx_id"]] = w
     out = []
     for tx_id, t in sorted(_latest(transmitters or [], "tx_id").items()):
         sig = t.get("pos_sigma_m")
-        out.append(dict(tx_id=tx_id, kind=t.get("kind") or "", network=t.get("network") or "",
-                        name=t.get("name") or "", status=t.get("status") or "",
-                        lat=t.get("lat"), lon=t.get("lon"),
-                        pos_sigma_m=None if sig is None else float(sig),
-                        built_at_utc=built_at))
+        kind = t.get("kind") or ""
+        cls, family = class_family(kind, t.get("network") or "")
+        wf = latest_wf.get(tx_id) or {}
+        centre, rate = wf.get("centre_hz"), wf.get("rate_hz_per_s")
+        out.append({"tx_id": tx_id, "kind": kind, "network": t.get("network") or "",
+                    "name": t.get("name") or "", "status": t.get("status") or "",
+                    "lat": t.get("lat"), "lon": t.get("lon"),
+                    "pos_sigma_m": None if sig is None else float(sig),
+                    "class": cls, "family": family,
+                    "centre_mhz": None if centre is None else float(centre) / 1e6,
+                    "rate_khz_s": None if rate is None else float(rate) / 1e3,
+                    "built_at_utc": built_at})
     return out
 
 
@@ -184,7 +213,8 @@ def build_all(source, built_at):
             source["solution"], source["transmitter"], built_at),
         "trust": build_trust(source["receiver"], built_at),
         "receivers": build_receivers(source["receiver"], built_at),
-        "transmitters": build_transmitters(source["transmitter"], built_at),
+        "transmitters": build_transmitters(
+            source["transmitter"], built_at, source.get("waveform", ())),
         "t3_calibration": [],
     }
 

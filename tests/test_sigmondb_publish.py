@@ -280,6 +280,40 @@ def test_transmitters_latest_version_full_precision():
     assert set(got["hfrnet:A"]) == {c for c, _ in publish.SCHEMAS["transmitters"]}
 
 
+def _wf(tx_id, valid_from, centre_hz, rate):
+    return dict(tx_id=tx_id, valid_from=valid_from, centre_hz=centre_hz, rate_hz_per_s=rate)
+
+
+def test_class_family_codar():
+    assert publish.class_family("codar", "BML") == ("ocean radar", "CODAR SeaSonde")
+
+
+def test_class_family_unknown_kind():
+    assert publish.class_family("zzz", "") == ("unknown", "unspecified")
+
+
+def test_class_family_other_kinds():
+    assert publish.class_family("oth", "") == ("over-the-horizon radar", "unspecified")
+
+
+def test_transmitters_carry_waveform():
+    rows = publish.build_transmitters(
+        [_tx("hfrnet:A"), _tx("hfrnet:B")], BUILT,
+        waveforms=[_wf("hfrnet:A", _utc(2026, 11, 1), 12_000_000.0, -50_000.0),
+                   _wf("hfrnet:A", _utc(2026, 11, 5), 13_500_000.0, -102940.0)])
+    got = {r["tx_id"]: r for r in rows}
+    assert got["hfrnet:A"]["centre_mhz"] == pytest.approx(13.5, abs=0.005)
+    assert got["hfrnet:A"]["rate_khz_s"] == pytest.approx(-102.94, abs=0.005)
+    assert got["hfrnet:A"]["class"] == "ocean radar"
+    assert got["hfrnet:A"]["family"] == "CODAR SeaSonde"
+    assert got["hfrnet:B"]["centre_mhz"] is None and got["hfrnet:B"]["rate_khz_s"] is None
+
+
+def test_transmitters_schema_columns():
+    cols = [c for c, _ in publish.SCHEMAS["transmitters"]]
+    assert cols[-5:] == ["class", "family", "centre_mhz", "rate_khz_s", "built_at_utc"]
+
+
 # --- build_all and the source read -----------------------------------------------------------
 
 def test_build_all_reads_final_and_t3_calibration_is_empty():
