@@ -41,18 +41,19 @@ every message this module prints or returns.
 """
 import base64
 import json
+import math
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
 from sigmondb.groundwave import _latest, great_circle_m
-from sigmondb.paths import match_group, path_kind
+from sigmondb.paths import gc_midpoint, match_group, path_kind
 from sigmondb.receivers import grid_to_latlon
 
 DATABASE = "sigmondb_public"
 TABLES = ("transmitter_offsets", "trust", "receivers", "transmitters", "groups", "heard",
-          "t3_calibration")
+          "t3_calibration", "ionosphere_hourly")
 NF64 = "Nullable(Float64)"
 SCHEMAS = {
     "transmitter_offsets": [
@@ -85,6 +86,13 @@ SCHEMAS = {
         ("station", "String"), ("reference", "String"), ("hour_utc", "UInt8"),
         ("n", "UInt32"), ("rms_z", "Float64"), ("floor_fraction", "Float64"),
         ("honest", "UInt8"), ("built_at_utc", "Float64")],
+    "ionosphere_hourly": [
+        ("reporter_id", "String"), ("target_id", "String"), ("target_type", "String"),
+        ("hour_utc", "Float64"), ("n", "UInt32"),
+        ("midpoints", "Array(Tuple(Float64, Float64))"),
+        ("doppler_med", NF64), ("doppler_iqr", NF64), ("s4_med", NF64), ("s4_iqr", NF64),
+        ("sphi_med", NF64), ("sphi_iqr", NF64), ("level_med", NF64), ("level_iqr", NF64),
+        ("built_at_utc", "Float64")],
 }
 
 # What read_source() takes from wd30's sigmondb, each table read FINAL.
@@ -112,6 +120,18 @@ AGG_QUERIES = {
         "min(time) AS first_t, max(time) AS last_t "
         "FROM sigmondb.arrival WHERE time > now() - INTERVAL 7 DAY AND " + _NOT_HFDL +
         " GROUP BY reporter_id, tx_id, group_key"),
+    "ionosphere": (
+        ("reporter_id", "tx_id", "group_key", "centre_hz", "rate_hz_per_s", "hour", "n",
+         "dq", "sq", "pq", "lq"),
+        "/* agg:ionosphere */ SELECT reporter_id, tx_id, group_key, "
+        "any(centre_hz) AS centre_hz, any(rate_hz_per_s) AS rate_hz_per_s, "
+        "toStartOfHour(time) AS hour, count() AS n, "
+        "quantilesIf(0.25, 0.5, 0.75)(doppler_hz, isNotNull(doppler_hz)) AS dq, "
+        "quantilesIf(0.25, 0.5, 0.75)(s4, isNotNull(s4)) AS sq, "
+        "quantilesIf(0.25, 0.5, 0.75)(sigma_phi_rad, isNotNull(sigma_phi_rad)) AS pq, "
+        "quantilesIf(0.25, 0.5, 0.75)(level_db, isNotNull(level_db)) AS lq "
+        "FROM sigmondb.arrival WHERE time > now() - INTERVAL 24 HOUR AND " + _NOT_HFDL +
+        " GROUP BY reporter_id, tx_id, group_key, hour"),
 }
 
 
@@ -337,6 +357,42 @@ def build_groups_heard(source, built_at, out=print):
     return ([groups[k] for k in sorted(groups)], [heard[k] for k in sorted(heard)])
 
 
+def _med_iqr(q):
+    """(median, q75 - q25) from a quantiles array; None, None when it is empty or NaN."""
+    if not q or len(q) < 3 or any(v is None or math.isnan(v) for v in q[:3]):
+        return None, None
+    return float(q[1]), float(q[2]) - float(q[0])
+
+
+def build_ionosphere(source, built_at, out=print):
+    """ionosphere_hourly rows: skywave paths only, one midpoint per member."""
+    index = build_index(source)
+    rows, skipped = {}, 0
+    for row in source.get("agg:ionosphere") or []:
+        tgt = resolve_target(row, index)
+        if tgt is None:
+            skipped += 1
+            continue
+        if path_kind(tgt["distance_km"], tgt["centre_hz"]) != "skywave":
+            continue
+        st = tgt["station"]
+        r = {"reporter_id": row["reporter_id"], "target_id": tgt["target_id"],
+             "target_type": tgt["target_type"], "hour_utc": _unix(row["hour"]),
+             "n": int(row["n"]),
+             "midpoints": [list(gc_midpoint(st[0], st[1], lat, lon))
+                           for lat, lon in tgt["member_positions"]]}
+        for pre, col in (("doppler", "dq"), ("s4", "sq"), ("sphi", "pq"), ("level", "lq")):
+            r[pre + "_med"], r[pre + "_iqr"] = _med_iqr(row.get(col))
+        r["built_at_utc"] = built_at
+        key = (r["reporter_id"], r["target_id"], r["hour_utc"])
+        if key not in rows or r["n"] > rows[key]["n"]:   # one tx under several group_keys
+            rows[key] = r
+    if skipped:
+        out("ionosphere: skipped %d path(s) with no station position, no candidate "
+            "or no transmitter position" % skipped)
+    return [rows[k] for k in sorted(rows)]
+
+
 def build_all(source, built_at):
     """{table: rows} for every table in TABLES order."""
     groups, heard = build_groups_heard(source, built_at)
@@ -350,6 +406,7 @@ def build_all(source, built_at):
         "groups": groups,
         "heard": heard,
         "t3_calibration": [],
+        "ionosphere_hourly": build_ionosphere(source, built_at),
     }
 
 

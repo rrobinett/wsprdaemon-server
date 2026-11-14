@@ -319,6 +319,73 @@ def test_transmitters_schema_columns():
     assert cols[-5:] == ["class", "family", "centre_mhz", "rate_khz_s", "built_at_utc"]
 
 
+# --- ionosphere_hourly -----------------------------------------------------------------------
+
+NAN = float("nan")
+
+
+def _ion_row(reporter="K0X", tx_id="", key="4.4505 -25.73", centre=4_450_500.0,
+             rate=-25_730.0, dq=(-1.0, 0.5, 2.0), sq=(0.1, 0.2, 0.4), pq=(NAN,) * 3,
+             lq=(-80.0, -70.0, -60.0), n=7, hour=None):
+    return dict(reporter_id=reporter, tx_id=tx_id, group_key=key, centre_hz=centre,
+                rate_hz_per_s=rate, hour=hour or _utc(2026, 11, 14, 5), n=n,
+                dq=list(dq), sq=list(sq), pq=list(pq), lq=list(lq))
+
+
+def _ion_src(rows, **kw):
+    lat, lon = publish.grid_to_latlon("EM38ww")
+    return _src([], [_rx("K0X", lat=lat, lon=lon)], **{"agg:ionosphere": rows}, **kw)
+
+
+def test_ionosphere_skywave_only():
+    lat, lon = publish.grid_to_latlon("EL29ho")
+    src = _src([], [_rx("K0X", lat=lat, lon=lon)],
+               transmitter=[_tx("hfrnet:PREY", lat=lat + 0.36, lon=lon)],
+               **{"agg:ionosphere": [_ion_row(tx_id="hfrnet:PREY", centre=13_500_000.0)]})
+    assert publish.build_ionosphere(src, BUILT) == []
+
+
+def test_ionosphere_group_midpoints():
+    from sigmondb.paths import gc_midpoint
+    src = _ion_src([_ion_row()],
+                   transmitter=[_tx("hfrnet:PREY", lat=29.0, lon=-95.0),
+                                _tx("hfrnet:P2", lat=30.0, lon=-94.0),
+                                _tx("hfrnet:P3", lat=31.0, lon=-93.0)],
+                   waveform=[_wf(t, _utc(2026, 11, 1), 4_450_500.0, -25_730.0)
+                             for t in ("hfrnet:PREY", "hfrnet:P2", "hfrnet:P3")])
+    rows = publish.build_ionosphere(src, BUILT)
+    assert len(rows) == 1
+    r = rows[0]
+    st = publish.grid_to_latlon("EM38ww")
+    assert len(r["midpoints"]) == 3
+    for mp, pos in zip(r["midpoints"], [(29.0, -95.0), (30.0, -94.0), (31.0, -93.0)]):
+        assert isinstance(mp, list) and len(mp) == 2
+        assert mp == pytest.approx(list(gc_midpoint(st[0], st[1], *pos)))
+    assert r["target_type"] == "group" and r["n"] == 7 and r["built_at_utc"] == BUILT
+    assert r["hour_utc"] == _utc(2026, 11, 14, 5).timestamp()
+
+
+def test_ionosphere_medians():
+    r = publish.build_ionosphere(_ion_src([_ion_row()]), BUILT)[0]
+    assert r["doppler_med"] == 0.5 and r["doppler_iqr"] == 3.0
+    assert r["s4_med"] == 0.2 and r["s4_iqr"] == pytest.approx(0.3)
+    assert r["level_med"] == -70.0 and r["level_iqr"] == 20.0
+
+
+def test_ionosphere_nulls_stay_null():
+    r = publish.build_ionosphere(_ion_src([_ion_row(sq=[], pq=(NAN, NAN, NAN))]), BUILT)[0]
+    assert r["s4_med"] is None and r["s4_iqr"] is None
+    assert r["sphi_med"] is None and r["sphi_iqr"] is None
+    assert r["doppler_med"] == 0.5
+
+
+def test_ionosphere_schema_and_table_order():
+    assert publish.TABLES[-1] == "ionosphere_hourly"
+    assert ("midpoints", "Array(Tuple(Float64, Float64))") in publish.SCHEMAS["ionosphere_hourly"]
+    assert "agg:ionosphere" in publish.AGG_QUERIES["ionosphere"][1] or \
+        publish.AGG_QUERIES["ionosphere"][1].startswith("/* agg:ionosphere */")
+
+
 # --- build_all and the source read -----------------------------------------------------------
 
 def test_build_all_reads_final_and_t3_calibration_is_empty():
@@ -327,7 +394,7 @@ def test_build_all_reads_final_and_t3_calibration_is_empty():
     tables = publish.build_all(publish.read_source(src), BUILT)
     assert list(tables) == list(publish.TABLES)
     assert tables["t3_calibration"] == []
-    assert [len(tables[t]) for t in publish.TABLES] == [1, 1, 1, 1, 0, 0, 0]
+    assert [len(tables[t]) for t in publish.TABLES] == [1, 1, 1, 1, 0, 0, 0, 0]
     assert all(" FINAL" in s for s in src.sql if not s.startswith("/* agg:"))
     for t in publish.TABLES:
         for r in tables[t]:
