@@ -14,6 +14,7 @@ from pathlib import Path
 from sigmondb import ddl
 from sigmondb.groundwave import fixed_clusters, ground_wave_solutions
 from sigmondb.load import insert_file, insert_rows
+from sigmondb.receivers import DEFAULT_POSITIONS
 from sigmondb.rows import read_rows, write_rows
 
 DEFAULT_CONF = "/etc/wsprdaemon/clickhouse.conf"
@@ -255,7 +256,31 @@ def _hours(days):
     return int(round(float(days) * 24))
 
 
-def _from_db(a, client=None):
+def _load_positions(a):
+    """The private precise positions for attribute and solve, or None when the file is absent.
+    A group- or other-readable file raises ValueError, so the run stops before the database.
+    Prints a count, never a value."""
+    import os
+    from sigmondb.receivers import load_positions
+    path = os.path.expanduser(a.positions)
+    if not os.path.exists(path):
+        print("positions: no private file; using sigmondb.receiver as stored")
+        return None
+    return load_positions(path)
+
+
+def _overlay_rows(rows, positions):
+    """rows with the private positions laid over them, in memory only."""
+    if positions is None:
+        return rows
+    from sigmondb.receivers import overlay_positions
+    out = overlay_positions(rows, positions)
+    n = len({r["reporter_id"] for r in rows if r.get("reporter_id") in positions})
+    print("positions: %d receiver(s) at full precision from the private file" % n)
+    return out
+
+
+def _from_db(a, client=None, positions=None):
     """(arrivals, transmitters, receivers) from the registry, every table read FINAL so a
     re-ingested row counts once.  Arrivals: anchored only, within --days; by default the
     latest detector_version per (reporter_id, group_key, time), judged after each arrival
@@ -273,7 +298,7 @@ def _from_db(a, client=None):
                     dict(params, dv=a.detector_version))
     else:
         arr = fetch("arrival", where, params)
-    rx = fetch("receiver")
+    rx = _overlay_rows(fetch("receiver"), positions)
     arr, dropped = _carried(arr, _latest(rx, "reporter_id"),
                             latest_detector=not a.detector_version)
     if dropped:
@@ -287,7 +312,7 @@ _ATTR_WHERE = ("WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000 AND clean_ta
                "AND rate_hz_per_s != 0 AND time > now() - INTERVAL {hours:UInt32} HOUR")
 
 
-def _attribution_inputs(client, days):
+def _attribution_inputs(client, days, positions=None):
     """(arrivals, sites, rxpos, coherence) for attribution.run_attribution.
 
     arrivals: T6-anchored, CLEAN 'A', chirped, within `days`; the latest detector per capture;
@@ -327,7 +352,8 @@ def _attribution_inputs(client, days):
             sites.append({"id": t["tx_id"], "lat": t["lat"], "lon": t["lon"],
                           "freq": w["centre_hz"], "rate": w["rate_hz_per_s"],
                           "period": w["period_s"]})
-    rx = _latest(_fetch(client, "receiver", ddl.COLUMNS["receiver"]), "reporter_id")
+    rx = _overlay_rows(_fetch(client, "receiver", ddl.COLUMNS["receiver"]), positions)
+    rx = _latest(rx, "reporter_id")
     placed = [r for r in rx if r.get("lat") is not None and r.get("lon") is not None]
     rxpos = {r["reporter_id"]: (r["lat"], r["lon"], r.get("pos_source") or "") for r in placed}
     coherence = {r["reporter_id"]: r.get("coherence_group") or "" for r in placed}
@@ -358,10 +384,11 @@ def cmd_attribute(a):
     (or to --out as JSON Lines, leaving the database alone).  Exits 0 when nothing gets named;
     a database error propagates, so systemd records a failure."""
     from sigmondb import attribution as at
+    positions = _load_positions(a)
     client = connect(a.conf)
     if not a.out:                       # --out leaves the database alone; so does reading
         ddl.ensure_schema(client)
-    arr, sites, rxpos, coherence = _attribution_inputs(client, a.days)
+    arr, sites, rxpos, coherence = _attribution_inputs(client, a.days, positions)
     if not arr:
         print("attribute: no arrivals in the last %g days; nothing written" % a.days)
         if a.out:
@@ -439,15 +466,16 @@ def cmd_solve(a):
     a cluster left unnamed gets no offset."""
     from sigmondb.attribution import apply_attribution
     client = None
+    positions = _load_positions(a) if (a.from_db or a.receivers) else None
     if a.from_db:
         client = connect(a.conf)
         ddl.ensure_schema(client)
-        arr, tx, rx = _from_db(a, client)
+        arr, tx, rx = _from_db(a, client, positions)
         attrs = [] if a.no_attribution else _latest_attributions(client)
     else:
         arr = read_rows(a.arrivals)
         tx = read_rows(a.transmitters) if a.transmitters else []
-        rx = _read_receivers(a.receivers) if a.receivers else []
+        rx = _overlay_rows(_read_receivers(a.receivers), positions) if a.receivers else []
         attrs = read_rows(a.attributions) if a.attributions else []
     aside = {}
     clusters = fixed_clusters(arr, rx, max_sd_ns=a.max_sd_us * 1000.0, set_aside=aside)
@@ -522,6 +550,9 @@ def build_parser():
     s.add_argument("--n-fake", type=int, default=400,
                    help="fake sites per group for the null test (default 400)")
     s.add_argument("--out", help="write JSON Lines here and leave the database alone")
+    s.add_argument("--positions", default=DEFAULT_POSITIONS,
+                   help="private GPSDO positions (JSON, mode 600), laid over the receiver rows "
+                        "in memory only (default %(default)s)")
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_attribute)
     s = sub.add_parser("receiver-positions",
@@ -555,6 +586,9 @@ def build_parser():
                    help="with --from-db: attach no names from sigmondb.attribution")
     s.add_argument("--attributions",
                    help="with --arrivals: attribution rows (JSON Lines) to name clusters from")
+    s.add_argument("--positions", default=DEFAULT_POSITIONS,
+                   help="private GPSDO positions (JSON, mode 600), laid over the receiver rows "
+                        "in memory only (default %(default)s)")
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_solve)
     s = sub.add_parser("publish",

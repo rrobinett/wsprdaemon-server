@@ -117,6 +117,24 @@ def load_positions(path):
     return out
 
 
+DEFAULT_POSITIONS = "~/.config/sigmondb-receiver-positions.json"
+
+
+def overlay_positions(rows, positions):
+    """Copies of `rows`; each row whose reporter_id is in `positions` takes that entry's lat,
+    lon and pos_sigma_m, unrounded, and pos_source gpsdo.  The input stays untouched.  The
+    caller keeps the result in memory: precise values never go to the database or a file."""
+    out = []
+    for r in rows:
+        r = dict(r)
+        p = positions.get(r.get("reporter_id"))
+        if p is not None:
+            r.update(lat=p["lat"], lon=p["lon"], pos_sigma_m=p["pos_sigma_m"],
+                     pos_source="gpsdo")
+        out.append(r)
+    return out
+
+
 def position_rows(latest_rows, positions, now):
     """(new receiver rows, unknown reporter ids).  Each reporter in `positions` that has a row
     gets a copy of its latest row at the new position, rounded to POS_DECIMALS, with
