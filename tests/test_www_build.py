@@ -59,3 +59,21 @@ def test_build_has_both_views(built):
     assert 'aria-pressed="true"' in timing
     iono = re.search(r'<[^>]*data-view="ionosphere"[^>]*>', html).group(0)
     assert 'aria-pressed="false"' in iono
+
+
+def test_build_standalone_url_defaults_empty(built):
+    html, _ = built
+    assert 'const STANDALONE_URL = "";' in html
+
+
+def test_build_embeds_standalone_url(tmp_path):
+    out = tmp_path / "t.html"
+    url = "https://example.org/sigmond/map.html"
+    subprocess.run([sys.executable, BUILD, "--standalone-url", url, str(out)], check=True, capture_output=True)
+    assert f'const STANDALONE_URL = "{url}";' in out.read_text()
+
+
+def test_build_refuses_unsafe_standalone_url(tmp_path):
+    run = subprocess.run([sys.executable, BUILD, "--standalone-url", "https://x/</script>", str(tmp_path / "t.html")],
+                         capture_output=True, text=True)
+    assert run.returncode != 0

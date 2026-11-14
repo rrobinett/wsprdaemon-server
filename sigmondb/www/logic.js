@@ -134,6 +134,17 @@ function coerceRows(rows, meta) {
   return rows;
 }
 
+// Tables the hourly publisher adds after the first five.  Until it creates them, a public host
+// answers "no such table" (ClickHouse code 60); such a table loads empty and is named in
+// `missing`.  A core table answering the same is an error.
+const OPTIONAL_TABLES = ["heard", "groups", "ionosphere_hourly"];
+const MISSING = {};
+
+function exceptionCode(resp) {
+  const h = resp && resp.headers;
+  return h && typeof h.get === "function" ? h.get("X-ClickHouse-Exception-Code") : null;
+}
+
 function fetchOnce(fetchFn, url, timeoutMs) {
   const ctl = new AbortController();
   let timer;
@@ -142,45 +153,57 @@ function fetchOnce(fetchFn, url, timeoutMs) {
   });
   const work = (async () => {
     const resp = await fetchFn(url, {signal: ctl.signal});
-    if (!resp || !resp.ok) throw new Error("error answer");
-    return resp.json();
+    if (resp && resp.ok) return resp.json();
+    if (resp && String(exceptionCode(resp)) === "60") return MISSING;
+    throw new Error("error answer");
   })();
   work.catch(() => {});
   return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
 }
 
-async function fetchTable(fetchFn, table, timeoutMs) {
+// One table, whole, from the first endpoint that has it.  Returns {rows} or {missing: true};
+// missing only when every endpoint that answered said code 60.  Anything else that is not
+// data counts as a failed endpoint, and the next one is tried.
+async function fetchTable(fetchFn, table, timeoutMs = FETCH_TIMEOUT_MS) {
   const q = "SELECT * FROM sigmondb_public." + table + " FORMAT JSON";
-  let last = "no endpoint";
+  let last = "no endpoint", said60 = 0, otherAnswer = false;
   for (const base of ENDPOINTS) {
     try {
       const body = await fetchOnce(fetchFn, base + "?query=" + encodeURIComponent(q), timeoutMs);
-      if (!body || !Array.isArray(body.data)) { last = base + " sent no data"; continue; }
-      return coerceRows(body.data, body.meta);
+      if (body === MISSING) { said60++; last = base + " has no such table"; continue; }
+      if (!body || !Array.isArray(body.data)) { otherAnswer = true; last = base + " sent no data"; continue; }
+      return {rows: coerceRows(body.data, body.meta)};
     } catch (e) {
-      last = base + (e.message === "timeout" ? " timed out" : " unreachable");
+      if (e.message === "error answer") otherAnswer = true;
+      last = base + (e.message === "timeout" ? " timed out" : e.message === "error answer" ? " sent an error" : " unreachable");
     }
   }
+  if (said60 && !otherAnswer) return {missing: true};
   throw new Error(table + ": " + last);
 }
 
 async function loadAll(fetchFn, cache, nowMs, timeoutMs = FETCH_TIMEOUT_MS) {
   if (cache && cache.data && nowMs - cache.asOfMs < CACHE_MAX_AGE_MS) {
-    return {data: cache.data, asOfMs: cache.asOfMs, stale: false, error: null};
+    return {data: cache.data, asOfMs: cache.asOfMs, stale: false, error: null, missing: cache.missing || []};
   }
   try {
-    const rows = await Promise.all(TABLES_READ.map((t) => fetchTable(fetchFn, t, timeoutMs)));
-    const data = {};
-    TABLES_READ.forEach((t, i) => { data[t] = rows[i]; });
-    return {data, asOfMs: nowMs, stale: false, error: null};
+    const got = await Promise.all(TABLES_READ.map((t) => fetchTable(fetchFn, t, timeoutMs)));
+    const data = {}, missing = [];
+    TABLES_READ.forEach((t, i) => {
+      if (!got[i].missing) { data[t] = got[i].rows; return; }
+      if (!OPTIONAL_TABLES.includes(t)) throw new Error(t + ": not published on any endpoint");
+      data[t] = [];
+      missing.push(t);
+    });
+    return {data, asOfMs: nowMs, stale: false, error: null, missing};
   } catch (e) {
-    const error = "No public endpoint answered (" + e.message + ")";
-    if (cache && cache.data) return {data: cache.data, asOfMs: cache.asOfMs, stale: true, error};
-    return {data: null, asOfMs: null, stale: false, error};
+    const error = (/not published/.test(e.message) ? "A required table is missing (" : "No public endpoint answered (") + e.message + ")";
+    if (cache && cache.data) return {data: cache.data, asOfMs: cache.asOfMs, stale: true, error, missing: cache.missing || []};
+    return {data: null, asOfMs: null, stale: false, error, missing: []};
   }
 }
 
 if (typeof module !== "undefined") {
-  module.exports = {FETCH_TIMEOUT_MS, ENDPOINTS, TABLES_READ, parseHash, formatHash, resolve, stageOf, canPin,
+  module.exports = {FETCH_TIMEOUT_MS, ENDPOINTS, TABLES_READ, OPTIONAL_TABLES, fetchTable, parseHash, formatHash, resolve, stageOf, canPin,
     t6Share, visible, hull, loadAll};
 }

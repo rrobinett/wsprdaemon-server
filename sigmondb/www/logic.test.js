@@ -174,3 +174,56 @@ test("loadAll times out a silent endpoint and falls through", async () => {
   assert.deepEqual(r.data.heard, [{x: 1}]);
   assert.equal(signalled, true);
 });
+
+// A ClickHouse "no such table" answer: HTTP 404 carrying X-ClickHouse-Exception-Code: 60.
+const chResp = (code) => Promise.resolve({ok: false, status: 404,
+  headers: {get: (n) => (code && n.toLowerCase() === "x-clickhouse-exception-code" ? code : null)}});
+const tableOf = (url) => /sigmondb_public\.(\w+)/.exec(decodeURIComponent(url))[1];
+
+test("optional table missing on every endpoint loads empty and is named", async () => {
+  assert.deepEqual(L.OPTIONAL_TABLES, ["heard", "groups", "ionosphere_hourly"]);
+  const f = (url) => tableOf(url) === "heard" ? chResp("60") : okResp([{x: 1}]);
+  const r = await L.loadAll(f, null, 0);
+  assert.equal(r.error, null);
+  assert.deepEqual(r.data.heard, []);
+  assert.deepEqual(r.data.groups, [{x: 1}]);
+  assert.deepEqual(r.missing, ["heard"]);
+  const again = await L.loadAll(() => chResp(null), {data: r.data, asOfMs: 0, missing: r.missing}, 10);
+  assert.deepEqual(again.missing, ["heard"]);
+});
+
+test("code 60 on db2 but data on wd1 gives wd1's data", async () => {
+  const f = (url) => url.startsWith("https://db2.wspr.live/") ? chResp("60") : okResp([{x: 2}]);
+  const r = await L.loadAll(f, null, 0);
+  assert.equal(r.error, null);
+  assert.deepEqual(r.data.heard, [{x: 2}]);
+  assert.deepEqual(r.missing, []);
+});
+
+test("a table is missing only if every endpoint that answered said 60", async () => {
+  // db2 never answers (down); wd1 and wd2 both say 60: missing.
+  const f = (url) => tableOf(url) !== "groups" ? okResp([{x: 1}])
+    : url.startsWith("https://db2.wspr.live/") ? Promise.reject(new Error("down")) : chResp("60");
+  const r = await L.loadAll(f, null, 0);
+  assert.equal(r.error, null);
+  assert.deepEqual(r.missing, ["groups"]);
+  // db2 sends another 404 (no code 60): a failed endpoint, so groups is not missing and the load fails.
+  const g = (url) => tableOf(url) !== "groups" ? okResp([{x: 1}])
+    : url.startsWith("https://db2.wspr.live/") ? chResp(null) : chResp("60");
+  const r2 = await L.loadAll(g, null, 0);
+  assert.equal(r2.data, null);
+  assert.match(r2.error, /groups/);
+  // Every endpoint sends a plain 404: failed endpoints, not a missing table.
+  const h = (url) => tableOf(url) === "heard" ? chResp(null) : okResp([{x: 1}]);
+  const r3 = await L.loadAll(h, null, 0);
+  assert.equal(r3.data, null);
+  assert.match(r3.error, /heard/);
+});
+
+test("a missing core table is an error that names it", async () => {
+  const f = (url) => tableOf(url) === "transmitters" ? chResp("60") : okResp([{x: 1}]);
+  const r = await L.loadAll(f, null, 0);
+  assert.equal(r.data, null);
+  assert.match(r.error, /transmitters/);
+  assert.match(r.error, /not published/);
+});

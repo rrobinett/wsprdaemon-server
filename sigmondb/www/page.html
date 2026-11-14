@@ -74,6 +74,11 @@ fieldset.classes legend { float: left; font: 500 11px/1.3 var(--f-body); text-tr
 .side table { font-size: 12.5px; }
 .side .clear { justify-self: start; }
 .hint { font-size: 12px; color: var(--ink-3); }
+.viewlink { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; font-size: 13px; color: var(--ink-2); }
+.viewlink[hidden] { display: none; }
+.viewlink input { flex: 1 1 260px; min-width: 0; font: 12.5px/1.4 var(--f-mono); color: var(--ink); background: var(--bg);
+  border: 1px solid var(--rule); border-radius: 4px; padding: 5px 7px; }
+.viewlink input:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
 #tip { position: absolute; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--rule);
   border-radius: 4px; padding: 7px 9px; font-size: 12.5px; line-height: 1.4; max-width: 280px; box-shadow: 0 2px 10px rgb(0 0 0 / 0.12); }
 #tip b { font-weight: 600; } #tip .m { font-family: var(--f-mono); font-size: 11.5px; color: var(--ink-2); }
@@ -121,7 +126,8 @@ details summary:focus-visible { outline: 2px solid var(--focus); outline-offset:
       <div class="mapbox" id="mapbox"><svg id="map" role="img" aria-label="Map of transmitters, fleet stations and the paths between them"></svg><div class="notice" id="notice" hidden></div><div id="tip" hidden></div></div>
       <aside class="side" id="side" aria-live="polite"></aside>
     </div>
-    <div class="hint">Drag to pan, scroll or pinch to zoom.  Click a transmitter, group or station to narrow the map to it; click empty map or press Escape to restore the full view.  The address then links to what you see.  Alaska and Hawaii appear as insets; transmitters outside this projection, such as Puerto Rico's, appear only in the transmitter table.</div>
+    <div class="viewlink" id="viewlink" hidden><label for="viewlink-url">Link to this view</label><input id="viewlink-url" type="text" readonly spellcheck="false"></div>
+    <div class="hint">Drag to pan, scroll or pinch to zoom.  Click a transmitter, group or station to narrow the map to it; click empty map or press Escape to restore the full view.<span id="linkclaim">  The address then links to what you see.</span>  Alaska and Hawaii appear as insets; transmitters outside this projection, such as Puerto Rico's, appear only in the transmitter table.</div>
   </section>
 
   <section class="tables">
@@ -160,11 +166,14 @@ const PATH_WORD = { ground_range: "ground-wave range", skywave: "skywave" };
 const isHfdl = t => t.kind === "hfdl" || String(t.tx_id || "").startsWith("hfdl:") || t.class === "HFDL ground station";
 
 // ---- state
+// STANDALONE_URL: where this page also lives unframed (build_page.py --standalone-url).
+const STANDALONE_URL = "";
+let framed;
+try { framed = window.self !== window.top; } catch (e) { framed = true; }
 let state = parseHash(location.hash);
 let cache = readStore();
 let D = null;                 // prepared data, or null when no endpoint has answered
-let load = { error: null, stale: false, asOfMs: null };
-let missingTables = new Set();
+let load = { error: null, stale: false, asOfMs: null, missing: [], loading: true };
 let selNotFound = null;
 let atlas = null, atlasError = null;
 let inflight = null;
@@ -176,40 +185,29 @@ function writeStore(c) {
   try { const s = JSON.stringify(c); if (s.length < 3e6) localStorage.setItem(STORE_KEY, s); } catch (e) { /* no storage here */ }
 }
 
-// A table the publisher has not created yet answers 404 with ClickHouse code 60
-// (UNKNOWN_TABLE).  That is a plain "no data yet", not an outage: hand logic.js an empty table.
-let pendingMissing = new Set();
-async function publicFetch(url, opts) {
-  const resp = await fetch(url, opts);
-  if (resp.ok || resp.status !== 404) return resp;
-  let text = "";
-  try { text = await resp.text(); } catch (e) { /* fall through */ }
-  const code = resp.headers && resp.headers.get && resp.headers.get("X-ClickHouse-Exception-Code");
-  if (code !== "60" && !/UNKNOWN_TABLE/.test(text)) return { ok: false };
-  const m = /sigmondb_public\.(\w+)/.exec(decodeURIComponent(url));
-  if (m) pendingMissing.add(m[1]);
-  return { ok: true, json: async () => ({ meta: [], data: [] }) };
-}
-
-async function refresh() {
+// Loads in the background, at start and on the timer only; a click never waits on it.
+// logic.js's loadAll reuses data under an hour old, so most ticks fetch nothing.
+function refresh() {
   if (inflight) return inflight;
   inflight = (async () => {
-    pendingMissing = new Set();
-    const before = cache && cache.asOfMs;
-    const res = await loadAll(publicFetch, cache, Date.now());
-    if (res.data && !res.stale && res.asOfMs !== before) {
-      cache = { data: res.data, asOfMs: res.asOfMs, missing: [...pendingMissing] };
-      writeStore(cache);
-    }
-    if (cache && res.data === cache.data) missingTables = new Set(cache.missing || []);
-    load = res;
-    D = res.data ? prepare(res.data) : null;
+    try {
+      const before = cache && cache.asOfMs;
+      const res = await loadAll((u, o) => fetch(u, o), cache, Date.now());
+      if (res.data && !res.stale && res.asOfMs !== before) {
+        cache = { data: res.data, asOfMs: res.asOfMs, missing: res.missing };
+        writeStore(cache);
+      }
+      load = res;
+      if (res.data && (!D || D.raw !== res.data)) D = prepare(res.data);
+      else if (!res.data) D = null;
+    } finally { inflight = null; }
+    apply();
   })();
-  try { await inflight; } finally { inflight = null; }
+  return inflight;
 }
 
 function prepare(raw) {
-  const d = {};
+  const d = { raw };
   for (const t of TABLES_READ) d[t] = Array.isArray(raw[t]) ? raw[t] : [];
   d.transmitters = d.transmitters.filter(t => !isHfdl(t)).map(t => Object.assign({}, t, {
     class: t.class || CLASS_OF_KIND[t.kind] || "unknown",
@@ -319,7 +317,7 @@ function draw() {
   if (!D) {
     for (const g of [gHulls, gLinks, gGroups, gTx, gMid, gSt]) g.selectAll("*").remove();
     notice.hidden = false;
-    notice.textContent = "No data to draw: " + (load.error || "no public endpoint has answered yet") + ".";
+    notice.textContent = load.loading ? "Reading the public data…" : "No data to draw: " + (load.error || "no public endpoint has answered") + ".";
     return;
   }
   const ion = state.view === "ionosphere";
@@ -526,11 +524,13 @@ function drawHeader() {
   if (load.asOfMs) parts.push("read " + fmtUtc(load.asOfMs / 1000));
   $("asof").textContent = parts.length ? parts.join(" · ") : "No data read yet";
   const msgs = [];
-  if (!D) msgs.push("No data: " + (load.error || "no public endpoint has answered") + ".  The page will try again.");
+  if (!D && load.loading) msgs.push("Reading the public data…");
+  else if (!D) msgs.push("No data: " + (load.error || "no public endpoint has answered") + ".  The page will try again.");
   else if (load.stale) msgs.push(`Stale: showing the answer read ${Math.round((Date.now() - load.asOfMs) / 60000)} min ago, because ${load.error}.`);
   if (D) {
     const empty = ["heard", "groups", "ionosphere_hourly"].filter(t => !D[t].length);
-    if (empty.length) msgs.push("No data yet in " + empty.join(", ") + (empty.some(t => missingTables.has(t)) ? " (not yet published)" : "") + ".");
+    const missing = load.missing || [];
+    if (empty.length) msgs.push("No data yet in " + empty.join(", ") + (empty.some(t => missing.includes(t)) ? " (not yet published)" : "") + ".");
   }
   if (selNotFound) msgs.push(`The linked selection ${selNotFound} was not found in the current data, so the map shows everything.`);
   $("status").innerHTML = msgs.map(esc).join("<br>");
@@ -627,10 +627,9 @@ function drawTables() {
       `<td>${esc(t.status)}</td><td>${D.txXY.has(t.tx_id) ? "yes" : t.lat == null ? "no position" : "outside the map"}</td></tr>`).join("") + "</tbody>";
 }
 
-// ---- the cycle: read the hash, load (cached under an hour), resolve, draw
-async function apply() {
+// ---- the cycle: read the hash, resolve against the data in hand, draw.  Never waits on a load.
+function apply() {
   state = parseHash(location.hash);
-  await refresh();
   selNotFound = null;
   if (D && state.sel) {
     const r = resolve(state, D);
@@ -643,7 +642,17 @@ async function apply() {
   render();
 }
 function render() {
-  drawHeader(); drawControls(); drawKey(); drawTiles(); draw(); drawSide(); drawTables();
+  drawHeader(); drawControls(); drawLinkControl(); drawKey(); drawTiles(); draw(); drawSide(); drawTables();
+}
+
+// In a frame (a Google Sites embed) the visitor's address bar never shows this page's
+// fragment, so the page makes no claim about it there.  With STANDALONE_URL set, it shows
+// the unframed URL of the current view as selectable text instead.
+function drawLinkControl() {
+  $("linkclaim").hidden = framed;
+  const box = $("viewlink");
+  box.hidden = !(framed && STANDALONE_URL);
+  if (!box.hidden) $("viewlink-url").value = STANDALONE_URL + formatHash(state);
 }
 
 // ---- events
@@ -666,12 +675,14 @@ $("classes").addEventListener("change", () => {
   setState(Object.assign({}, state, { classes: on.length === boxes.length ? null : on }));
 });
 window.addEventListener("hashchange", apply);
-setInterval(apply, REFRESH_MS);
+$("viewlink-url").addEventListener("focus", ev => ev.target.select());
+setInterval(refresh, REFRESH_MS);
 
 fetch(ATLAS_URL).then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
   .then(a => { atlas = a; drawStates(); }, e => { atlasError = e.message || "unreachable"; if (D) draw(); });
-render();
+if (cache) { D = prepare(cache.data); load.asOfMs = cache.asOfMs; load.missing = cache.missing || []; }
 apply();
+refresh();
 </script>
 </body>
 </html>
