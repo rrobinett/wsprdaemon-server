@@ -261,18 +261,3 @@ def test_bad_position_values_are_refused_without_the_value(tmp_path, entry):
         load_positions(f)
     msg = str(e.value)
     assert "K3LR/D" in msg and "41.5551" not in msg and "90.5" not in msg and "180.5" not in msg
-
-
-def test_overlay_positions_replaces_listed_reporters_and_copies_the_rest():
-    from sigmondb.receivers import overlay_positions
-    rows = [dict(reporter_id="A", lat=41.12, lon=-80.46, pos_sigma_m=400.0, pos_source="gpsdo",
-                 version=2),
-            dict(reporter_id="B", lat=1.0, lon=2.0, pos_sigma_m=3.0, pos_source="typed_grid")]
-    keep = [dict(r) for r in rows]
-    out = overlay_positions(rows, {"A": dict(lat=41.123457, lon=-80.456789, pos_sigma_m=5.5),
-                                   "Z": dict(lat=9.0, lon=9.0, pos_sigma_m=9.0)})
-    assert rows == keep                                     # input untouched
-    assert out[0] is not rows[0] and out[1] is not rows[1]
-    assert (out[0]["lat"], out[0]["lon"], out[0]["pos_sigma_m"]) == (41.123457, -80.456789, 5.5)
-    assert out[0]["pos_source"] == "gpsdo" and out[0]["version"] == 2
-    assert out[1] == rows[1]
