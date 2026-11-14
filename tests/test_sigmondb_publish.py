@@ -358,7 +358,8 @@ def test_ionosphere_group_midpoints():
     r = rows[0]
     st = publish.grid_to_latlon("EM38ww")
     assert len(r["midpoints"]) == 3
-    for mp, pos in zip(r["midpoints"], [(29.0, -95.0), (30.0, -94.0), (31.0, -93.0)]):
+    # members come in tx_id order: P2, P3, PREY
+    for mp, pos in zip(r["midpoints"], [(30.0, -94.0), (31.0, -93.0), (29.0, -95.0)]):
         assert isinstance(mp, list) and len(mp) == 2
         assert mp == pytest.approx(list(gc_midpoint(st[0], st[1], *pos)))
     assert r["target_type"] == "group" and r["n"] == 7 and r["built_at_utc"] == BUILT
