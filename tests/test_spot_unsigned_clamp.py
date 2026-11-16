@@ -59,3 +59,38 @@ def test_in_range_says_nothing(monkeypatch):
     monkeypatch.setattr(ws, 'log', lambda msg, level='INFO': said.append(msg))
     ws.convert_spot_to_clickhouse(_spot(sync_quality=5))
     assert not said
+
+
+def _psk(**extra):
+    row = {'time': '2026-11-16T16:28:00Z', 'mode': 'FT8', 'rx_sign': 'AC0G',
+           'receiver': 'AC0G/B1A', 'tx_call': 'K1ABC', 'frequency': 14074000,
+           'band': 20, 'report': -12, 'snr_db': -12, 'score': 5}
+    row.update(extra)
+    return row
+
+
+@pytest.mark.parametrize('field', ['report', 'snr_db', 'score'])
+@pytest.mark.parametrize('value', [40000, -40000])
+def test_psk_small_ints_out_of_range_become_null(field, value):
+    assert ws.convert_psk_spot_to_clickhouse(_psk(**{field: value}))[field] is None
+
+
+def test_psk_in_range_kept():
+    out = ws.convert_psk_spot_to_clickhouse(_psk(report=-24, snr_db=None))
+    assert out['report'] == -24 and out['snr_db'] is None
+
+
+def test_psk_out_of_range_names_receiver(monkeypatch):
+    said = []
+    monkeypatch.setattr(ws, 'log', lambda msg, level='INFO': said.append(msg))
+    ws.convert_psk_spot_to_clickhouse(_psk(receiver='KFS/NW', report=99999))
+    assert any('KFS/NW' in m and 'report' in m and '99999' in m for m in said)
+
+
+def test_warnings_capped_per_reporter_and_field(monkeypatch):
+    said = []
+    monkeypatch.setattr(ws, 'log', lambda msg, level='INFO': said.append(msg))
+    monkeypatch.setattr(ws, '_range_warnings', {})
+    for _ in range(ws._RANGE_WARN_CAP + 10):
+        ws.convert_psk_spot_to_clickhouse(_psk(receiver='CAP/TEST', report=99999))
+    assert len(said) == ws._RANGE_WARN_CAP

@@ -1363,6 +1363,19 @@ def _parse_psk_time(ts) -> datetime:
     raise ValueError(f"unparseable psk row time: {ts!r}")
 
 
+def _psk_int16_or_null(row: Dict, field: str):
+    """A Nullable(Int16) psk column: a value outside Int16 is no real report,
+    and one such value fails the whole insert, so it is stored as NULL."""
+    value = row.get(field)
+    if value is None or -32768 <= int(value) <= 32767:
+        return value
+    who = row.get('receiver') or row.get('rx_sign') or '?'
+    _warn_out_of_range(who, field,
+                       f"PSK row from {who} ({row.get('tx_call') or '?'}): "
+                       f"{field}={value} outside Int16, stored as NULL")
+    return None
+
+
 def convert_psk_spot_to_clickhouse(row: Dict) -> Dict:
     """Convert a psk-recorder JSONL row to a clickhouse-driver insert dict."""
     return {
@@ -1376,12 +1389,12 @@ def convert_psk_spot_to_clickhouse(row: Dict) -> Dict:
         'host_id':               row.get('host_id') or '',
         'tx_call':               row.get('tx_call') or '',
         'grid':                  row.get('grid') or '',
-        'report':                row.get('report'),
+        'report':                _psk_int16_or_null(row, 'report'),
         'message':               row.get('message') or '',
         'frequency':             int(row.get('frequency') or 0),
         'band':                  int(row.get('band') or 0),
-        'snr_db':                row.get('snr_db'),
-        'score':                 row.get('score'),
+        'snr_db':                _psk_int16_or_null(row, 'snr_db'),
+        'score':                 _psk_int16_or_null(row, 'score'),
         'dt':                    float(row.get('dt') or 0.0),
         'spectral_width_hz':     row.get('spectral_width_hz'),
         'forward_to_pskreporter': 1 if row.get('forward_to_pskreporter', True) else 0,
@@ -1794,6 +1807,19 @@ def process_spot_files(extraction_dir: Path, client_version: Optional[str],
     return all_spots
 
 
+# Out-of-range warnings, capped per (reporter, field) for the life of the
+# process, so one station sending garbage cannot flood the log.
+_RANGE_WARN_CAP = 20
+_range_warnings: Dict = {}
+
+
+def _warn_out_of_range(who: str, field: str, message: str) -> None:
+    n = _range_warnings.get((who, field), 0)
+    if n < _RANGE_WARN_CAP:
+        _range_warnings[(who, field)] = n + 1
+        log(message, "WARNING")
+
+
 # Unsigned spot columns and their ceilings (the table's UInt16/UInt8 types).
 # One value out of range fails the whole insert, and the flush that carries it
 # also holds noise, psk and chirp rows: on 2026-11-16 one bad sync_quality
@@ -1813,9 +1839,10 @@ def _clamp_unsigned_spot_fields(ch_record: Dict) -> None:
         value = int(ch_record[field])
         clamped = min(max(value, 0), ceiling)
         if clamped != value:
-            log(f"Spot from {ch_record['rx_id']} ({ch_record['tx_sign']}): "
-                f"{field}={value} outside 0..{ceiling}, stored as {clamped}",
-                "WARNING")
+            _warn_out_of_range(
+                ch_record['rx_id'], field,
+                f"Spot from {ch_record['rx_id']} ({ch_record['tx_sign']}): "
+                f"{field}={value} outside 0..{ceiling}, stored as {clamped}")
         ch_record[field] = clamped
 
 
