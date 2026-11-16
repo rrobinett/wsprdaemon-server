@@ -8,9 +8,11 @@ own timestamps feed only the statistics (usual gap, active days, hourly counts).
 Two rules keep the board from shouting about one fault many times:
 - one cause, one alarm: a station off the air shows only that, not a quiet
   client and a low count for each of its sources as well;
-- when more than half the stations with history fall silent at once, the fault
-  lies in wd30's ingest, not in the stations, so one ingest_stalled finding
-  replaces their off_air findings and those stations show grey.
+- when more than half the stations with history fall silent at once, the
+  fault lies in wd30's ingest, not in the stations, so one ingest_stalled
+  finding replaces their off_air findings and those stations show grey.  The
+  guard needs at least INGEST_MIN_STATIONS stations with history: in a smaller
+  fleet a majority is one or two stations, too few to blame the server.
 """
 from __future__ import annotations
 
@@ -30,6 +32,9 @@ LOW_HOURS = 3
 LOW_FRACTION = 0.30
 LOW_MIN_MEDIAN_PER_H = 20
 FAST_SOURCE_MAX_GAP_S = 600
+# Below this many stations with history, silent stations get ordinary off_air
+# findings and the ingest_stalled guard stays off.
+INGEST_MIN_STATIONS = 4
 
 INGEST_STATION = "wd30"
 
@@ -152,7 +157,8 @@ def evaluate(stations: list[Station], acts: dict[str, StationActivity], now: dat
         f = _off_air(st, sa, now)
         if f:
             off[st.name] = f
-    stalled = len(off) > len(with_history) / 2
+    stalled = (len(with_history) >= INGEST_MIN_STATIONS
+               and len(off) > len(with_history) / 2)
     out: list[Finding] = []
     for st, sa in with_history:
         if st.name in off:

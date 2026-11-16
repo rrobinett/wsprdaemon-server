@@ -46,9 +46,8 @@ def _live(name="A", add=(), drop=()):
 
 
 def _run(pairs, alarm_hours=None, bystanders=2):
-    """Evaluate `pairs` beside healthy bystanders, so that one silent station
-    reads as off the air rather than as more than half the fleet (an ingest
-    stall).  The bystanders raise no findings."""
+    """Evaluate `pairs` beside healthy bystanders, which raise no findings.
+    The ingest tests pass bystanders=0 to control N exactly."""
     pairs = list(pairs) + [_live(f"ZZ{i}") for i in range(bystanders)]
     return evaluate([st for st, _ in pairs], {st.name: sa for st, sa in pairs},
                     NOW, alarm_hours or {})
@@ -260,14 +259,27 @@ def test_mass_silence_keeps_findings_of_live_stations():
     assert verdict(st9, sa9, fs) == "warn"
 
 
-def test_lone_silent_station_is_an_ingest_stall():
-    # Rule: K > N/2.  With one station in the fleet, its silence cannot be told
-    # from wd30's.
-    st, sa = _live()
+def test_small_fleet_silence_is_off_air_not_ingest_stall():
+    # Under INGEST_MIN_STATIONS stations with history, the guard stays off:
+    # one of two silent is a station fault, not wd30's.
+    st, sa = _live("S0")
     sa.last_arrival["wspr_noise"] = NOW - timedelta(hours=1)
-    fs = _run([(st, sa)], bystanders=0)
-    assert _checks(fs) == [("wd30", "ingest_stalled", "")]
-    assert verdict(st, sa, fs) == "grey"
+    pairs = [(st, sa), _live("S1")]
+    fs = _run(pairs, bystanders=0)
+    assert _checks(fs) == [("S0", "off_air", "")]
+    assert verdict(st, sa, fs) == "off"
+    # Two of three silent is a majority, but still under the minimum.
+    pairs.append(_live("S2"))
+    pairs[1][1].last_arrival["wspr_noise"] = NOW - timedelta(hours=1)
+    fs = _run(pairs, bystanders=0)
+    assert _checks(fs) == [("S0", "off_air", ""), ("S1", "off_air", "")]
+
+
+def test_ingest_guard_fires_at_four_stations():
+    pairs = [_live(f"S{i}") for i in range(4)]
+    for _, sa in pairs[:3]:
+        sa.last_arrival["wspr_noise"] = NOW - timedelta(hours=1)
+    assert _checks(_run(pairs, bystanders=0)) == [("wd30", "ingest_stalled", "")]
 
 
 def test_half_silent_is_not_ingest_stalled():
