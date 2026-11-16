@@ -86,3 +86,37 @@ def test_fetch_runs_every_query():
     a = sources.fetch(C(), NOW)
     assert len(seen) == len(sources.queries(NOW))
     assert a.last_arrival == {}
+
+
+def test_window_lengths_pinned():
+    from datetime import timezone  # noqa: F401
+    for n, s in sources.queries(NOW).items():
+        if n.endswith("_last"):
+            assert "ingested_at > toDateTime('2026-11-16 12:00:00', 'UTC') - INTERVAL 14 DAY" in s, n
+        elif n.endswith("_days"):
+            assert "time > toDateTime('2026-11-16 12:00:00', 'UTC') - INTERVAL 14 DAY" in s, n
+        elif n.endswith("_gap"):
+            assert "time > toDateTime('2026-11-16 12:00:00', 'UTC') - INTERVAL 7 DAY" in s, n
+        elif n.endswith("_hourly"):
+            assert "time > toDateTime('2026-11-16 12:00:00', 'UTC') - INTERVAL 171 HOUR" in s, n
+            assert "+ INTERVAL" not in s, n
+
+
+def test_gap_sql_quantile_and_leading_zero():
+    for n, s in sources.queries(NOW).items():
+        if n.endswith("_gap"):
+            assert "quantileExact(0.9)" in s, n
+            assert "arrayPopFront(arrayDifference(" in s, n
+
+
+def test_aware_datetimes_normalised_to_naive_utc():
+    from datetime import timedelta, timezone
+    t = datetime(2026, 11, 16, 11, 55, tzinfo=timezone.utc)
+    est = timezone(timedelta(hours=-5))
+    h = datetime(2026, 11, 16, 5, tzinfo=est)  # 10:00 UTC
+    a = sources.parse({
+        "ft8_last": [("A", t), ("EPOCHAWARE", datetime(1970, 1, 1, tzinfo=timezone.utc))],
+        "wspr_spots_hourly": [("A", h, 7)],
+    })
+    assert a.last_arrival == {("ft8", "A"): datetime(2026, 11, 16, 11, 55)}
+    assert a.hourly == {("wspr_spots", "A"): {datetime(2026, 11, 16, 10): 7}}

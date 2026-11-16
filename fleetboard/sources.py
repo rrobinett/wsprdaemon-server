@@ -12,7 +12,7 @@ without a database.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 SOURCES = ("wspr_noise", "wspr_spots", "ft8", "codar", "hfdl")
 HOURLY_SOURCES = ("wspr_spots", "ft8")
@@ -44,6 +44,13 @@ class Activity:
 
 def _lit(t: datetime) -> str:
     return f"toDateTime('{t:%Y-%m-%d %H:%M:%S}', 'UTC')"
+
+
+def _naive_utc(t: datetime) -> datetime:
+    """clickhouse_connect may return aware datetimes; compare and store naive UTC."""
+    if t.tzinfo is not None:
+        t = t.astimezone(timezone.utc).replace(tzinfo=None)
+    return t
 
 
 def _where(col: str, now: datetime, days_back: str, extra: str) -> str:
@@ -78,7 +85,7 @@ def queries(now: datetime) -> dict[str, str]:
             out[f"{src}_hourly"] = (
                 f"SELECT {rep} AS reporter, toStartOfHour(time, 'UTC') AS hour, count() "
                 f"FROM {table} "
-                f"WHERE {_where('time', now, f'{BASELINE_DAYS} DAY + INTERVAL 3 HOUR', extra)} "
+                f"WHERE {_where('time', now, f'{BASELINE_DAYS * 24 + 3} HOUR', extra)} "
                 f"GROUP BY reporter, hour"
             )
     return out
@@ -91,7 +98,10 @@ def parse(results: dict[str, list[tuple]]) -> Activity:
     hourly: dict[Key, dict[datetime, int]] = {}
     for src in SOURCES:
         for rep, t in results.get(f"{src}_last", []):
-            if t is not None and t != EPOCH:
+            if t is None:
+                continue
+            t = _naive_utc(t)
+            if t != EPOCH:
                 last[(src, rep)] = t
         for rep, d in results.get(f"{src}_days", []):
             days.setdefault((src, rep), set()).add(d)
@@ -99,7 +109,7 @@ def parse(results: dict[str, list[tuple]]) -> Activity:
             gap[(src, rep)] = float(g)
         if src in HOURLY_SOURCES:
             for rep, h, n in results.get(f"{src}_hourly", []):
-                hourly.setdefault((src, rep), {})[h] = int(n)
+                hourly.setdefault((src, rep), {})[_naive_utc(h)] = int(n)
     return Activity(
         last_arrival=last,
         days_active={k: frozenset(v) for k, v in days.items()},
