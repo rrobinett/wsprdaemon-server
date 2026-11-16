@@ -268,15 +268,34 @@ def pick_free_rac():
     return None
 
 
+# The station's upload account shares this name when its reporter ID has no '/' or '-'
+# (AB4EJ, W7WKR_2): whichever of this registrar and wsprdaemon_server's SFTP provisioner
+# runs first must leave an account that can upload -- sshd's `Match Group sftponly`
+# chroot needs the group and a root-owned 0755 home, with uploads/ the station's
+# (registrar-sftponly, 2026-11-12; N8UR-SIGMOND needed a hand fix on 11-14).
+UPLOAD_GROUP = "sftponly"
+
+
 def ensure_account(site, pubkey_line):
+    created = False
     try:
         pwd.getpwnam(site)
     except KeyError:
+        subprocess.run(["groupadd", "-f", UPLOAD_GROUP], check=True, capture_output=True)
         subprocess.run(
-            ["useradd", "-m", "-s", "/bin/false", site], check=True, capture_output=True
+            ["useradd", "-m", "-s", "/bin/false", "-G", UPLOAD_GROUP, site],
+            check=True, capture_output=True,
         )
+        created = True
         log.info("created account %s", site)
     home = pwd.getpwnam(site).pw_dir
+    if created:
+        u = pwd.getpwnam(site)
+        os.chown(home, 0, 0)
+        os.chmod(home, 0o755)
+        uploads = os.path.join(home, "uploads")
+        os.makedirs(uploads, exist_ok=True)
+        os.chown(uploads, u.pw_uid, u.pw_gid)
     sshdir = os.path.join(home, ".ssh")
     akf = os.path.join(sshdir, "authorized_keys")
     os.makedirs(sshdir, mode=0o700, exist_ok=True)

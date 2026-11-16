@@ -2143,6 +2143,9 @@ def _provision_sftp_user_on_gw(gw: str, username: str, pubkey: str) -> None:
         f"PUBKEY='{pubkey}'\n"
         "sudo useradd -m -s /bin/false -G sftponly \"$USERNAME\" 2>/dev/null || "
         "{ RC=$?; [ $RC -eq 9 ] || exit $RC; }\n"
+        # An account the RAC registrar created first has no sftponly (useradd -G applies only on
+        # create), so sshd's Match Group sftponly never chroots it and the login is refused.
+        'sudo usermod -aG sftponly "$USERNAME"\n'
         'SSH_DIR="/home/$USERNAME/.ssh"\n'
         'sudo mkdir -p "$SSH_DIR"\n'
         'sudo chmod 700 "$SSH_DIR"\n'
