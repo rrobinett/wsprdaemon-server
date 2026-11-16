@@ -1794,6 +1794,31 @@ def process_spot_files(extraction_dir: Path, client_version: Optional[str],
     return all_spots
 
 
+# Unsigned spot columns and their ceilings (the table's UInt16/UInt8 types).
+# One value out of range fails the whole insert, and the flush that carries it
+# also holds noise, psk and chirp rows: on 2026-11-16 one bad sync_quality
+# stopped every insert for six hours.
+_SPOT_UNSIGNED_MAX = {
+    'sync_quality': 65535,
+    'blocksize':    65535,
+    'nhardmin':     65535,
+    'osd_decode':   255,
+    'ipass':        255,
+}
+
+
+def _clamp_unsigned_spot_fields(ch_record: Dict) -> None:
+    """Clamp each unsigned column into its range, naming the reporter."""
+    for field, ceiling in _SPOT_UNSIGNED_MAX.items():
+        value = int(ch_record[field])
+        clamped = min(max(value, 0), ceiling)
+        if clamped != value:
+            log(f"Spot from {ch_record['rx_id']} ({ch_record['tx_sign']}): "
+                f"{field}={value} outside 0..{ceiling}, stored as {clamped}",
+                "WARNING")
+        ch_record[field] = clamped
+
+
 def convert_spot_to_clickhouse(spot: Dict) -> Dict:
     """Convert a parsed spot record to a ClickHouse insert dict."""
     date_str = spot['date']   # YYMMDD
@@ -1855,6 +1880,7 @@ def convert_spot_to_clickhouse(spot: Dict) -> Dict:
         'version':       spot.get('client_version', None),
         'rx_status':     'No Info',
     }
+    _clamp_unsigned_spot_fields(ch_record)
 
     return ch_record
 
