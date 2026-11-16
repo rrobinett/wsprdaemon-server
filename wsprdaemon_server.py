@@ -391,6 +391,7 @@ def setup_clickhouse_tables(admin_user: str, admin_password: str,
         log(f"Table {config['clickhouse_database']}.{config['clickhouse_noise_table']} ready", "INFO")
 
         ensure_spots_ingested_at(admin_client, config)
+        ensure_noise_ingested_at(admin_client, config)
 
         setup_wsprnet_reporter_table(admin_client, config)
 
@@ -627,6 +628,33 @@ def ensure_spots_ingested_at(admin_client, config: Dict) -> None:
         # Not fatal: without it the forwarder cannot run, but ingest can.
         log(f"Could not add {db}.{table}.ingested_at ({e}) — the wsprnet "
             f"forwarder will not be able to track arrivals", "ERROR")
+
+
+def ensure_noise_ingested_at(admin_client, config: Dict) -> None:
+    """Add `ingested_at` to an existing noise table (idempotent, metadata-only).
+
+    The fleet monitor judges a station's liveness by when the SERVER
+    received its rows, never by the station's own `time` column.
+
+    The DEFAULT stays the constant `toDateTime(0)`, never `now()`.  The
+    reason is the one `ensure_spots_ingested_at` documents: ClickHouse
+    computes the DEFAULT of a newly added column at read time, so `now()`
+    would make every old row read as "just arrived".  Because the default
+    is a constant, every insert must supply the value itself; see
+    `process_noise_files`.
+    """
+    db = config['clickhouse_database']
+    table = config['clickhouse_noise_table']
+    try:
+        admin_client.command(
+            f"ALTER TABLE {db}.{table} ADD COLUMN IF NOT EXISTS "
+            f"`ingested_at` DateTime DEFAULT toDateTime(0) "
+            f"CODEC(Delta(4), ZSTD(3))")
+        log(f"Column {db}.{table}.ingested_at ready", "INFO")
+    except Exception as e:
+        # Not fatal: ingest continues, the fleet monitor lacks arrival times.
+        log(f"Could not add {db}.{table}.ingested_at ({e}) — the fleet "
+            f"monitor will not see noise arrivals", "ERROR")
 
 
 WSPRNET_REPORTER_TABLE = 'wsprnet_reporter'
@@ -2080,6 +2108,9 @@ def process_noise_files(extraction_dir: Path, running_jobs: Optional[str],
                 'rms_level':  rms_level,
                 'c2_level':   c2_level,
                 'ov':         ov,
+                # Server arrival time; the column's DEFAULT is a constant
+                # on purpose (ensure_noise_ingested_at).
+                'ingested_at': datetime.utcnow(),
                 # Optional metadata from uploads_config.txt
             })
 
