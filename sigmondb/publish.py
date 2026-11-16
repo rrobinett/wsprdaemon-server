@@ -501,21 +501,25 @@ class ChHttp:
             raise PublishError(self.scrub("%s: %s" % (type(e).__name__, e))[:500]) from None
 
 
-def _create_sql(name, schema):
+def _create_sql(name, schema, database=DATABASE):
     cols = ", ".join("`%s` %s" % (c, t) for c, t in schema)
-    return "CREATE TABLE %s.%s (%s) ENGINE = MergeTree ORDER BY tuple()" % (DATABASE, name, cols)
+    return "CREATE TABLE %s.%s (%s) ENGINE = MergeTree ORDER BY tuple()" % (database, name, cols)
 
 
 def _jsonl(rows):
     return "".join(json.dumps(r, allow_nan=False, ensure_ascii=False) + "\n" for r in rows)
 
 
-def replace_table(ch, table, rows):
-    """Build <table>__new, then swap it in: EXCHANGE when <table> exists, else RENAME."""
-    new, live = "%s.%s__new" % (DATABASE, table), "%s.%s" % (DATABASE, table)
+def replace_table(ch, table, rows, schema=None, database=DATABASE):
+    """Build <table>__new, then swap it in: EXCHANGE when <table> exists, else RENAME.
+
+    schema and database default to this module's own; fleetboard passes its own."""
+    if schema is None:
+        schema = SCHEMAS[table]
+    new, live = "%s.%s__new" % (database, table), "%s.%s" % (database, table)
     data = _jsonl(rows)   # before any statement: unsendable rows touch nothing
     ch.run("DROP TABLE IF EXISTS %s" % new)
-    ch.run(_create_sql(table + "__new", SCHEMAS[table]))
+    ch.run(_create_sql(table + "__new", schema, database))
     if rows:
         ch.run("INSERT INTO %s FORMAT JSONEachRow" % new, data)
     if ch.run("EXISTS TABLE %s" % live).strip() == "1":
