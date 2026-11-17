@@ -117,13 +117,21 @@ def cmd_run(a):
     for s in ddl.statements():
         client.command(s)
     stations = read_map(client)
+    if not stations:
+        # Zero stations would judge nothing, clear every alarm and publish an
+        # empty board that reads as health.  Publish nothing: the page goes stale.
+        print("run: fleet.station_map is empty; no station map, so nothing judged, "
+              "written or published (load it with load-map)", file=sys.stderr)
+        return 2
     acts = fold(sources.fetch(client, now), stations)
     prev = read_alarms(client, now)
     acks = read_acks(client, now)
     since = now - timedelta(days=sources.BASELINE_DAYS + 1)
     hours = al.alarm_hours(prev, since)
     findings = evaluate(stations, acts, now, hours)
-    changed = al.step(prev, findings, acks, now)
+    hold = {s for f in findings if f.check == "ingest_stalled"
+            for s in f.numbers.get("silent", ())}
+    changed = al.step(prev, findings, acks, now, hold=hold)
     if changed:
         _insert(client, "fleet.alarm", [[getattr(c, k) for k in ALARM_COLS] for c in changed],
                 ALARM_COLS)

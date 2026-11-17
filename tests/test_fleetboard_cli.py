@@ -25,8 +25,9 @@ def _now():
 
 
 class FakeClient:
-    def __init__(self, events, alarm_rows=()):
+    def __init__(self, events, alarm_rows=(), map_rows=None):
         self.events, self.sql, self.alarm_rows = events, [], list(alarm_rows)
+        self.map_rows = [("A", "EN16ov", "ft8", "A1", [], [])] if map_rows is None else map_rows
         self.inserts = []
 
     def command(self, sql):
@@ -36,7 +37,7 @@ class FakeClient:
         self.sql.append(sql)
         rows = []
         if "station_map" in sql:
-            rows = [("A", "EN16ov", "ft8", "A1", [], [])]
+            rows = self.map_rows
         elif "fleet.alarm FINAL" in sql:
             rows = self.alarm_rows
         return _types.SimpleNamespace(result_rows=rows)
@@ -53,9 +54,9 @@ def _silent():
                     days_active={("ft8", "A1"): frozenset({now.date()})})
 
 
-def _stub(monkeypatch, activity=None, alarm_rows=()):
+def _stub(monkeypatch, activity=None, alarm_rows=(), map_rows=None):
     events = []
-    client = FakeClient(events, alarm_rows)
+    client = FakeClient(events, alarm_rows, map_rows)
     published = []
     monkeypatch.setattr(cli, "connect", lambda conf: client)
     monkeypatch.setattr(cli.sources, "fetch",
@@ -151,9 +152,9 @@ def test_live_alarm_published_cleared_alarm_only_feeds_excluded_hours(monkeypatc
     seen = {}
     real = cli.evaluate
 
-    def spy(stations, acts, now_, hours):
+    def spy(stations, acts, now_, hours, **kw):
         seen.update(hours)
-        return real(stations, acts, now_, hours)
+        return real(stations, acts, now_, hours, **kw)
 
     monkeypatch.setattr(cli, "evaluate", spy)
     assert cli.main(["run", "--conf", "x"]) == 0
@@ -217,3 +218,40 @@ def test_load_map_loaded_at_inserts_as_utc_in_a_chicago_process(monkeypatch):
         (table, data, cols), = client.inserts
         v = dict(zip(cols, data[0]))["loaded_at"]
         assert before <= int(v.timestamp()) <= after
+
+
+# --- I2: an empty station map is not a healthy fleet -----------------------
+
+def test_run_with_empty_map_exits_2_writes_and_publishes_nothing(monkeypatch, capsys):
+    now = _now()
+    live = ("A", "off_air", "", now - timedelta(hours=2), now - timedelta(minutes=5),
+            "open", 0, "{}", now - timedelta(minutes=5))
+    client, published, _ = _stub(monkeypatch, _silent(), [live], map_rows=[])
+    _env(monkeypatch, True)
+    assert cli.main(["run", "--conf", "x"]) == 2
+    assert "station map" in capsys.readouterr().err
+    assert not client.inserts and not published
+
+
+# --- I4: an ingest stall freezes the silent stations' alarms ---------------
+
+def test_run_holds_alarms_of_stations_silent_under_an_ingest_stall(monkeypatch):
+    now = _now()
+    names = ["S%d" % i for i in range(5)]
+    maprows = [(n, "EN16ov", "wspr_noise", n, [], []) for n in names]
+    act = Activity(
+        last_arrival={("wspr_noise", n): now - timedelta(hours=2 if i < 3 else 0, minutes=1)
+                      for i, n in enumerate(names)},
+        days_active={("wspr_noise", n): frozenset({now.date()}) for n in names})
+    first = now - timedelta(days=1)
+    acked = ("S0", "off_air", "", first, now - timedelta(minutes=5), "acknowledged", 0, "{}",
+             now - timedelta(minutes=5))
+    client, published, _ = _stub(monkeypatch, act, [acked], map_rows=maprows)
+    _env(monkeypatch, True)
+    assert cli.main(["run", "--conf", "x"]) == 0
+    (table, data, cols), = client.inserts
+    written = [dict(zip(cols, r)) for r in data]
+    assert [(w["station"], w["check"]) for w in written] == [("wd30", "ingest_stalled")]
+    alarms = {t: r for t, r, _, _ in published}["fleet_alarms"]
+    s0 = [a for a in alarms if a["station"] == "S0"]
+    assert [(a["check"], a["state"]) for a in s0] == [("off_air", "acknowledged")]

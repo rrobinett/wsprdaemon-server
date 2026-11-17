@@ -8,6 +8,10 @@ does not close an outage.  An ack names one instance by its first_seen; a
 condition that clears and returns opens a new instance that needs a new ack.
 Cleared alarms still feed alarm_hours: the usual-activity baseline must skip
 hours that fell inside an outage.
+
+`hold` names stations whose live alarms stay frozen this run.  When wd30's
+ingest stalls, its silent stations get no findings, and without the hold three
+such runs would clear a real outage (and drop its ack) on wd30's fault.
 """
 from __future__ import annotations
 
@@ -44,13 +48,18 @@ class Ack:
     acked_at: datetime
 
 
-def step(prev, findings, acks, now):
+def step(prev, findings, acks, now, hold=frozenset()):
+    """hold: stations whose live alarms are left untouched (no streak change,
+    not returned)."""
     now = now.replace(microsecond=0)
     live = {(a.station, a.check, a.subject): a for a in prev if a.state in LIVE}
+    held = {k for k, a in live.items() if a.station in hold}
     changed: dict[tuple, Alarm] = {}
     found = set()
     for fd in findings:
         key = (fd.station, fd.check, fd.subject)
+        if key in held:
+            continue
         found.add(key)
         numbers = json.dumps(fd.numbers, sort_keys=True)
         old = live.get(key)
@@ -60,7 +69,7 @@ def step(prev, findings, acks, now):
             changed[key] = replace(old, last_seen=now, false_streak=0,
                                    numbers=numbers, updated_at=now)
     for key, old in live.items():
-        if key in found:
+        if key in found or key in held:
             continue
         streak = old.false_streak + 1
         changed[key] = replace(

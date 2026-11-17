@@ -109,3 +109,25 @@ def test_false_streak_sets_updated_at():
     now = T0 + timedelta(minutes=3)
     (a,) = step([alarm()], [], [], now)
     assert a.updated_at == now and a.false_streak == 1
+
+
+def test_hold_freezes_a_silent_stations_alarm_through_an_ingest_stall():
+    """UACNJ off the air and acknowledged; wd30's ingest then stalls with UACNJ
+    among the silent for 5 runs.  Its alarm must come out the same instance,
+    still acknowledged: a stall must neither clear it nor re-open it unacked."""
+    ack = Ack("UACNJ", "off_air", "", T0, "rob", "site visit", T0)
+    (a,) = step([alarm(station="UACNJ")], [f(station="UACNJ")], [ack], T0 + timedelta(minutes=5))
+    assert a.state == "acknowledged"
+    stall = Finding("wd30", "ingest_stalled", "", {"silent": ["UACNJ"]})
+    prev = [a]
+    for i in range(5):
+        now = T0 + timedelta(minutes=10 + 5 * i)
+        out = step(prev, [stall], [ack], now, hold={"UACNJ"})
+        assert [(x.station, x.check) for x in out] == [("wd30", "ingest_stalled")]
+        prev = [a] + out
+    assert (a.state, a.first_seen, a.false_streak) == ("acknowledged", T0, 0)
+
+
+def test_hold_leaves_other_stations_alone():
+    out = step([alarm(station="B")], [], [], T0 + timedelta(minutes=5), hold={"UACNJ"})
+    assert [(x.station, x.false_streak) for x in out] == [("B", 1)]
