@@ -181,7 +181,7 @@ def cmd_run(a):
                          publish.now_utc(), excluded_hours=hours, now=now)
     fails = publish.publish(tables, hosts, user, password, timeout=a.timeout,
                             out=lambda s: print(s, flush=True), names=tuple(board.SCHEMAS),
-                            schemas=board.SCHEMAS, database=ddl.DATABASE)
+                            schemas=board.SCHEMAS, database=publish.DATABASE)
     if fails:
         print("run: %d of %d host+table replacements FAILED"
               % (len(fails), len(hosts) * len(board.SCHEMAS)), file=sys.stderr)

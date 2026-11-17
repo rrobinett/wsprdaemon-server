@@ -110,7 +110,8 @@ def test_run_inserts_alarms_before_publishing(monkeypatch):
     _env(monkeypatch, True)
     assert cli.main(["run", "--conf", "x"]) == 0
     assert events == ["insert fleet.alarm", "publish fleet_board", "publish fleet_alarms"]
-    assert [p[2] is not None and p[3] for p in published] == ["fleet", "fleet"]
+    assert [p[2] is not None and p[3] for p in published] == ["sigmondb_public", "sigmondb_public"]
+    assert all(p[3] != "fleet" for p in published)
     rows = dict((t, r) for t, r, _, _ in published)
     assert rows["fleet_board"][0]["verdict"] == "off"
     assert [r["check"] for r in rows["fleet_alarms"]] == ["off_air"]
