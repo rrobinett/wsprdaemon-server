@@ -27,7 +27,7 @@ import clickhouse_driver        # native TCP client — used for the hot insert 
 import logging
 
 # Version
-VERSION = "2.30.0"  # spots.ingested_at — the wsprnet forwarder's arrival cursor
+VERSION = "2.31.0"  # noise.ingested_at — the fleet board reads noise arrival by the server's clock
 
 # Default configuration
 DEFAULT_CONFIG = {

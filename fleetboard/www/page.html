@@ -101,6 +101,7 @@ function render() {
     $("boardbox").classList.remove("stale-board");
     $("banner").textContent = "";
     $("stalebar").textContent = "No board can be shown: the data could not be read (" + e.message + ").";
+    $("asof").textContent = "No data";
     $("detail").hidden = true;
   }
 }
