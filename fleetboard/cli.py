@@ -32,6 +32,19 @@ def _naive(t):
     return sources._naive_utc(t)
 
 
+def _utc(v):
+    """The insert boundary.  clickhouse_connect 0.10 writes a naive datetime as LOCAL
+    time (x.timestamp()), and wd30 runs America/Chicago, so a naive UTC value would land
+    6 h late.  In memory every datetime stays naive UTC; on the way out it becomes aware."""
+    if isinstance(v, datetime) and v.tzinfo is None:
+        return v.replace(tzinfo=timezone.utc)
+    return v
+
+
+def _insert(client, table, rows, cols):
+    client.insert(table, [[_utc(v) for v in r] for r in rows], column_names=cols)
+
+
 def _alarm(r):
     r = dict(zip(ALARM_COLS, r))
     for k in ("first_seen", "last_seen", "updated_at"):
@@ -87,7 +100,7 @@ def cmd_load_map(a):
         client.command(s)
     client.command("TRUNCATE TABLE fleet.station_map")
     if rows:
-        client.insert("fleet.station_map", rows, column_names=MAP_COLS)
+        _insert(client, "fleet.station_map", rows, MAP_COLS)
     print("station_map: %d rows" % len(rows))
     return 0
 
@@ -112,9 +125,8 @@ def cmd_run(a):
     findings = evaluate(stations, acts, now, hours)
     changed = al.step(prev, findings, acks, now)
     if changed:
-        client.insert("fleet.alarm",
-                      [[getattr(c, k) for k in ALARM_COLS] for c in changed],
-                      column_names=ALARM_COLS)
+        _insert(client, "fleet.alarm", [[getattr(c, k) for k in ALARM_COLS] for c in changed],
+                ALARM_COLS)
     print("run: %d stations, %d findings, %d alarms changed"
           % (len(stations), len(findings), len(changed)), flush=True)
     merged = {(x.station, x.check, x.subject): x for x in prev if x.state in al.LIVE}

@@ -8,6 +8,9 @@ Type=oneshot
 User=wsprdaemon
 Group=wsprdaemon
 WorkingDirectory=/home/wsprdaemon/wsprdaemon-server
+# Belt and braces: the code hands ClickHouse aware UTC datetimes, so a hand run in
+# another zone is also correct; this keeps any naive datetime UTC as well.
+Environment=TZ=UTC
 # CH_PUB_USER, CH_PUB_PASSWORD, CH_PUB_HOSTS (mode 600, owned by wsprdaemon)
 EnvironmentFile=/home/wsprdaemon/.config/sigmondb-public.env
 ExecStart=/opt/wsprdaemon-server/venv/bin/python -m fleetboard run --conf /etc/wsprdaemon/clickhouse.conf

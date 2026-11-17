@@ -162,3 +162,58 @@ def test_live_alarm_published_cleared_alarm_only_feeds_excluded_hours(monkeypatc
         ("client_quiet", "ft8"), ("off_air", "")]
     hour = (now - timedelta(hours=40)).replace(minute=0, second=0)
     assert hour in seen["A"]
+
+
+# --- C1: datetimes reach the insert as aware UTC ---------------------------
+
+import calendar  # noqa: E402
+import contextlib  # noqa: E402
+import os  # noqa: E402
+import time  # noqa: E402
+
+
+@contextlib.contextmanager
+def _tz(name):
+    """Run with the process in time zone `name` (wd30 runs America/Chicago)."""
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
+
+
+def _epoch(naive_utc):
+    return calendar.timegm(naive_utc.timetuple())
+
+
+def test_alarm_datetimes_insert_as_utc_in_a_chicago_process(monkeypatch):
+    client, _, _ = _stub(monkeypatch, _silent())
+    _env(monkeypatch, False)
+    with _tz("America/Chicago"):
+        before = _epoch(_now())
+        assert cli.main(["run", "--conf", "x", "--no-publish"]) == 0
+        after = _epoch(_now())
+        (table, data, cols), = client.inserts
+        row = dict(zip(cols, data[0]))
+        for k in ("first_seen", "last_seen", "updated_at"):
+            assert before <= int(row[k].timestamp()) <= after, k
+
+
+def test_load_map_loaded_at_inserts_as_utc_in_a_chicago_process(monkeypatch):
+    client, _, _ = _stub(monkeypatch)
+    line = json.dumps({"name": "A", "grid6": "EN16ov", "source": "ft8", "reporter": "A1",
+                       "is_alias": 0, "expect_add": [], "expect_drop": []})
+    monkeypatch.setattr(sys, "stdin", __import__("io").StringIO(line + "\n"))
+    with _tz("America/Chicago"):
+        before = _epoch(_now())
+        assert cli.main(["load-map", "--conf", "x"]) == 0
+        after = _epoch(_now())
+        (table, data, cols), = client.inserts
+        v = dict(zip(cols, data[0]))["loaded_at"]
+        assert before <= int(v.timestamp()) <= after

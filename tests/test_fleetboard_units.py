@@ -27,3 +27,7 @@ def test_timer():
     assert t["Timer"]["OnCalendar"] == "*:0/5" and t["Timer"]["Persistent"] == "true"
     assert "RandomizedDelaySec" not in t["Timer"]
     assert t["Install"]["WantedBy"] == "timers.target"
+
+
+def test_service_runs_in_utc():
+    assert _unit("fleetboard.service")["Service"]["Environment"] == "TZ=UTC"
