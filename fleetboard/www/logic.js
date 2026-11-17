@@ -68,13 +68,14 @@ function newestArrival(sources) {
   return m;
 }
 
-function cellText(row, column, nowMs) {
+// stale: the board is older than STALE_AFTER_S; text health (✓) must not outlive its colour.
+function cellText(row, column, nowMs, stale) {
   const sources = parseJson(row.sources);
   switch (column) {
     case "STATION": return row.station + (row.grid6 ? " " + row.grid6 : "");
     case "ON AIR": {
       if (row.verdict === "grey") return "no data yet";
-      if (row.verdict !== "off") return "✓";
+      if (row.verdict !== "off") return stale ? "stale" : "✓";
       const t = newestArrival(sources);
       return t === null ? "✗" : "✗ " + ageText((nowMs === undefined ? Date.now() : nowMs) / 1000 - t);
     }
@@ -83,13 +84,14 @@ function cellText(row, column, nowMs) {
     case "CLIENTS": {
       const bad = Object.keys(sources).filter((k) => sources[k] && sources[k].expected && sources[k].state !== "ok")
         .map((k) => SOURCE_NAMES[k] || k);
-      return bad.length ? bad.join(", ") : "✓";
+      return bad.length ? bad.join(", ") : stale ? "—" : "✓";
     }
     case "SPOTS vs USUAL": {
       const v = parseJson(row.spots_vs_usual);
-      const parts = Object.keys(v).map((k) => {
+      const parts = Object.keys(v).filter((k) => v[k] && typeof v[k] === "object").map((k) => {
         const last = Number(v[k].last3h), usual = Number(v[k].usual3h);
-        return (SPOT_NAMES[k] || k) + " " + last + " / " + usual + (last >= LOW_FRACTION * usual ? " ✓" : " low");
+        return (SPOT_NAMES[k] || k) + " " + last + " / " + usual +
+          (last >= LOW_FRACTION * usual ? (stale ? "" : " ✓") : " low");
       });
       return parts.length ? parts.join("; ") : "—";
     }
@@ -108,7 +110,7 @@ function bannerText(alarms) {
 
 function detailLines(numbersText) {
   const n = parseJson(numbersText);
-  return Object.keys(n).sort().map((k) => k + ": " + n[k]);
+  return Object.keys(n).sort().map((k) => k + ": " + (n[k] !== null && typeof n[k] === "object" ? JSON.stringify(n[k]) : n[k]));
 }
 
 function coerceRows(rows, meta) {

@@ -93,6 +93,16 @@ async function refresh() {
 }
 
 function render() {
+  try { renderBoard(); } catch (e) {
+    $("board").innerHTML = "";
+    $("boardbox").classList.remove("stale-board");
+    $("banner").textContent = "";
+    $("stalebar").textContent = "No board can be shown: the data could not be read (" + e.message + ").";
+    $("detail").hidden = true;
+  }
+}
+
+function renderBoard() {
   const now = Date.now();
   const board = $("board"), banner = $("banner"), stalebar = $("stalebar"), asof = $("asof");
   if (!res.data) {
@@ -126,7 +136,7 @@ function render() {
         const cells = COLUMNS.map(c => {
           if (c === "STATION") return '<td><button type="button" class="linkish" data-station="' + esc(r.station) + '">' +
             esc(r.station) + '</button> <span class="grid6">' + esc(r.grid6) + "</span></td>";
-          return '<td class="mono">' + esc(cellText(r, c, now)) + "</td>";
+          return '<td class="mono">' + esc(cellText(r, c, now, stale)) + "</td>";
         });
         return '<tr class="row v-' + esc(v) + '">' + cells.join("") + "</tr>";
       }).join("") + "</tbody>";

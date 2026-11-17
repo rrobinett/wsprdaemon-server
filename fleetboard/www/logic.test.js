@@ -105,3 +105,23 @@ test("loadAll with no endpoint answering reports the error and the last good tim
   assert.equal(again.data, null, "old rows are never kept on screen");
   assert.equal(again.lastGoodMs, NOW - 120000);
 });
+
+test("stale board: ON AIR says stale, off keeps its age, no tick survives", () => {
+  assert.equal(L.cellText(row({}), "ON AIR", NOW, true), "stale");
+  const old = JSON.stringify({wspr_noise: {expected: true, last_arrival_utc: NOW / 1000 - 7200, state: "quiet"}});
+  assert.equal(L.cellText(row({verdict: "off", sources: old}), "ON AIR", NOW, true), "✗ 2 h");
+  assert.ok(!L.cellText(row({}), "CLIENTS", NOW, true).includes("✓"));
+  const v = JSON.stringify({wspr_spots: {last3h: 40, usual3h: 100}, ft8: {last3h: 5, usual3h: 100}});
+  const t = L.cellText(row({spots_vs_usual: v}), "SPOTS vs USUAL", NOW, true);
+  assert.equal(t, "wspr 40 / 100; ft8 5 / 100 low");
+  assert.ok(!t.includes("✓"));
+});
+
+test("null entry in spots_vs_usual does not throw", () => {
+  const v = JSON.stringify({ft8: null, wspr_spots: {last3h: 1, usual3h: 100}});
+  assert.equal(L.cellText(row({spots_vs_usual: v}), "SPOTS vs USUAL"), "wspr 1 / 100 low");
+});
+
+test("detailLines stringifies nested values", () => {
+  assert.deepEqual(L.detailLines(JSON.stringify({a: {b: 1}, c: 2})), ['a: {"b":1}', "c: 2"]);
+});
