@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import sys
 import types as _types
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -16,12 +16,12 @@ for _mod in ('clickhouse_connect', 'clickhouse_driver'):
         sys.modules[_mod] = _stub
 
 from fleetboard.alarms import Alarm  # noqa: E402
-from fleetboard.board import build  # noqa: E402
+from fleetboard.board import SCHEMAS, build  # noqa: E402
 from fleetboard.checks import Finding  # noqa: E402
 from fleetboard.stations import Station, StationActivity  # noqa: E402
 
 NOW = datetime(2026, 11, 16, 12, 10, 0)
-BUILT = NOW.replace(tzinfo=None).timestamp()
+BUILT = NOW.replace(tzinfo=timezone.utc).timestamp()
 
 
 def _st(name, grid="EN16ov"):
@@ -44,6 +44,10 @@ def test_public_rows_carry_no_ack_fields():
     row = out["fleet_alarms"][0]
     assert row["state"] == "acknowledged"
     assert not {"acked_by", "note"} & set(row)
+    for r in out["fleet_alarms"]:
+        assert set(r) == {c for c, _ in SCHEMAS["fleet_alarms"]}
+    for r in out["fleet_board"]:
+        assert set(r) == {c for c, _ in SCHEMAS["fleet_board"]}
 
 
 def test_grid6_truncates_finer_grids():

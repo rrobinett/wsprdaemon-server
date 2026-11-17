@@ -16,6 +16,7 @@ from fleetboard import alarms as al
 from fleetboard import board, ddl, sources
 from fleetboard.checks import evaluate
 from fleetboard.stations import fold, load_map
+from sigmondb import publish
 from sigmondb.cli import connect
 
 DEFAULT_CONF = "/etc/wsprdaemon/clickhouse.conf"
@@ -91,25 +92,6 @@ def cmd_load_map(a):
     return 0
 
 
-def publish_board(tables, hosts, user, password, timeout, out=print):
-    """Replace both tables on every host; one line each; a failure never stops the rest."""
-    from sigmondb import publish
-    fails = []
-    for host in hosts:
-        ch = publish.ChHttp(host, user, password, timeout=timeout)
-        for table, schema in board.SCHEMAS.items():
-            try:
-                n = publish.replace_table(ch, table, tables[table], schema=schema,
-                                          database=ddl.DATABASE)
-                out("%s %s: %d rows" % (host, table, n))
-            except Exception as e:
-                msg = ch.scrub(str(e) if isinstance(e, publish.PublishError)
-                               else "%s: %s" % (type(e).__name__, e))
-                fails.append((host, table, msg))
-                out("%s %s: FAILED: %s" % (host, table, msg))
-    return fails
-
-
 def cmd_run(a):
     user, password = os.environ.get("CH_PUB_USER"), os.environ.get("CH_PUB_PASSWORD")
     hosts = (os.environ.get("CH_PUB_HOSTS") or "").split()
@@ -145,19 +127,15 @@ def cmd_run(a):
     if a.no_publish:
         return 0
     tables = board.build(stations, acts, list(merged.values()), findings,
-                         publish_now(), excluded_hours=hours, now=now)
-    fails = publish_board(tables, hosts, user, password, a.timeout,
-                          out=lambda s: print(s, flush=True))
+                         publish.now_utc(), excluded_hours=hours, now=now)
+    fails = publish.publish(tables, hosts, user, password, timeout=a.timeout,
+                            out=lambda s: print(s, flush=True), names=tuple(board.SCHEMAS),
+                            schemas=board.SCHEMAS, database=ddl.DATABASE)
     if fails:
         print("run: %d of %d host+table replacements FAILED"
               % (len(fails), len(hosts) * len(board.SCHEMAS)), file=sys.stderr)
         return 1
     return 0
-
-
-def publish_now():
-    from sigmondb import publish
-    return publish.now_utc()
 
 
 def build_parser():

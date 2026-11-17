@@ -530,17 +530,22 @@ def replace_table(ch, table, rows, schema=None, database=DATABASE):
     return len(rows)
 
 
-def publish(tables, hosts, user, password, urlopen=None, out=print, timeout=30.0):
+def publish(tables, hosts, user, password, urlopen=None, out=print, timeout=30.0,
+            names=None, schemas=None, database=DATABASE):
     """Replace every table on every host.  One line per host+table.  Returns the failures
-    as (host, table, message); a failure never stops the next table or host."""
+    as (host, table, message); a failure never stops the next table or host.
+    names, schemas and database default to this module's own; fleetboard passes its."""
+    names = TABLES if names is None else names
     fails = []
     for host in hosts:
         ch = ChHttp(host, user, password, timeout=timeout, urlopen=urlopen)
-        for table in TABLES:
+        for table in names:
             if table not in tables:   # not built this run: the host keeps its last copy
                 continue
             try:
-                n = replace_table(ch, table, tables[table])
+                n = replace_table(ch, table, tables[table],
+                                  schema=None if schemas is None else schemas[table],
+                                  database=database)
                 out("%s %s: %d rows" % (host, table, n))
             except Exception as e:
                 msg = ch.scrub(str(e) if isinstance(e, PublishError)

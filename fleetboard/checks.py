@@ -115,8 +115,8 @@ def _usual(sa: StationActivity, source: str, now: datetime,
            excluded_hours: set[datetime]) -> tuple[int, float, float] | None:
     """The last 3 complete hours against each hour's median over the past 7
     days, leaving out hours the station sat under an alarm.  Returns
-    {"last3h", "usual3h"}, or None with no baseline or under 7 days of history.
-    Returns (last, usual, mean baseline per hour) or None."""
+    (last, usual, mean baseline per hour), or None with no baseline or under
+    7 days of history."""
     days = sa.days_active.get(source)
     if not days or (now.date() - min(days)).days < BASELINE_DAYS:
         return None
