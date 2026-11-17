@@ -6,9 +6,11 @@ fleet_alarms (one row per live alarm).  Public output carries station names and
 6-character grid squares only.  An alarm row leaves out acked_by and note: an
 acknowledgement's author and wording stay private.
 
-rank orders the board worst first: off the air, then stations with live alarms
-(most alarms first), then the rest, ties by name.  A grey station, one we cannot
-judge, sorts last.
+rank orders the board worst first: off the air, then stations with open alarms
+(most first), then the rest, ties by name.  A grey station, one we cannot judge,
+sorts last.  An acknowledged alarm means an admin is on it, so it does not count
+toward rank: a station whose only live alarms are acknowledged ranks with the
+healthy, while its verdict still shows the condition and n_acked counts them.
 """
 from __future__ import annotations
 
@@ -23,7 +25,8 @@ SCHEMAS = {
     "fleet_board": [
         ("station", "String"), ("grid6", "String"), ("verdict", "String"),
         ("sources", "String"), ("spots_vs_usual", "String"),
-        ("n_open", "UInt16"), ("rank", "UInt16"), ("built_at_utc", "Float64"),
+        ("n_open", "UInt16"), ("n_acked", "UInt16"), ("rank", "UInt16"),
+        ("built_at_utc", "Float64"),
     ],
     "fleet_alarms": [
         ("station", "String"), ("check", "String"), ("subject", "String"),
@@ -82,8 +85,10 @@ def build(stations, acts, alarms, findings: list[Finding], built_at: float,
         excluded_hours = alarm_hours(alarms, now - timedelta(days=BASELINE_DAYS + 1))
     live = [a for a in alarms if a.state in LIVE]
     n_open: dict[str, int] = {}
+    n_acked: dict[str, int] = {}
     for a in live:
-        n_open[a.station] = n_open.get(a.station, 0) + 1
+        count = n_open if a.state == "open" else n_acked
+        count[a.station] = count.get(a.station, 0) + 1
     rows = []
     lmap = live_map(live)
     for st in stations:
@@ -94,12 +99,15 @@ def build(stations, acts, alarms, findings: list[Finding], built_at: float,
             "verdict": verdict(st, sa, findings),
             "sources": _sources_json(st, sa, findings, expected),
             "spots_vs_usual": _usual_json(sa, now, excluded_hours.get(st.name, set()), expected),
-            "n_open": n_open.get(st.name, 0), "rank": 0, "built_at_utc": built_at,
+            "n_open": n_open.get(st.name, 0), "n_acked": n_acked.get(st.name, 0),
+            "rank": 0, "built_at_utc": built_at,
         })
 
     def order(r):
         if r["verdict"] == "grey":
             return (3, 0, r["station"])
+        if r["n_acked"] and not r["n_open"]:
+            return (2, 0, r["station"])
         if r["verdict"] == "off":
             return (0, 0, r["station"])
         if r["n_open"]:

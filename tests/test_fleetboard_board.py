@@ -87,3 +87,26 @@ def test_live_quiet_source_shows_expected_and_quiet():
     r = build([_st("A")], {"A": sa}, [a], [f], BUILT, now=NOW)["fleet_board"][0]
     assert json.loads(r["sources"])["ft8"]["expected"] is True
     assert json.loads(r["sources"])["ft8"]["state"] == "quiet"
+
+
+def test_ack_takes_a_station_off_the_top():
+    # ACKOFF: off the air, acknowledged.  ACKW: one acked quiet alarm.  Both
+    # rank with the healthy; their verdicts still show the condition.
+    sts = [_st(n) for n in ("ACKOFF", "ACKW", "W1", "OK", "OFF")]
+    acts = {n: _sa() for n in ("ACKOFF", "ACKW", "W1", "OK", "OFF")}
+    findings = [Finding("OFF", "off_air", "", {}), Finding("ACKOFF", "off_air", "", {}),
+                Finding("ACKW", "client_quiet", "s0", {}), Finding("W1", "client_quiet", "s0", {})]
+    alarms = (_live("OFF", check="off_air") + _live("ACKOFF", check="off_air", state="acknowledged")
+              + _live("ACKW", state="acknowledged") + _live("W1", 2)
+              + [Alarm("W1", "client_quiet", "s9", NOW, NOW, "acknowledged", 0, "{}", NOW)])
+    out = build(sts, acts, alarms, findings, BUILT, now=NOW)
+    order = [r["station"] for r in sorted(out["fleet_board"], key=lambda r: r["rank"])]
+    assert order == ["OFF", "W1", "ACKOFF", "ACKW", "OK"]
+    by = {r["station"]: r for r in out["fleet_board"]}
+    assert (by["W1"]["n_open"], by["W1"]["n_acked"]) == (2, 1)
+    assert (by["ACKOFF"]["n_open"], by["ACKOFF"]["n_acked"]) == (0, 1)
+    assert by["ACKOFF"]["verdict"] == "off" and by["ACKW"]["verdict"] == "warn"
+
+
+def test_board_schema_carries_n_acked():
+    assert ("n_acked", "UInt16") in SCHEMAS["fleet_board"]

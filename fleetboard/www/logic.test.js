@@ -125,3 +125,16 @@ test("null entry in spots_vs_usual does not throw", () => {
 test("detailLines stringifies nested values", () => {
   assert.deepEqual(L.detailLines(JSON.stringify({a: {b: 1}, c: 2})), ['a: {"b":1}', "c: 2"]);
 });
+
+test("ALARMS shows acknowledged alarms beside the open count", () => {
+  assert.equal(L.cellText(row({n_open: 2, n_acked: 0}), "ALARMS"), "2");
+  assert.equal(L.cellText(row({n_open: 1, n_acked: 2}), "ALARMS"), "1 (+2 acked)");
+  assert.equal(L.cellText(row({n_open: 0, n_acked: "1"}), "ALARMS"), "0 (+1 acked)");
+  assert.equal(L.cellText(row({n_open: 0}), "ALARMS"), "0");
+});
+
+test("alarmHeading marks an acknowledged alarm", () => {
+  assert.equal(L.alarmHeading({check: "off_air", subject: "", state: "open"}), "off_air (open)");
+  assert.equal(L.alarmHeading({check: "client_quiet", subject: "ft8", state: "acknowledged"}),
+    "client_quiet ft8 (ACKNOWLEDGED: an admin is on it)");
+});

@@ -55,6 +55,8 @@ tr.v-off td:first-child { border-left-color: var(--off); }
 .panel[hidden] { display: none; }
 .panel pre { margin: 0; font: 12.5px/1.5 var(--f-mono); white-space: pre-wrap; color: var(--ink-2); }
 .empty { color: var(--ink-3); font-style: italic; }
+.alarm { border-left: 3px solid var(--warn); padding-left: 10px; }
+.alarm.acked { border-left-color: var(--grey); color: var(--ink-2); }
 .foot { font-size: 12.5px; color: var(--ink-3); display: grid; gap: 4px; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
@@ -72,6 +74,7 @@ tr.v-off td:first-child { border-left-color: var(--off); }
   <section class="panel" id="detail" aria-live="polite" hidden></section>
   <footer class="foot">
     <div>Data: the public, read-only tables fleet_board and fleet_alarms of sigmondb_public, rebuilt every five minutes.  Positions show a 6-character grid square, never the exact site.</div>
+    <div>ALARMS counts open alarms; "(+2 acked)" adds alarms an admin has acknowledged and is working on, which no longer lift a station up the board.</div>
     <div>Row colour never stands alone: the ON AIR column also says ✓, ✗ with an age, or "no data yet".  Grey means no history yet, or a board older than 15 minutes.  DEVICES and CAPACITY arrive in a later stage.</div>
   </footer>
 </div>
@@ -154,8 +157,9 @@ function renderDetail() {
     '</h2><div><button type="button" class="linkish" id="close">Close</button></div>';
   if (!row) h += '<p class="empty">This station is not on the board.</p>';
   else if (!alarms.length) h += '<p class="empty">No open alarms for this station.</p>';
+  alarms.sort((x, y) => (x.state === "acknowledged") - (y.state === "acknowledged"));
   for (const a of alarms) {
-    h += "<div><b>" + esc(a.check) + "</b> " + esc(a.subject) + " (" + esc(a.state) + ")<br>" +
+    h += '<div class="alarm' + (a.state === "acknowledged" ? " acked" : "") + '"><b>' + esc(alarmHeading(a)) + "</b><br>" +
       "First seen " + esc(utcText(a.first_seen_utc)) + "; last seen " + esc(utcText(a.last_seen_utc)) +
       "<pre>" + esc(detailLines(a.numbers).join("\n")) + "</pre></div>";
   }

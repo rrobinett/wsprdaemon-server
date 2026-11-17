@@ -95,7 +95,10 @@ function cellText(row, column, nowMs, stale) {
       });
       return parts.length ? parts.join("; ") : "—";
     }
-    case "ALARMS": return String(Number(row.n_open) || 0);
+    case "ALARMS": {
+      const open = Number(row.n_open) || 0, acked = Number(row.n_acked) || 0;
+      return acked ? open + " (+" + acked + " acked)" : String(open);
+    }
     default: return "";
   }
 }
@@ -106,6 +109,12 @@ function bannerText(alarms) {
   if (!a) return null;
   return a.station + " has stopped storing data since " + utcText(a.first_seen_utc) +
     "; stations below may look silent";
+}
+
+// An acknowledged alarm is still live; the mark says an admin has taken it on.
+function alarmHeading(a) {
+  return a.check + (a.subject ? " " + a.subject : "") +
+    (a.state === "acknowledged" ? " (ACKNOWLEDGED: an admin is on it)" : " (" + a.state + ")");
 }
 
 function detailLines(numbersText) {
@@ -172,6 +181,6 @@ function maxBuiltAt(rows) {
 }
 
 if (typeof module !== "undefined") {
-  module.exports = {ENDPOINTS, COLUMNS, STALE_AFTER_S, sortRows, staleness, cellText, bannerText, detailLines,
+  module.exports = {ENDPOINTS, COLUMNS, STALE_AFTER_S, sortRows, staleness, cellText, bannerText, alarmHeading, detailLines,
     parseHash, formatHash, fetchTable, loadAll, maxBuiltAt, utcText, ageText, parseJson};
 }
