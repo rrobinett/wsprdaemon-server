@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleet Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #f6f7f5; --surface: #fcfcfb; --ink: #111413; --ink-2: #4d5350; --ink-3: #7d8480;
+  --rule: #dde1dd; --ok: #1baf7a; --warn: #eb6834; --off: #c2362b; --grey: #7d8480; --focus: #2a78d6;
+  --f-display: "Instrument Sans", "Segoe UI", system-ui, sans-serif;
+  --f-body: "Instrument Sans", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #141615; --surface: #1a1a19; --ink: #eef0ec; --ink-2: #b9beb8; --ink-3: #8a908b;
+  --rule: #303431; --ok: #199e70; --warn: #d95926; --off: #e5645a; --grey: #8a908b; --focus: #3987e5;
+  color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #141615; --surface: #1a1a19; --ink: #eef0ec; --ink-2: #b9beb8; --ink-3: #8a908b;
+  --rule: #303431; --ok: #199e70; --warn: #d95926; --off: #e5645a; --grey: #8a908b; --focus: #3987e5;
+  color-scheme: dark }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.5 var(--f-body); }
+.wrap { max-width: 1180px; margin: 0 auto; padding-block: 28px 56px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 20px; grid-template-columns: minmax(0, 1fr); }
+header { display: grid; gap: 6px; }
+h1 { font: 600 clamp(24px, 3.4vw, 32px)/1.15 var(--f-display); margin: 0; letter-spacing: -0.01em; }
+h2 { font: 600 18px/1.3 var(--f-display); margin: 0 0 8px; }
+.lede { color: var(--ink-2); max-width: 68ch; margin: 0; }
+.meta { font: 12px/1.4 var(--f-mono); color: var(--ink-3); letter-spacing: 0.02em; }
+.banner { font-size: 14px; border-left: 3px solid var(--off); padding: 8px 12px; background: var(--surface); }
+.banner[hidden], .banner:empty { display: none; }
+.banner.stale { border-left-color: var(--grey); }
+.tscroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+th, td { text-align: left; padding: 7px 10px 7px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font: 500 11px/1.3 var(--f-body); text-transform: uppercase; letter-spacing: 0.07em; color: var(--ink-3); }
+td.mono { font-family: var(--f-mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+tr.row td:first-child { border-left: 4px solid var(--grey); padding-left: 8px; }
+tr.v-ok td:first-child { border-left-color: var(--ok); }
+tr.v-warn td:first-child { border-left-color: var(--warn); }
+tr.v-off td:first-child { border-left-color: var(--off); }
+.stale-board tr.row td { color: var(--ink-3); }
+.stale-board tr.row td:first-child { border-left-color: var(--grey); }
+.linkish { font: inherit; color: var(--ink); background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline;
+  text-decoration-color: var(--rule); text-underline-offset: 3px; text-align: left; }
+.linkish:hover { text-decoration-color: var(--ink-2); }
+.linkish:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.grid6 { font-family: var(--f-mono); font-size: 12px; color: var(--ink-3); }
+.panel { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 14px; display: grid; gap: 10px; }
+.panel[hidden] { display: none; }
+.panel pre { margin: 0; font: 12.5px/1.5 var(--f-mono); white-space: pre-wrap; color: var(--ink-2); }
+.empty { color: var(--ink-3); font-style: italic; }
+.foot { font-size: 12.5px; color: var(--ink-3); display: grid; gap: 4px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="meta" id="asof">Reading the public data…</div>
+    <h1>Fleet board</h1>
+    <p class="lede">Which stations send data, and whether each one sends what it usually does.  The server judges every station by when its data last arrived, never by the station's own clock.</p>
+  </header>
+  <div class="banner" id="banner" role="status"></div>
+  <div class="banner stale" id="stalebar" role="status"></div>
+  <section class="tscroll" id="boardbox"><table id="board"></table></section>
+  <section class="panel" id="detail" aria-live="polite" hidden></section>
+  <footer class="foot">
+    <div>Data: the public, read-only tables fleet_board and fleet_alarms of sigmondb_public, rebuilt every five minutes.  Positions show a 6-character grid square, never the exact site.</div>
+    <div>Row colour never stands alone: the ON AIR column also says ✓, ✗ with an age, or "no data yet".  Grey means no history yet, or a board older than 15 minutes.  DEVICES and CAPACITY arrive in a later stage.</div>
+  </footer>
+</div>
+<!-- LOGIC -->
+<script>
+"use strict";
+const REFRESH_MS = 60 * 1000;
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+let state = parseHash(location.hash);
+let res = { data: null, error: null, lastGoodMs: null };
+let loaded = false;
+
+async function refresh() {
+  res = await loadAll((u, o) => fetch(u, o), { asOfMs: res.lastGoodMs }, Date.now());
+  loaded = true;
+  render();
+}
+
+function render() {
+  const now = Date.now();
+  const board = $("board"), banner = $("banner"), stalebar = $("stalebar"), asof = $("asof");
+  if (!res.data) {
+    board.innerHTML = "";
+    $("boardbox").classList.remove("stale-board");
+    banner.textContent = "";
+    stalebar.textContent = loaded
+      ? "No public server answered, so no board can be shown.  " +
+        (res.lastGoodMs ? "The last successful load was at " + utcText(res.lastGoodMs / 1000) + "." : "Nothing has loaded yet.")
+      : "";
+    asof.textContent = loaded ? "No data" : "Reading the public data…";
+    $("detail").hidden = true;
+    return;
+  }
+  const rows = sortRows(res.data.board);
+  const built = maxBuiltAt(rows) || maxBuiltAt(res.data.alarms);
+  const stale = staleness(built, now) === "stale";
+  $("boardbox").classList.toggle("stale-board", stale);
+  asof.textContent = "Board built " + (built ? utcText(built) : "at an unknown time") + "; checked " + utcText(now / 1000);
+  stalebar.textContent = stale
+    ? "This board is stale.  The server built it " + (built ? utcText(built) : "at an unknown time") +
+      ", more than 15 minutes ago, so every row is greyed and none can be trusted as current."
+    : "";
+  banner.textContent = bannerText(res.data.alarms) || "";
+  if (!rows.length) {
+    board.innerHTML = '<tr><td class="empty">No stations on the board yet.</td></tr>';
+  } else {
+    board.innerHTML = "<thead><tr>" + COLUMNS.map(c => "<th>" + esc(c) + "</th>").join("") + "</tr></thead><tbody>" +
+      rows.map(r => {
+        const v = stale ? "grey" : r.verdict;
+        const cells = COLUMNS.map(c => {
+          if (c === "STATION") return '<td><button type="button" class="linkish" data-station="' + esc(r.station) + '">' +
+            esc(r.station) + '</button> <span class="grid6">' + esc(r.grid6) + "</span></td>";
+          return '<td class="mono">' + esc(cellText(r, c, now)) + "</td>";
+        });
+        return '<tr class="row v-' + esc(v) + '">' + cells.join("") + "</tr>";
+      }).join("") + "</tbody>";
+  }
+  renderDetail();
+}
+
+function renderDetail() {
+  const box = $("detail");
+  const name = state.station;
+  if (!name || !res.data) { box.hidden = true; return; }
+  const row = res.data.board.find(r => r.station === name);
+  const alarms = res.data.alarms.filter(a => a.station === name && a.check !== "ingest_stalled");
+  let h = "<h2>" + esc(name) + (row ? ' <span class="grid6">' + esc(row.grid6) + "</span>" : "") +
+    '</h2><div><button type="button" class="linkish" id="close">Close</button></div>';
+  if (!row) h += '<p class="empty">This station is not on the board.</p>';
+  else if (!alarms.length) h += '<p class="empty">No open alarms for this station.</p>';
+  for (const a of alarms) {
+    h += "<div><b>" + esc(a.check) + "</b> " + esc(a.subject) + " (" + esc(a.state) + ")<br>" +
+      "First seen " + esc(utcText(a.first_seen_utc)) + "; last seen " + esc(utcText(a.last_seen_utc)) +
+      "<pre>" + esc(detailLines(a.numbers).join("\n")) + "</pre></div>";
+  }
+  box.innerHTML = h;
+  box.hidden = false;
+}
+
+function select(name) {
+  state = { station: name };
+  history.replaceState(null, "", formatHash(state));
+  renderDetail();
+}
+
+$("board").addEventListener("click", e => {
+  const b = e.target.closest("[data-station]");
+  if (b) select(b.dataset.station);
+});
+$("detail").addEventListener("click", e => { if (e.target.id === "close") select(null); });
+window.addEventListener("hashchange", () => { state = parseHash(location.hash); renderDetail(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && state.station) select(null); });
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>

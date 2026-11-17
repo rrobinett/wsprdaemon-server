@@ -6,3 +6,4 @@ files.zip
 *.log
 tar-bulk-loader-state.json
 sigmondb/www/dist/
+fleetboard/www/dist/
