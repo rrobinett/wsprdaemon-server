@@ -11,7 +11,6 @@ tables on each host in CH_PUB_HOSTS.  Credentials for this host come from
 CH_PUB_PASSWORD, CH_PUB_HOSTS), which the unit's EnvironmentFile= sets.
 """
 import argparse
-import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
