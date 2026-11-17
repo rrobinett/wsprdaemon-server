@@ -1,4 +1,8 @@
-"""python -m fleetboard: ddl, load-map, run.
+"""python -m fleetboard: ddl, load-map, ack, run.
+
+load-map and ack write fleet tables, so they run on wd30 with the admin conf
+(wd30's default user is read-only); ops/bin/fleet-map-export --load and
+ops/bin/fleet-alarms ack call them over ssh.
 
 run is the 5-minute job: read the sources, judge every station, move the alarms,
 write the changed alarms to fleet.alarm on this host, then replace the two public
@@ -15,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from fleetboard import alarms as al
 from fleetboard import board, ddl, sources
 from fleetboard.checks import evaluate
-from fleetboard.stations import fold, load_map
+from fleetboard.stations import fold, load_map, parse_map_lines
 from sigmondb import publish
 from sigmondb.cli import connect
 
@@ -86,22 +90,50 @@ def cmd_ddl(a):
 
 
 def cmd_load_map(a):
+    try:
+        parsed = parse_map_lines(sys.stdin)
+    except ValueError as e:
+        print("load-map: refusing the map, fleet.station_map untouched: %s" % e, file=sys.stderr)
+        return 1
     now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
-    rows = []
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        r = json.loads(line)
-        rows.append([r["name"], r["grid6"], r["source"], r["reporter"],
-                     int(r.get("is_alias", 0)), list(r.get("expect_add") or ()),
-                     list(r.get("expect_drop") or ()), now])
+    rows = [[r["name"], r.get("grid6", ""), r["source"], r["reporter"], int(r.get("is_alias", 0)),
+             list(r.get("expect_add") or ()), list(r.get("expect_drop") or ()), now]
+            for r in parsed]
     client = connect(a.conf)
     for s in ddl.statements():
         client.command(s)
     client.command("TRUNCATE TABLE fleet.station_map")
-    if rows:
+    try:
         _insert(client, "fleet.station_map", rows, MAP_COLS)
+    except Exception as e:  # noqa: BLE001 -- any failure here leaves the map empty
+        print("load-map: fleet.station_map is now EMPTY: TRUNCATE ran, INSERT failed (%s). "
+              "Re-run load-map; until then run judges nothing and publishes nothing." % e,
+              file=sys.stderr)
+        return 1
     print("station_map: %d rows" % len(rows))
+    return 0
+
+
+def cmd_ack(a):
+    """Acknowledge the live alarm (station, check, subject): one alarm_ack row
+    naming its first_seen, so the ack covers this instance only."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    client = connect(a.conf)
+    params = {"station": a.station, "check": a.check, "subject": a.subject}
+    res = client.query(
+        "SELECT first_seen FROM fleet.alarm FINAL "
+        "WHERE station = {station:String} AND check = {check:String} "
+        "AND subject = {subject:String} AND state IN ('open', 'acknowledged') "
+        "ORDER BY first_seen DESC LIMIT 1", parameters=params)
+    if not res.result_rows:
+        print("ack: no live alarm for %s %s %s" % (a.station, a.check, a.subject or "(no subject)"),
+              file=sys.stderr)
+        return 1
+    first = _naive(res.result_rows[0][0])
+    _insert(client, "fleet.alarm_ack",
+            [[a.station, a.check, a.subject, first, a.by, a.note, now]], ACK_COLS)
+    print("acknowledged %s %s %s (first seen %s UTC)"
+          % (a.station, a.check, a.subject or "-", first.strftime("%Y-%m-%d %H:%M:%S")))
     return 0
 
 
@@ -165,6 +197,14 @@ def build_parser():
     s = sub.add_parser("load-map", help="JSON Lines on stdin replace fleet.station_map")
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_load_map)
+    s = sub.add_parser("ack", help="acknowledge one live alarm")
+    s.add_argument("--conf", default=DEFAULT_CONF)
+    s.add_argument("--station", required=True)
+    s.add_argument("--check", required=True)
+    s.add_argument("--subject", default="", help="the source; empty for off_air")
+    s.add_argument("--note", required=True)
+    s.add_argument("--by", required=True, help="who acknowledges")
+    s.set_defaults(fn=cmd_ack)
     s = sub.add_parser("run", help="check the stations, move the alarms, publish the board")
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.add_argument("--no-publish", action="store_true",

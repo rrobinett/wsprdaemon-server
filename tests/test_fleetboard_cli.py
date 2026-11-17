@@ -28,21 +28,27 @@ class FakeClient:
     def __init__(self, events, alarm_rows=(), map_rows=None):
         self.events, self.sql, self.alarm_rows = events, [], list(alarm_rows)
         self.map_rows = [("A", "EN16ov", "ft8", "A1", [], [])] if map_rows is None else map_rows
-        self.inserts = []
+        self.inserts, self.commands, self.params, self.ack_rows = [], [], [], []
+        self.fail_insert = False
 
     def command(self, sql):
-        pass
+        self.commands.append(sql)
 
     def query(self, sql, **kw):
         self.sql.append(sql)
+        self.params.append(kw.get("parameters"))
         rows = []
-        if "station_map" in sql:
+        if sql.startswith("SELECT first_seen FROM fleet.alarm"):
+            rows = self.ack_rows
+        elif "station_map" in sql:
             rows = self.map_rows
         elif "fleet.alarm FINAL" in sql:
             rows = self.alarm_rows
         return _types.SimpleNamespace(result_rows=rows)
 
     def insert(self, table, data, column_names=None):
+        if self.fail_insert:
+            raise RuntimeError("Code: 241. MEMORY_LIMIT_EXCEEDED")
         self.inserts.append((table, data, column_names))
         self.events.append("insert " + table)
 
@@ -271,3 +277,80 @@ def test_live_off_air_keeps_a_station_with_aged_out_history_off(monkeypatch):
     assert (row["check"], row["state"], row["false_streak"]) == ("off_air", "acknowledged", 0)
     board = {t: r for t, r, _, _ in published}["fleet_board"]
     assert board[0]["verdict"] == "off"
+
+
+# --- I1: ack and load-map run on wd30 with the admin conf ------------------
+
+def _ack_argv(*extra):
+    return ["ack", "--conf", "x", "--station", "UACNJ", "--check", "off_air",
+            "--subject", "", "--note", "site visit Fri", "--by", "mjh", *extra]
+
+
+def test_ack_inserts_one_row_naming_the_live_first_seen(monkeypatch, capsys):
+    client, _, _ = _stub(monkeypatch)
+    first = datetime(2026, 11, 16, 10, 0, 0)
+    client.ack_rows = [(first,)]
+    with _tz("America/Chicago"):
+        before = _epoch(_now())
+        assert cli.main(_ack_argv()) == 0
+        after = _epoch(_now())
+        (table, data, cols), = client.inserts
+        assert table == "fleet.alarm_ack" and cols == cli.ACK_COLS
+        row = dict(zip(cols, data[0]))
+        assert int(row["first_seen"].timestamp()) == _epoch(first)
+        assert before <= int(row["acked_at"].timestamp()) <= after
+    assert (row["station"], row["check"], row["subject"]) == ("UACNJ", "off_air", "")
+    assert (row["acked_by"], row["note"]) == ("mjh", "site visit Fri")
+    q = next(q for q in client.sql if q.startswith("SELECT first_seen"))
+    assert "FINAL" in q and "state IN ('open', 'acknowledged')" in q
+    assert client.params[-1] == {"station": "UACNJ", "check": "off_air", "subject": ""}
+    assert "acknowledged UACNJ off_air" in capsys.readouterr().out
+
+
+def test_ack_without_live_alarm_exits_1_and_writes_nothing(monkeypatch, capsys):
+    client, _, _ = _stub(monkeypatch)
+    assert cli.main(_ack_argv()) == 1
+    assert "no live alarm" in capsys.readouterr().err
+    assert not client.inserts
+
+
+def _map_line(**over):
+    r = {"name": "A", "grid6": "EN16ov", "source": "ft8", "reporter": "A1",
+         "is_alias": 0, "expect_add": [], "expect_drop": []}
+    r.update(over)
+    return json.dumps(r) + "\n"
+
+
+def _load(monkeypatch, client, text):
+    monkeypatch.setattr(sys, "stdin", __import__("io").StringIO(text))
+    return cli.main(["load-map", "--conf", "x"])
+
+
+def test_load_map_refuses_bad_input_before_truncate(monkeypatch, capsys):
+    bad = ["", "not json\n", _map_line(source="wspr"), _map_line(name=""),
+           _map_line(reporter=""), _map_line(host="kph1"), _map_line(grid6="EN16ov12"),
+           _map_line(expect_add=["nope"]), _map_line(is_alias=2), '["A"]\n',
+           _map_line() + _map_line(source="bogus")]
+    for text in bad:
+        client, _, _ = _stub(monkeypatch)
+        assert _load(monkeypatch, client, text) == 1, text
+        assert not any("TRUNCATE" in c for c in client.commands), text
+        assert not client.inserts, text
+    assert "load-map" in capsys.readouterr().err
+
+
+def test_load_map_says_loudly_when_insert_fails_after_truncate(monkeypatch, capsys):
+    client, _, _ = _stub(monkeypatch)
+    client.fail_insert = True
+    assert _load(monkeypatch, client, _map_line()) == 1
+    assert any("TRUNCATE" in c for c in client.commands)
+    err = capsys.readouterr().err
+    assert "EMPTY" in err and "MEMORY_LIMIT_EXCEEDED" in err
+
+
+def test_load_map_good_input_truncates_then_inserts(monkeypatch):
+    client, _, _ = _stub(monkeypatch)
+    assert _load(monkeypatch, client, _map_line() + "\n" + _map_line(source="codar", is_alias=1)) == 0
+    assert client.commands[-1] == "TRUNCATE TABLE fleet.station_map"
+    (table, data, cols), = client.inserts
+    assert [r[:5] for r in data] == [["A", "EN16ov", "ft8", "A1", 0], ["A", "EN16ov", "codar", "A1", 1]]

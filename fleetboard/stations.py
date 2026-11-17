@@ -7,10 +7,15 @@ checks judge a station, not a spelling.  A reporter in no station is ignored.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
 from .sources import SOURCES, Activity
+
+MAP_KEYS = ("name", "grid6", "source", "reporter", "is_alias", "expect_add", "expect_drop")
+_REQUIRED = ("name", "source", "reporter")
+GRID_CHARS = 6
 
 
 @dataclass(frozen=True)
@@ -28,6 +33,52 @@ class StationActivity:
     days_active: dict[str, frozenset[date]] = field(default_factory=dict)
     usual_gap_s: dict[str, float] = field(default_factory=dict)
     hourly: dict[str, dict[datetime, int]] = field(default_factory=dict)
+
+
+def _check_row(r) -> str | None:
+    """Why a map row is unfit, or None.  Unknown keys are refused, not dropped:
+    the map must carry only what the board may show (no hosts or reach)."""
+    if not isinstance(r, dict):
+        return "not a JSON object"
+    extra = sorted(set(r) - set(MAP_KEYS))
+    if extra:
+        return "unknown keys %s" % extra
+    for k in _REQUIRED:
+        if not isinstance(r.get(k), str) or not r[k]:
+            return "%s must be a non-empty string" % k
+    if r["source"] not in SOURCES:
+        return "unknown source %r" % r["source"]
+    grid = r.get("grid6", "")
+    if not isinstance(grid, str) or len(grid) > GRID_CHARS:
+        return "grid6 must be a string of at most %d characters" % GRID_CHARS
+    if r.get("is_alias", 0) not in (0, 1):
+        return "is_alias must be 0 or 1"
+    for k in ("expect_add", "expect_drop"):
+        v = r.get(k) or []
+        if not isinstance(v, list) or any(x not in SOURCES for x in v):
+            return "%s must list known sources" % k
+    return None
+
+
+def parse_map_lines(lines) -> list[dict]:
+    """JSON Lines -> map rows, every one checked.  Raises ValueError naming the
+    first bad line, or when there is no row at all, so load-map can refuse
+    before it empties fleet.station_map."""
+    rows = []
+    for n, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError as e:
+            raise ValueError("line %d: not JSON (%s)" % (n, e)) from None
+        why = _check_row(r)
+        if why:
+            raise ValueError("line %d: %s" % (n, why))
+        rows.append(r)
+    if not rows:
+        raise ValueError("no rows")
+    return rows
 
 
 def load_map(rows: list[dict]) -> list[Station]:
