@@ -358,3 +358,10 @@ def test_numbers_are_json_serialisable():
     sa.last_arrival.pop("ft8")
     for f in _run([(st, sa)]):
         json.dumps(f.numbers)
+
+
+def test_spots_vs_usual_matches_activity_low_numbers():
+    from fleetboard.checks import spots_vs_usual
+    st, sa = _spots(100, 50)
+    assert spots_vs_usual(sa, "wspr_spots", NOW, set()) == {"last3h": 50, "usual3h": 300}
+    assert spots_vs_usual(sa, "ft8", NOW, set()) is None

@@ -111,10 +111,12 @@ def _client_quiet(station: Station, sa: StationActivity, now: datetime,
     return out
 
 
-def _activity_low(station: Station, sa: StationActivity, now: datetime,
-                  source: str, alarm: set[datetime]) -> Finding | None:
+def _usual(sa: StationActivity, source: str, now: datetime,
+           excluded_hours: set[datetime]) -> tuple[int, float, float] | None:
     """The last 3 complete hours against each hour's median over the past 7
-    days, leaving out hours the station sat under an alarm."""
+    days, leaving out hours the station sat under an alarm.  Returns
+    {"last3h", "usual3h"}, or None with no baseline or under 7 days of history.
+    Returns (last, usual, mean baseline per hour) or None."""
     days = sa.days_active.get(source)
     if not days or (now.date() - min(days)).days < BASELINE_DAYS:
         return None
@@ -124,13 +126,30 @@ def _activity_low(station: Station, sa: StationActivity, now: datetime,
     baselines = []
     for h in hours:
         past = [h - timedelta(days=d) for d in range(1, BASELINE_DAYS + 1)]
-        kept = [counts.get(p, 0) for p in past if p not in alarm]
+        kept = [counts.get(p, 0) for p in past if p not in excluded_hours]
         if not kept:
             return None
         baselines.append(median(kept))
-    last = sum(counts.get(h, 0) for h in hours)
-    usual = sum(baselines)
-    if mean(baselines) >= LOW_MIN_MEDIAN_PER_H and last < LOW_FRACTION * usual:
+    return sum(counts.get(h, 0) for h in hours), sum(baselines), mean(baselines)
+
+
+def spots_vs_usual(sa: StationActivity, source: str, now: datetime,
+                   excluded_hours: set[datetime]) -> dict | None:
+    """{"last3h", "usual3h"} for one source, or None with no baseline or under
+    7 days of history.  The activity_low check and the public board share it."""
+    r = _usual(sa, source, now, excluded_hours)
+    if r is None:
+        return None
+    return {"last3h": int(r[0]), "usual3h": int(round(r[1]))}
+
+
+def _activity_low(station: Station, sa: StationActivity, now: datetime,
+                  source: str, alarm: set[datetime]) -> Finding | None:
+    r = _usual(sa, source, now, alarm)
+    if r is None:
+        return None
+    last, usual, mean_base = r
+    if mean_base >= LOW_MIN_MEDIAN_PER_H and last < LOW_FRACTION * usual:
         return Finding(station.name, "activity_low", source,
                        {"last3h": int(last), "usual3h": int(round(usual))})
     return None
