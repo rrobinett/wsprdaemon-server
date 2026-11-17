@@ -62,9 +62,15 @@ def expected_sources(station: Station, sa: StationActivity) -> set[str]:
 
 def _off_air(station: Station, sa: StationActivity, now: datetime) -> Finding | None:
     """No row from any source for 30 min, or 3x the slowest usual gap when every
-    expected source is slow (CODAR, HFDL)."""
+    expected source is slow (CODAR, HFDL).
+
+    A station with no expected source that has a gap (new, or all dropped) is
+    judged by the gaps of every source it has; a slow-only newcomer must not
+    cry wolf at 30 min.  The bare floor applies only with no gaps at all."""
     expected = expected_sources(station, sa)
     gaps = [sa.usual_gap_s[s] for s in expected if s in sa.usual_gap_s]
+    if not gaps:
+        gaps = list(sa.usual_gap_s.values())
     if any(g <= FAST_SOURCE_MAX_GAP_S for g in gaps):
         threshold = OFF_AIR_MIN_S
     else:
@@ -135,8 +141,11 @@ def _source_findings(station: Station, sa: StationActivity, now: datetime,
     never = _never_started(station, sa, now)
     unstarted = {f.subject for f in never}
     expected = expected_sources(station, sa)
-    out = never + _client_quiet(station, sa, now, expected - unstarted)
-    for source in sorted(expected & set(HOURLY_SOURCES)):
+    quiet = _client_quiet(station, sa, now, expected - unstarted)
+    out = never + quiet
+    # One source, one alarm: a quiet source's low count is the same fault.
+    quiet_sources = {f.subject for f in quiet}
+    for source in sorted((expected & set(HOURLY_SOURCES)) - quiet_sources):
         f = _activity_low(station, sa, now, source, alarm)
         if f:
             out.append(f)

@@ -47,7 +47,8 @@ def _live(name="A", add=(), drop=()):
 
 def _run(pairs, alarm_hours=None, bystanders=2):
     """Evaluate `pairs` beside healthy bystanders, which raise no findings.
-    The ingest tests pass bystanders=0 to control N exactly."""
+    They keep the single-station tests independent of INGEST_MIN_STATIONS;
+    the ingest tests pass bystanders=0 to control N exactly."""
     pairs = list(pairs) + [_live(f"ZZ{i}") for i in range(bystanders)]
     return evaluate([st for st, _ in pairs], {st.name: sa for st, sa in pairs},
                     NOW, alarm_hours or {})
@@ -112,6 +113,19 @@ def test_off_air_when_history_but_no_arrival():
     assert fs[0].numbers["silence_s"] is None
 
 
+
+def test_off_air_uses_every_gap_when_no_source_is_expected():
+    # A new station: hfdl on 1 day only, so nothing is expected yet.  Its gap
+    # still sets the threshold (3 x 2 h), rather than the 30-min floor.
+    st = _st()
+    sa = _add(StationActivity(), "hfdl", ago=timedelta(hours=1), gap=7200.0, ndays=1)
+    assert expected_sources(st, sa) == set()
+    assert _run([(st, sa)]) == []
+    sa.last_arrival["hfdl"] = NOW - timedelta(hours=6, minutes=1)
+    fs = _run([(st, sa)])
+    assert _checks(fs) == [("A", "off_air", "")]
+    assert fs[0].numbers["threshold_s"] == 3 * 7200
+
 # --- client quiet ----------------------------------------------------------
 
 def test_client_quiet_threshold_is_3x_gap_floored_at_30_min():
@@ -154,6 +168,12 @@ def test_never_started_needs_expect_add_and_7_days_silence():
     sa.last_arrival["codar"] = NOW - timedelta(days=2)
     assert _checks(_run([(st, sa)])) == [("K3LR", "client_quiet", "codar")]
 
+
+
+def test_never_started_counts_a_day_exactly_7_days_back_as_silent():
+    st, sa = _live("K3LR", add=("codar",))
+    sa.days_active["codar"] = frozenset({(NOW - timedelta(days=7)).date()})
+    assert _checks(_run([(st, sa)])) == [("K3LR", "never_started", "codar")]
 
 def test_expect_drop_beats_expect_add():
     st, sa = _live(add=("codar",), drop=("codar",))
@@ -216,6 +236,19 @@ def test_under_7_days_history_raises_no_activity_alarm():
     st, sa = _spots(100, 50, hist_days=5)
     assert _run([(st, sa)]) == []
 
+
+
+def test_activity_low_fires_with_history_exactly_7_days_back():
+    st, sa = _spots(100, 50, hist_days=7)
+    assert min(sa.days_active["wspr_spots"]) == NOW.date() - timedelta(days=7)
+    assert _checks(_run([(st, sa)])) == [("A", "activity_low", "wspr_spots")]
+
+
+def test_quiet_source_raises_no_activity_low():
+    # One source, one alarm: wspr_spots silent 4 h against a strong baseline.
+    st, sa = _spots(100, 0)
+    sa.last_arrival["wspr_spots"] = NOW - timedelta(hours=4)
+    assert _checks(_run([(st, sa)])) == [("A", "client_quiet", "wspr_spots")]
 
 # --- one cause, one alarm --------------------------------------------------
 
