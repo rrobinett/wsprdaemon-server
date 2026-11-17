@@ -70,3 +70,42 @@ def test_alarm_hours_cover_first_to_last_seen():
     assert got["AC0G-B4"] == {h(2026, 11, 16, 11), h(2026, 11, 16, 12)}
     assert got["X1"] == got["X2"] == {h(2026, 11, 16, 12)}
     assert "wd30" not in got
+
+
+def test_clear_after_is_three():
+    assert CLEAR_AFTER == 3
+
+
+def test_streak_two_with_ack_clears_not_acknowledged():
+    ack = Ack("AC0G-B4", "off_air", "", T0, "rob", "", T0)
+    (a,) = step([alarm(streak=2)], [], [ack], T0 + timedelta(minutes=9))
+    assert a.state == "cleared"
+
+
+def test_ack_naming_another_instance_changes_nothing():
+    now = T0 + timedelta(minutes=5)
+    acks = [
+        Ack("AC0G-B4", "off_air", "", T0 + timedelta(hours=1), "rob", "", T0),
+        Ack("OTHER", "off_air", "", T0, "rob", "", T0),
+        Ack("AC0G-B4", "client_quiet", "", T0, "rob", "", T0),
+        Ack("AC0G-B4", "off_air", "src", T0, "rob", "", T0),
+    ]
+    (a,) = step([alarm()], [f()], acks, now)
+    assert a.state == "open"
+
+
+def test_numbers_stored_sorted_raw_string():
+    fd = Finding("AC0G-B4", "off_air", "", {"zeta": 1, "alpha": 2})
+    (a,) = step([], [fd], [], T0)
+    assert a.numbers == json.dumps({"zeta": 1, "alpha": 2}, sort_keys=True)
+    assert a.numbers == '{"alpha": 2, "zeta": 1}'
+
+
+def test_cleared_alarm_without_finding_is_not_returned():
+    assert step([alarm(state="cleared", streak=3)], [], [], T0) == []
+
+
+def test_false_streak_sets_updated_at():
+    now = T0 + timedelta(minutes=3)
+    (a,) = step([alarm()], [], [], now)
+    assert a.updated_at == now and a.false_streak == 1
