@@ -76,3 +76,14 @@ def test_sources_json_states():
     src = json.loads(r["sources"])
     assert src["codar"] == {"expected": True, "last_arrival_utc": None, "state": "never"}
     assert src["ft8"]["state"] == "-" and src["ft8"]["last_arrival_utc"] is not None
+
+
+def test_live_quiet_source_shows_expected_and_quiet():
+    # ft8 aged out of the learning window, but its client_quiet alarm is live.
+    sa = _sa()
+    sa.last_arrival["ft8"] = NOW - timedelta(days=20)
+    a = Alarm("A", "client_quiet", "ft8", NOW, NOW, "open", 0, "{}", NOW)
+    f = Finding("A", "client_quiet", "ft8", {})
+    r = build([_st("A")], {"A": sa}, [a], [f], BUILT, now=NOW)["fleet_board"][0]
+    assert json.loads(r["sources"])["ft8"]["expected"] is True
+    assert json.loads(r["sources"])["ft8"]["state"] == "quiet"

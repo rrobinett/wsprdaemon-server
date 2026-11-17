@@ -30,13 +30,20 @@ def test_epoch_ingested_at_is_no_arrival():
     assert a.last_arrival == {}
 
 
-def test_hourly_only_for_hourly_sources():
+def test_hourly_for_every_source_but_noise():
     h = datetime(2026, 11, 16, 10)
-    a = sources.parse({"wspr_spots_hourly": [("A", h, 30)],
-                       "hfdl_hourly": [("A", h, 5)]})
-    assert a.hourly == {("wspr_spots", "A"): {h: 30}}
-    assert not any(k.endswith("_hourly") and k.startswith(("wspr_noise", "codar", "hfdl"))
-                   for k in sources.queries(NOW))
+    a = sources.parse({"wspr_spots_hourly": [("A", h, 30)], "hfdl_hourly": [("A", h, 5)],
+                       "codar_hourly": [("A", h, 2)], "wspr_noise_hourly": [("A", h, 9)]})
+    assert a.hourly == {("wspr_spots", "A"): {h: 30}, ("hfdl", "A"): {h: 5},
+                        ("codar", "A"): {h: 2}}
+    names = {n for n in sources.queries(NOW) if n.endswith("_hourly")}
+    assert names == {"wspr_spots_hourly", "ft8_hourly", "codar_hourly", "hfdl_hourly"}
+
+
+def test_usual_sources_unchanged():
+    # activity_low and spots_vs_usual read these two only; the wider hourly
+    # set serves client_quiet's usual-hours rule.
+    assert sources.USUAL_SOURCES == ("wspr_spots", "ft8")
 
 
 def test_days_and_gap_parse():
@@ -92,7 +99,10 @@ def test_window_lengths_pinned():
     from datetime import timezone  # noqa: F401
     for n, s in sources.queries(NOW).items():
         if n.endswith("_last"):
-            assert "ingested_at > toDateTime('2026-11-16 12:00:00', 'UTC') - INTERVAL 14 DAY" in s, n
+            # 30 days, so a long silence still reads as silence; the time
+            # clause, one day wider, lets ClickHouse prune partitions.
+            assert "ingested_at > toDateTime('2026-11-16 12:00:00', 'UTC') - INTERVAL 30 DAY" in s, n
+            assert "AND time > toDateTime('2026-11-16 12:00:00', 'UTC') - INTERVAL 31 DAY" in s, n
         elif n.endswith("_days"):
             assert "time > toDateTime('2026-11-16 12:00:00', 'UTC') - INTERVAL 14 DAY" in s, n
         elif n.endswith("_gap"):

@@ -255,3 +255,19 @@ def test_run_holds_alarms_of_stations_silent_under_an_ingest_stall(monkeypatch):
     alarms = {t: r for t, r, _, _ in published}["fleet_alarms"]
     s0 = [a for a in alarms if a["station"] == "S0"]
     assert [(a["check"], a["state"]) for a in s0] == [("off_air", "acknowledged")]
+
+
+# --- I6: live alarms reach the checks --------------------------------------
+
+def test_live_off_air_keeps_a_station_with_aged_out_history_off(monkeypatch):
+    now = _now()
+    live = ("A", "off_air", "", now - timedelta(days=40), now - timedelta(minutes=5),
+            "acknowledged", 0, "{}", now - timedelta(minutes=5))
+    client, published, _ = _stub(monkeypatch, Activity(), [live])
+    _env(monkeypatch, True)
+    assert cli.main(["run", "--conf", "x"]) == 0
+    (table, data, cols), = client.inserts
+    row = dict(zip(cols, data[0]))
+    assert (row["check"], row["state"], row["false_streak"]) == ("off_air", "acknowledged", 0)
+    board = {t: r for t, r, _, _ in published}["fleet_board"]
+    assert board[0]["verdict"] == "off"

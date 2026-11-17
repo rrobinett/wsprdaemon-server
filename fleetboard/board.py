@@ -15,9 +15,9 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
-from .alarms import LIVE, alarm_hours
-from .checks import Finding, expected_sources, spots_vs_usual, verdict
-from .sources import BASELINE_DAYS, HOURLY_SOURCES, SOURCES
+from .alarms import LIVE, alarm_hours, live_map
+from .checks import Finding, expected_sources, live_subjects, spots_vs_usual, verdict
+from .sources import BASELINE_DAYS, SOURCES, USUAL_SOURCES
 
 SCHEMAS = {
     "fleet_board": [
@@ -49,8 +49,7 @@ def _source_state(source, expected, own):
     return "ok"
 
 
-def _sources_json(station, sa, findings):
-    expected = expected_sources(station, sa)
+def _sources_json(station, sa, findings, expected):
     own = [f for f in findings if f.station == station.name]
     out = {}
     for s in SOURCES:
@@ -61,10 +60,10 @@ def _sources_json(station, sa, findings):
     return json.dumps(out, sort_keys=True)
 
 
-def _usual_json(station, sa, now, excluded):
+def _usual_json(sa, now, excluded, expected):
     out = {}
-    for s in HOURLY_SOURCES:
-        if s not in expected_sources(station, sa):
+    for s in USUAL_SOURCES:
+        if s not in expected:
             continue
         r = spots_vs_usual(sa, s, now, excluded)
         if r is not None:
@@ -86,13 +85,15 @@ def build(stations, acts, alarms, findings: list[Finding], built_at: float,
     for a in live:
         n_open[a.station] = n_open.get(a.station, 0) + 1
     rows = []
+    lmap = live_map(live)
     for st in stations:
         sa = acts[st.name]
+        expected = expected_sources(st, sa, live_subjects(lmap, st.name))
         rows.append({
             "station": st.name, "grid6": st.grid6[:6],
             "verdict": verdict(st, sa, findings),
-            "sources": _sources_json(st, sa, findings),
-            "spots_vs_usual": _usual_json(st, sa, now, excluded_hours.get(st.name, set())),
+            "sources": _sources_json(st, sa, findings, expected),
+            "spots_vs_usual": _usual_json(sa, now, excluded_hours.get(st.name, set()), expected),
             "n_open": n_open.get(st.name, 0), "rank": 0, "built_at_utc": built_at,
         })
 

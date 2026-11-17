@@ -39,19 +39,36 @@ def _add(sa, source, *, ago, gap, ndays=10):
     return sa
 
 
+def _hours(sa, source, *, last, hours=range(24), n=10, ndays=10):
+    """A source with rows in every listed hour-of-day of the past 8 days, up to
+    the hour of its last arrival `last` (rows stop when the source falls silent)."""
+    top = NOW.replace(minute=0, second=0, microsecond=0)
+    stop = last.replace(minute=0, second=0, microsecond=0)
+    counts = {}
+    for k in range(0, 8 * 24 + 1):
+        t = top - timedelta(hours=k)
+        if t.hour in hours and t <= stop:
+            counts[t] = n
+    sa.hourly[source] = counts
+    sa.last_arrival[source] = last
+    sa.usual_gap_s[source] = 60.0
+    sa.days_active[source] = _days(ndays)
+    return sa
+
+
 def _live(name="A", add=(), drop=()):
     """A healthy station: wspr_noise fresh every 2 minutes for 10 days."""
     return _st(name, add, drop), _add(StationActivity(), "wspr_noise",
                                       ago=timedelta(minutes=1), gap=120.0)
 
 
-def _run(pairs, alarm_hours=None, bystanders=2):
+def _run(pairs, alarm_hours=None, bystanders=2, live=None):
     """Evaluate `pairs` beside healthy bystanders, which raise no findings.
     They keep the single-station tests independent of INGEST_MIN_STATIONS;
     the ingest tests pass bystanders=0 to control N exactly."""
     pairs = list(pairs) + [_live(f"ZZ{i}") for i in range(bystanders)]
     return evaluate([st for st, _ in pairs], {st.name: sa for st, sa in pairs},
-                    NOW, alarm_hours or {})
+                    NOW, alarm_hours or {}, live=live or {})
 
 
 def _checks(findings):
@@ -128,18 +145,77 @@ def test_off_air_uses_every_gap_when_no_source_is_expected():
 
 # --- client quiet ----------------------------------------------------------
 
-def test_client_quiet_threshold_is_3x_gap_floored_at_30_min():
+def test_noise_quiet_threshold_is_3x_gap_floored_at_30_min():
+    # wspr_spots keeps the station on the air; wspr_noise is judged by its gap.
     st, sa = _live()
-    _add(sa, "ft8", ago=timedelta(minutes=29), gap=60.0)      # 3x60 = 3 min -> floor 30 min
-    _add(sa, "codar", ago=timedelta(minutes=50), gap=1200.0)  # 3x1200 = 60 min
+    _add(sa, "wspr_spots", ago=timedelta(minutes=1), gap=120.0)
+    sa.usual_gap_s["wspr_noise"] = 60.0                       # 3x60 = 3 min -> floor 30 min
+    sa.last_arrival["wspr_noise"] = NOW - timedelta(minutes=29)
     assert _run([(st, sa)]) == []
-    sa.last_arrival["ft8"] = NOW - timedelta(minutes=31)
-    sa.last_arrival["codar"] = NOW - timedelta(minutes=61)
+    sa.last_arrival["wspr_noise"] = NOW - timedelta(minutes=31)
     fs = _run([(st, sa)])
-    assert _checks(fs) == [("A", "client_quiet", "codar"), ("A", "client_quiet", "ft8")]
-    by = {f.subject: f.numbers for f in fs}
-    assert by["ft8"]["threshold_s"] == 1800
-    assert by["codar"]["threshold_s"] == 3600
+    assert _checks(fs) == [("A", "client_quiet", "wspr_noise")]
+    assert fs[0].numbers["threshold_s"] == 1800
+    sa.usual_gap_s["wspr_noise"] = 1200.0                     # 3x1200 = 60 min
+    sa.last_arrival["wspr_noise"] = NOW - timedelta(minutes=59)
+    assert _run([(st, sa)]) == []
+    sa.last_arrival["wspr_noise"] = NOW - timedelta(minutes=61)
+    fs = _run([(st, sa)])
+    assert _checks(fs) == [("A", "client_quiet", "wspr_noise")]
+    assert fs[0].numbers["threshold_s"] == 3600
+
+
+def test_wspr_spots_never_raises_client_quiet():
+    # wspr_noise carries WSPR liveness; spots follow the band.
+    st, sa = _live()
+    _hours(sa, "wspr_spots", last=NOW - timedelta(days=2))
+    assert not any(f.check == "client_quiet" for f in _run([(st, sa)]))
+    assert not any(f.check == "client_quiet"
+                   for f in _run([(st, sa)], live={"A": {("client_quiet", "wspr_spots")}}))
+
+
+def test_band_closure_night_raises_no_quiet():
+    # ft8 decodes 00-08 UTC every day; rows stop at 08:59 as usual.  At 12:10
+    # three silent hours have passed, none of them usually active.
+    st, sa = _live()
+    _hours(sa, "ft8", last=NOW.replace(hour=8, minute=59), hours=range(0, 9))
+    assert _run([(st, sa)]) == []
+
+
+def test_daytime_outage_of_two_usual_hours_raises_quiet():
+    st, sa = _live()
+    _hours(sa, "ft8", last=NOW.replace(hour=10, minute=59), hours=range(6, 21))
+    assert _run([(st, sa)]) == []                     # one usual hour missed: 11
+    _hours(sa, "ft8", last=NOW.replace(hour=9, minute=59), hours=range(6, 21))
+    fs = _run([(st, sa)])
+    assert _checks(fs) == [("A", "client_quiet", "ft8")]
+    assert fs[0].numbers["active_hours_missed"] == 2  # 10 and 11
+    assert fs[0].numbers["silence_s"] == (NOW - NOW.replace(hour=9, minute=59)).total_seconds()
+
+
+def test_usual_hours_rule_covers_codar_and_hfdl():
+    for source in ("codar", "hfdl"):
+        st, sa = _live()
+        _hours(sa, source, last=NOW - timedelta(hours=5), n=2)
+        assert _checks(_run([(st, sa)])) == [("A", "client_quiet", source)]
+
+
+def test_source_with_no_usual_hours_never_raises_quiet():
+    # codar rows on only 4 of the past 7 days at any hour: no hour is usual.
+    st, sa = _live()
+    _hours(sa, "codar", last=NOW - timedelta(days=3, hours=1))
+    assert _run([(st, sa)]) == []
+
+
+def test_usual_hours_skip_alarm_hours():
+    # Daytime outage, but the hours 6-20 sat under an alarm on 3 of the past
+    # 7 days: those days do not count, so 4 of 7 leaves no hour usual.
+    st, sa = _live()
+    _hours(sa, "ft8", last=NOW.replace(hour=9, minute=59), hours=range(6, 21))
+    top = NOW.replace(minute=0)
+    alarm = {"A": {top - timedelta(days=d) + timedelta(hours=h - top.hour)
+                   for d in (2, 3, 4) for h in range(6, 21)}}
+    assert _run([(st, sa)], alarm) == []
 
 
 def test_client_quiet_ignores_unexpected_and_dropped_sources():
@@ -163,10 +239,11 @@ def test_never_started_needs_expect_add_and_7_days_silence():
     sa.usual_gap_s["codar"] = 600.0
     assert _checks(_run([(st, sa)])) == [("K3LR", "never_started", "codar")]
 
-    # A codar day 2 days back: started (and now merely quiet).
+    # A codar day 2 days back: started.  One day of rows gives no usual
+    # hours, so it is not yet judged quiet either.
     sa.days_active["codar"] = frozenset({(NOW - timedelta(days=2)).date()})
     sa.last_arrival["codar"] = NOW - timedelta(days=2)
-    assert _checks(_run([(st, sa)])) == [("K3LR", "client_quiet", "codar")]
+    assert _run([(st, sa)]) == []
 
 
 
@@ -182,11 +259,12 @@ def test_expect_drop_beats_expect_add():
 
 # --- activity low ----------------------------------------------------------
 
-def _spots(per_hour_baseline, last3, *, hist_days=8, outage_days=()):
-    """wspr_spots: `per_hour_baseline` in every hour of the past `hist_days`
-    days, 0 in the hours of `outage_days`, and `last3` spread over the last 3 h."""
+def _spots(per_hour_baseline, last3, *, hist_days=8, outage_days=(), source="wspr_spots"):
+    """`source` (wspr_spots): `per_hour_baseline` in each of the last 3 hours of the
+    day on the past `hist_days` days, 0 in the hours of `outage_days`, and
+    `last3` spread over the last 3 h."""
     st, sa = _live()
-    _add(sa, "wspr_spots", ago=timedelta(minutes=1), gap=120.0, ndays=hist_days + 1)
+    _add(sa, source, ago=timedelta(minutes=1), gap=120.0, ndays=hist_days + 1)
     hourly = {}
     for d in range(1, hist_days + 1):
         for h in LAST3:
@@ -194,7 +272,7 @@ def _spots(per_hour_baseline, last3, *, hist_days=8, outage_days=()):
     counts = [last3 // 3 + (1 if k < last3 % 3 else 0) for k in range(3)]
     for h, n in zip(LAST3, counts):
         hourly[h] = n
-    sa.hourly["wspr_spots"] = hourly
+    sa.hourly[source] = hourly
     return st, sa
 
 
@@ -245,10 +323,16 @@ def test_activity_low_fires_with_history_exactly_7_days_back():
 
 
 def test_quiet_source_raises_no_activity_low():
-    # One source, one alarm: wspr_spots silent 4 h against a strong baseline.
+    # One source, one alarm: ft8 silent 4 h against a strong baseline.
+    st, sa = _spots(100, 0, source="ft8")
+    sa.last_arrival["ft8"] = NOW - timedelta(hours=4)
+    assert _checks(_run([(st, sa)])) == [("A", "client_quiet", "ft8")]
+
+
+def test_silent_wspr_spots_is_low_not_quiet():
     st, sa = _spots(100, 0)
     sa.last_arrival["wspr_spots"] = NOW - timedelta(hours=4)
-    assert _checks(_run([(st, sa)])) == [("A", "client_quiet", "wspr_spots")]
+    assert _checks(_run([(st, sa)])) == [("A", "activity_low", "wspr_spots")]
 
 # --- one cause, one alarm --------------------------------------------------
 
@@ -286,7 +370,7 @@ def test_mass_silence_keeps_findings_of_live_stations():
     for _, sa in pairs[:6]:
         sa.last_arrival["wspr_noise"] = NOW - timedelta(hours=1)
     st9, sa9 = pairs[9]
-    _add(sa9, "ft8", ago=timedelta(hours=1), gap=60.0)
+    _hours(sa9, "ft8", last=NOW - timedelta(hours=3))
     fs = _run(pairs, bystanders=0)
     assert _checks(fs) == [("S9", "client_quiet", "ft8"), ("wd30", "ingest_stalled", "")]
     assert verdict(st9, sa9, fs) == "warn"
@@ -343,7 +427,7 @@ def test_grey_station_raises_nothing():
 def test_verdict_ok_warn_off():
     st, sa = _live()
     assert verdict(st, sa, _run([(st, sa)])) == "ok"
-    _add(sa, "ft8", ago=timedelta(hours=1), gap=60.0)
+    _hours(sa, "ft8", last=NOW - timedelta(hours=3))
     assert verdict(st, sa, _run([(st, sa)])) == "warn"
     sa.last_arrival["wspr_noise"] = NOW - timedelta(hours=1)
     assert verdict(st, sa, _run([(st, sa)])) == "off"
@@ -351,7 +435,7 @@ def test_verdict_ok_warn_off():
 
 def test_numbers_are_json_serialisable():
     st, sa = _live(add=("codar",))
-    _add(sa, "ft8", ago=timedelta(hours=1), gap=60.0)
+    _hours(sa, "ft8", last=NOW - timedelta(hours=3))
     for f in _run([(st, sa)]):
         json.dumps(f.numbers)
     sa.last_arrival["wspr_noise"] = NOW - timedelta(hours=1)
@@ -365,3 +449,47 @@ def test_spots_vs_usual_matches_activity_low_numbers():
     st, sa = _spots(100, 50)
     assert spots_vs_usual(sa, "wspr_spots", NOW, set()) == {"last3h": 50, "usual3h": 300}
     assert spots_vs_usual(sa, "ft8", NOW, set()) is None
+
+
+# --- live alarms keep long silence visible (I6) ----------------------------
+
+def test_live_quiet_keeps_an_aged_out_source_expected_and_quiet():
+    # ft8 silent 20 days: no learned days, no hourly baseline, no gap left.
+    st, sa = _live()
+    sa.last_arrival["ft8"] = NOW - timedelta(days=20)
+    assert expected_sources(st, sa) == {"wspr_noise"}
+    assert _run([(st, sa)]) == []
+    live = {"A": {("client_quiet", "ft8")}}
+    assert expected_sources(st, sa, {"ft8"}) == {"wspr_noise", "ft8"}
+    fs = _run([(st, sa)], live=live)
+    assert _checks(fs) == [("A", "client_quiet", "ft8")]
+    assert fs[0].numbers["silence_s"] == 20 * 86400
+    # A row arrives: the live alarm no longer holds the finding.
+    sa.last_arrival["ft8"] = NOW - timedelta(minutes=2)
+    assert _run([(st, sa)], live=live) == []
+
+
+def test_live_quiet_with_no_arrival_in_window_stays_quiet():
+    st, sa = _live()
+    fs = _run([(st, sa)], live={"A": {("client_quiet", "codar")}})
+    assert _checks(fs) == [("A", "client_quiet", "codar")]
+    assert fs[0].numbers["silence_s"] is None
+
+
+def test_live_alarm_does_not_override_expect_drop():
+    st, sa = _live(drop=("ft8",))
+    sa.last_arrival["ft8"] = NOW - timedelta(days=20)
+    assert _run([(st, sa)], live={"A": {("client_quiet", "ft8")}}) == []
+
+
+def test_live_off_air_station_is_judged_after_its_history_ages_out():
+    st, sa = _st("UACNJ"), StationActivity()
+    assert _run([(st, sa)]) == []
+    assert verdict(st, sa, []) == "grey"
+    fs = _run([(st, sa)], live={"UACNJ": {("off_air", "")}})
+    assert _checks(fs) == [("UACNJ", "off_air", "")]
+    assert verdict(st, sa, fs) == "off"
+    # Arrivals resume: off_air is no longer found, so the alarm can clear.
+    sa.last_arrival["wspr_noise"] = NOW - timedelta(minutes=1)
+    fs = _run([(st, sa)], live={"UACNJ": {("off_air", "")}})
+    assert fs == [] and verdict(st, sa, fs) == "ok"

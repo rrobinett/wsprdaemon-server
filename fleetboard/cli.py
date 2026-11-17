@@ -128,7 +128,7 @@ def cmd_run(a):
     acks = read_acks(client, now)
     since = now - timedelta(days=sources.BASELINE_DAYS + 1)
     hours = al.alarm_hours(prev, since)
-    findings = evaluate(stations, acts, now, hours)
+    findings = evaluate(stations, acts, now, hours, live=al.live_map(prev))
     hold = {s for f in findings if f.check == "ingest_stalled"
             for s in f.numbers.get("silent", ())}
     changed = al.step(prev, findings, acks, now, hold=hold)

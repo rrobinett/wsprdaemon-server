@@ -83,6 +83,15 @@ def step(prev, findings, acks, now, hold=frozenset()):
     return list(changed.values())
 
 
+def live_map(alarms) -> dict[str, set[tuple[str, str]]]:
+    """station -> {(check, subject)} of its live alarms, the shape checks.evaluate takes."""
+    out: dict[str, set[tuple[str, str]]] = {}
+    for a in alarms:
+        if a.state in LIVE:
+            out.setdefault(a.station, set()).add((a.check, a.subject))
+    return out
+
+
 def alarm_hours(alarms, since):
     """station -> naive-UTC hour starts covered by its alarms, from `since`'s hour."""
     floor = since.replace(minute=0, second=0, microsecond=0)

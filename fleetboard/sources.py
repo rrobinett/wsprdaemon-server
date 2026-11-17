@@ -15,12 +15,18 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
 SOURCES = ("wspr_noise", "wspr_spots", "ft8", "codar", "hfdl")
-HOURLY_SOURCES = ("wspr_spots", "ft8")
+# Hourly counts: activity_low reads USUAL_SOURCES; client_quiet's usual-hours
+# rule reads ft8, codar and hfdl, whose rows follow the band and the day.
+HOURLY_SOURCES = ("wspr_spots", "ft8", "codar", "hfdl")
+USUAL_SOURCES = ("wspr_spots", "ft8")
 
 EPOCH = datetime(1970, 1, 1)
 
 BASELINE_DAYS = 7
 EXPECT_WINDOW_DAYS = 14
+# Arrivals are read this far back, so a long silence still reads as silence
+# after the 14-day learning window has forgotten the source.
+LAST_WINDOW_DAYS = 30
 
 # source -> (table, reporter column, extra WHERE clause)
 _SPEC = {
@@ -59,12 +65,17 @@ def _where(col: str, now: datetime, days_back: str, extra: str) -> str:
 
 
 def queries(now: datetime) -> dict[str, str]:
-    """name -> SQL, four per source; reporter is the first column of each."""
+    """name -> SQL: last, days and gap per source, hourly for HOURLY_SOURCES;
+    reporter is the first column of each."""
     out: dict[str, str] = {}
     for src, (table, rep, extra) in _SPEC.items():
+        # The time clause, one day wider than the ingested_at window, adds
+        # nothing to the answer; it lets ClickHouse prune the monthly partitions.
+        prune = f"time > {_lit(now)} - INTERVAL {LAST_WINDOW_DAYS + 1} DAY"
         out[f"{src}_last"] = (
             f"SELECT {rep} AS reporter, max(ingested_at) FROM {table} "
-            f"WHERE {_where('ingested_at', now, f'{EXPECT_WINDOW_DAYS} DAY', extra)} "
+            f"WHERE {_where('ingested_at', now, f'{LAST_WINDOW_DAYS} DAY', extra)} "
+            f"AND {prune} "
             f"GROUP BY reporter"
         )
         out[f"{src}_days"] = (
