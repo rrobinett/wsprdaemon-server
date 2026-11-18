@@ -50,6 +50,7 @@ from datetime import datetime, timezone
 from sigmondb.groundwave import _latest, great_circle_m
 from sigmondb.paths import gc_midpoint, match_group, path_kind
 from sigmondb.receivers import grid_to_latlon
+from sigmondb.set_aside import not_set_aside, solution_not_set_aside
 
 DATABASE = "sigmondb_public"
 TABLES = ("transmitter_offsets", "trust", "receivers", "transmitters", "groups", "heard",
@@ -104,10 +105,15 @@ SOURCE_COLUMNS = {
     "receiver": ("reporter_id", "lat", "lon", "a_level", "valid_from", "version"),
     "waveform": ("tx_id", "centre_hz", "rate_hz_per_s", "valid_from"),
 }
-SOURCE_WHERE = {"solution": "WHERE offset_ns IS NOT NULL AND tx_id != ''"}
+# A solution any of whose reporters holds an active 'codar' or 'all' set-aside window over the
+# solution's span never reaches transmitter_offsets (sigmondb/set_aside.py).
+SOURCE_WHERE = {"solution": "WHERE offset_ns IS NOT NULL AND tx_id != '' AND "
+                            + solution_not_set_aside("codar")}
 
-# Aggregates read_source runs on wd30: name -> (columns, SQL).  HFDL stays out of every one.
-_NOT_HFDL = "NOT startsWith(group_key, 'hfdl') AND tx_id NOT LIKE 'hfdl:%'"
+# Aggregates read_source runs on wd30: name -> (columns, SQL).  HFDL stays out of every one,
+# and so does every arrival inside an active 'codar' or 'all' set-aside window.
+_CODAR_KEPT = ("NOT startsWith(group_key, 'hfdl') AND tx_id NOT LIKE 'hfdl:%' AND "
+             + not_set_aside("codar"))
 AGG_QUERIES = {
     "heard": (
         ("reporter_id", "tx_id", "group_key", "centre_hz", "rate_hz_per_s",
@@ -118,7 +124,7 @@ AGG_QUERIES = {
         "countIf(time > now() - INTERVAL 24 HOUR AND origin = 't6_anchor') AS t6_24h, "
         "count() AS n_7d, countIf(origin = 't6_anchor') AS t6_7d, "
         "min(time) AS first_t, max(time) AS last_t "
-        "FROM sigmondb.arrival FINAL WHERE time > now() - INTERVAL 7 DAY AND " + _NOT_HFDL +
+        "FROM sigmondb.arrival FINAL WHERE time > now() - INTERVAL 7 DAY AND " + _CODAR_KEPT +
         " GROUP BY reporter_id, tx_id, group_key"),
     "ionosphere": (
         ("reporter_id", "tx_id", "group_key", "centre_hz", "rate_hz_per_s", "hour", "n",
@@ -130,7 +136,7 @@ AGG_QUERIES = {
         "quantilesIf(0.25, 0.5, 0.75)(s4, isNotNull(s4)) AS sq, "
         "quantilesIf(0.25, 0.5, 0.75)(sigma_phi_rad, isNotNull(sigma_phi_rad)) AS pq, "
         "quantilesIf(0.25, 0.5, 0.75)(level_db, isNotNull(level_db)) AS lq "
-        "FROM sigmondb.arrival FINAL WHERE time > now() - INTERVAL 24 HOUR AND " + _NOT_HFDL +
+        "FROM sigmondb.arrival FINAL WHERE time > now() - INTERVAL 24 HOUR AND " + _CODAR_KEPT +
         " GROUP BY reporter_id, tx_id, group_key, hour"),
 }
 

@@ -1,4 +1,5 @@
-"""python -m sigmondb: ddl, seed, backfill-codar, backfill-hfdl, load, attribute, receiver-positions, solve, publish.
+"""python -m sigmondb: ddl, seed, backfill-codar, backfill-hfdl, load, attribute, receiver-positions, solve,
+publish, set-aside.
 
 Credentials come from /etc/wsprdaemon/clickhouse.conf (--conf overrides the path in tests).
 No verb takes a password.  publish reads the public servers' credentials from the
@@ -12,6 +13,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from sigmondb import ddl
+from sigmondb.set_aside import not_set_aside
 from sigmondb.groundwave import fixed_clusters, ground_wave_solutions
 from sigmondb.load import insert_file, insert_rows
 from sigmondb.rows import read_rows, write_rows
@@ -164,7 +166,8 @@ def _fetch(client, table, cols, where="", params=None):
         res = client.query(sql, parameters=params)
     out = [dict(zip(cols, r)) for r in res.result_rows]
     for r in out:
-        for c in ("time", "valid_from", "window_from", "window_to", "run_at"):
+        for c in ("time", "valid_from", "window_from", "window_to", "run_at",
+                  "from_time", "to_time", "set_at"):
             if c in r:
                 r[c] = _utc_naive(r[c])
     return out
@@ -259,14 +262,15 @@ def _from_db(a, client=None):
     """(arrivals, transmitters, receivers) from the registry, every table read FINAL so a
     re-ingested row counts once.  Arrivals: anchored only, within --days; by default the
     latest detector_version per (reporter_id, group_key, time), judged after each arrival
-    counts at the receiver whose radiod heard it (_carried); --detector-version picks one."""
+    counts at the receiver whose radiod heard it (_carried); --detector-version picks one.
+    Rows inside an active 'codar' or 'all' set-aside window never come back (set_aside.py)."""
     client = client or connect(a.conf)
 
     def fetch(table, where="", params=None):
         return _fetch(client, table, ddl.COLUMNS[table], where, params)
 
     where = ("WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000 AND origin = 't6_anchor' "
-             "AND time > now() - INTERVAL {hours:UInt32} HOUR")
+             "AND time > now() - INTERVAL {hours:UInt32} HOUR AND " + not_set_aside("codar"))
     params = {"hours": _hours(a.days)}
     if a.detector_version:
         arr = fetch("arrival", where + " AND detector_version = {dv:String}",
@@ -284,13 +288,15 @@ def _from_db(a, client=None):
 _ATTR_ARRIVAL_COLS = ("time", "reporter_id", "group_key", "delay_ns", "level_db",
                       "detector_version", "engineering")
 _ATTR_WHERE = ("WHERE u_epoch_ns IS NOT NULL AND u_epoch_ns <= 1000 AND origin = 't6_anchor' AND clean_tag = 'A' "
-               "AND rate_hz_per_s != 0 AND time > now() - INTERVAL {hours:UInt32} HOUR")
+               "AND rate_hz_per_s != 0 AND time > now() - INTERVAL {hours:UInt32} HOUR AND "
+               + not_set_aside("codar"))
 
 
 def _attribution_inputs(client, days):
     """(arrivals, sites, rxpos, coherence) for attribution.run_attribution.
 
-    arrivals: T6-anchored, CLEAN 'A', chirped, within `days`; the latest detector per capture;
+    arrivals: T6-anchored, CLEAN 'A', chirped, within `days`, outside every active 'codar' or
+    'all' set-aside window; the latest detector per capture;
     live when engineering carries sweep_repetition_hz; counted at their radiod.
     sites: the latest codar transmitter row per tx_id with a position, one site per waveform
     (latest per centre); a transmitter with no waveform drops out.  Sorted by tx_id, so ties
@@ -493,6 +499,83 @@ def cmd_publish(a):
     return 0
 
 
+def _now_s():
+    return datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+
+
+def _set_by(a):
+    import getpass
+    import os
+    return a.by or os.environ.get("SUDO_USER") or getpass.getuser()
+
+
+def _fmt_window(r):
+    return "%s %s [%s, %s) active=%d set %s by %s: %s" % (
+        r["scope"], r["reporter_id"], r["from_time"].isoformat(sep=" "),
+        r["to_time"].isoformat(sep=" "), r["active"], r["set_at"].isoformat(sep=" "),
+        r["set_by"], r["reason"])
+
+
+def _count(client, sql, params):
+    try:
+        res = client.query(sql, parameters=params, query_tz="UTC")
+    except TypeError:
+        res = client.query(sql, parameters=params)
+    return int(res.result_rows[0][0])
+
+
+def cmd_set_aside(a):
+    """add, list and withdraw set-aside windows (sigmondb/set_aside.py).  Nothing is ever
+    deleted: withdraw inserts the same key with active = 0 and a later set_at."""
+    from sigmondb import set_aside as sa
+    if a.action == "add":
+        try:
+            row = sa.window_row(a.scope, a.reporter, sa.parse_utc(a.from_), sa.parse_utc(a.to),
+                                a.reason, _set_by(a), _now_s())
+        except ValueError as e:
+            print("set-aside add: %s" % e, file=sys.stderr)
+            return 2
+        print("set-aside: " + _fmt_window(row))
+        client = connect(a.conf)
+        if a.dry_run:
+            asql, ssql = sa.dry_run_queries(a.scope)
+            p = {"rid": row["reporter_id"], "f": sa.ch_time(row["from_time"]),
+                 "t": sa.ch_time(row["to_time"])}
+            print("dry run: would set aside %d arrival rows and %s solution rows; nothing written"
+                  % (_count(client, asql, p), "no" if ssql is None else _count(client, ssql, p)))
+            return 0
+        ddl.ensure_schema(client)
+        print("set_aside: %d rows" % insert_rows(client, "set_aside", [row]))
+        return 0
+    client = connect(a.conf)
+    cols = ddl.COLUMNS["set_aside"]
+    if a.action == "list":
+        for r in _fetch(client, "set_aside", cols, sa.list_where(a.all)):
+            print(_fmt_window(r))
+        return 0
+    # withdraw
+    try:
+        from_time = sa.parse_utc(a.from_)
+    except ValueError as e:
+        print("set-aside withdraw: %s" % e, file=sys.stderr)
+        return 2
+    found = _fetch(client, "set_aside", cols, sa.key_where(),
+                   {"scope": a.scope, "rid": a.reporter, "from_time": sa.ch_time(from_time)})
+    if not found:
+        print("set-aside withdraw: no window %s %s from %s" % (
+            a.scope, a.reporter, from_time.isoformat(sep=" ")), file=sys.stderr)
+        return 1
+    current = max(found, key=lambda r: r["set_at"])
+    if not current["active"]:
+        print("set-aside withdraw: already withdrawn: " + _fmt_window(current), file=sys.stderr)
+        return 1
+    row = sa.withdrawal_row(current, _set_by(a), _now_s())
+    ddl.ensure_schema(client)
+    insert_rows(client, "set_aside", [row])
+    print("withdrawn: " + _fmt_window(row))
+    return 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="python -m sigmondb")
     sub = p.add_subparsers(dest="verb", required=True)
@@ -563,6 +646,31 @@ def build_parser():
     s.add_argument("--conf", default=DEFAULT_CONF, help="this host's sigmondb credentials")
     s.add_argument("--timeout", type=float, default=30.0, help="seconds per HTTP request")
     s.set_defaults(fn=cmd_publish)
+    s = sub.add_parser("set-aside",
+                       help="keep a reporter's rows in a UTC window out of every product; "
+                            "list or withdraw such windows (nothing is deleted)")
+    ssub = s.add_subparsers(dest="action", required=True)
+    x = ssub.add_parser("add", help="set aside [FROM, TO) for one reporter")
+    x.add_argument("--scope", required=True, help="codar, hfdl or all")
+    x.add_argument("--reporter", required=True, help="reporter_id as stored in the rows")
+    x.add_argument("--from", dest="from_", required=True, help="ISO 8601; no zone means UTC")
+    x.add_argument("--to", required=True, help="ISO 8601, exclusive; no zone means UTC")
+    x.add_argument("--reason", required=True)
+    x.add_argument("--by", help="who sets it (default: $SUDO_USER, else the login name)")
+    x.add_argument("--dry-run", action="store_true",
+                   help="print the row and the arrival and solution rows it would set aside; "
+                        "write nothing")
+    x.add_argument("--conf", default=DEFAULT_CONF)
+    x = ssub.add_parser("list", help="active windows (--all: withdrawn ones too)")
+    x.add_argument("--all", action="store_true")
+    x.add_argument("--conf", default=DEFAULT_CONF)
+    x = ssub.add_parser("withdraw", help="withdraw the window keyed (SCOPE, REPORTER, FROM)")
+    x.add_argument("--scope", required=True)
+    x.add_argument("--reporter", required=True)
+    x.add_argument("--from", dest="from_", required=True)
+    x.add_argument("--by", help="who withdraws it (default: $SUDO_USER, else the login name)")
+    x.add_argument("--conf", default=DEFAULT_CONF)
+    s.set_defaults(fn=cmd_set_aside)
     return p
 
 

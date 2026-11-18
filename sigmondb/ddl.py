@@ -190,6 +190,23 @@ for _name, _s in _SPEC.items():
     TABLES[_name] = _create_table(_name, _s["cols"], _s["part"], _s["order"], ttl=_s.get("ttl"))
     COLUMNS[_name] = tuple(n for n, _ in _s["cols"])
 
+# set_aside: windows of rows that must never feed a product (sigmondb/set_aside.py).
+# [from_time, to_time) in UTC.  Withdrawing a window inserts the same key with active = 0
+# and a later set_at; ReplacingMergeTree(set_at) keeps the latest.  No ingested_at:
+# set_at is the version.  Not in TABLE_ORDER: `load` never bulk-loads it, `set-aside` writes it.
+_SET_ASIDE_COLS = [
+    ("scope", LC), ("reporter_id", "String"),
+    ("from_time", "DateTime64(3)"), ("to_time", "DateTime64(3)"),
+    ("reason", "String"), ("set_by", "String"), ("set_at", "DateTime"),
+]
+TABLES["set_aside"] = (
+    "CREATE TABLE IF NOT EXISTS %s.set_aside\n(\n%s,\n    `active` UInt8 DEFAULT 1\n)\n"
+    "ENGINE = ReplacingMergeTree(set_at)\nORDER BY (scope, reporter_id, from_time)" % (
+        DATABASE, ",\n".join(("    `%s` %s %s" % (n, t, _codec(t))).rstrip()
+                             for n, t in _SET_ASIDE_COLS)))
+COLUMN_TYPES["set_aside"] = dict(_SET_ASIDE_COLS + [("active", "UInt8")])
+COLUMNS["set_aside"] = tuple(COLUMN_TYPES["set_aside"])
+
 # heard: last arrival time and level per (receiver, transmitter, group).
 # The target table keeps aggregate states; the materialized view feeds it
 # from arrival.  Read with maxMerge / argMaxMerge.

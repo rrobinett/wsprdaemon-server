@@ -225,6 +225,20 @@ ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMM(time)
 ORDER BY (tx_id, reporter_id, time);
 
+CREATE TABLE IF NOT EXISTS sigmondb.set_aside
+(
+    `scope` LowCardinality(String) CODEC(ZSTD(3)),
+    `reporter_id` String CODEC(ZSTD(3)),
+    `from_time` DateTime64(3) CODEC(Delta(8), ZSTD(3)),
+    `to_time` DateTime64(3) CODEC(Delta(8), ZSTD(3)),
+    `reason` String CODEC(ZSTD(3)),
+    `set_by` String CODEC(ZSTD(3)),
+    `set_at` DateTime CODEC(Delta(4), ZSTD(3)),
+    `active` UInt8 DEFAULT 1
+)
+ENGINE = ReplacingMergeTree(set_at)
+ORDER BY (scope, reporter_id, from_time);
+
 CREATE TABLE IF NOT EXISTS sigmondb.heard_state
 (
     `reporter_id` String,
