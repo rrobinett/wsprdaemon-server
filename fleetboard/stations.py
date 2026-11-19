@@ -124,11 +124,11 @@ def fold(activity: Activity, stations: list[Station]) -> dict[str, StationActivi
                     for t, n in h.items():
                         total[t] = total.get(t, 0) + n
                 sa.hourly[source] = total
-        # A drift row names the station's own reporter id; take the newest row
-        # under any name the station answers to, aliases included.
-        names = {st.name}.union(*(set(v) for v in st.reporters.values()))
+        # A drift row names the station's own reporter id.  Only the mapped
+        # reporter ids count (aliases included), never the display name.
+        names = set().union(*(set(v) for v in st.reporters.values()))
         rows = [activity.drift[n] for n in names if n in activity.drift]
         if rows:
-            sa.drift = max(rows, key=lambda r: r.time)
+            sa.drift = max(rows, key=lambda r: r.ingested or r.time)
         result[st.name] = sa
     return result

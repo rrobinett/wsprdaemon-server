@@ -12,6 +12,7 @@ without a database.
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
@@ -45,11 +46,15 @@ Key = tuple[str, str]
 # arrival source, so it never counts toward liveness.
 DRIFT_TABLE = "sigmondb.station_drift"
 DRIFT_WINDOW_DAYS = 30
+# A row stamped further ahead than this carries a wrong station clock; it is
+# ignored, so it can neither win "latest" nor keep a station looking fresh.
+DRIFT_FUTURE_S = 600
 
 
 @dataclass(frozen=True)
 class DriftRow:
-    time: datetime              # the station's own clock, naive UTC
+    time: datetime              # the station's own clock, naive UTC (display only)
+    ingested: datetime | None = None   # the server's clock; freshness reads this
     n_fault: int = 0
     n_drift: int = 0
     faults: tuple = ()          # dicts: kind, subject, detail, fix, key
@@ -116,11 +121,18 @@ def queries(now: datetime) -> dict[str, str]:
                 f"WHERE {_where('time', now, f'{BASELINE_DAYS * 24 + 3} HOUR', extra)} "
                 f"GROUP BY reporter, hour"
             )
+    future = f"time <= {_lit(now)} + INTERVAL {DRIFT_FUTURE_S} SECOND"
+    # Latest by the server's ingested_at, never the station's own `time`.
     out["drift_latest"] = (
-        f"SELECT reporter_id AS reporter, time, n_fault, n_drift, faults_json, reminders_json "
-        f"FROM {DRIFT_TABLE} "
-        f"WHERE time > {_lit(now)} - INTERVAL {DRIFT_WINDOW_DAYS} DAY "
-        f"ORDER BY reporter_id, time DESC LIMIT 1 BY reporter_id"
+        f"SELECT reporter_id AS reporter, time, ingested_at, n_fault, n_drift, "
+        f"faults_json, reminders_json FROM {DRIFT_TABLE} "
+        f"WHERE ingested_at > {_lit(now)} - INTERVAL {DRIFT_WINDOW_DAYS} DAY AND {future} "
+        f"ORDER BY reporter_id, ingested_at DESC LIMIT 1 BY reporter_id"
+    )
+    out["drift_future"] = (
+        f"SELECT reporter_id AS reporter, count() FROM {DRIFT_TABLE} "
+        f"WHERE ingested_at > {_lit(now)} - INTERVAL {DRIFT_WINDOW_DAYS} DAY "
+        f"AND time > {_lit(now)} + INTERVAL {DRIFT_FUTURE_S} SECOND GROUP BY reporter"
     )
     return out
 
@@ -134,7 +146,7 @@ def _json_list(text) -> tuple:
     return tuple(x for x in v if isinstance(x, dict)) if isinstance(v, list) else ()
 
 
-def parse(results: dict[str, list[tuple]]) -> Activity:
+def parse(results: dict[str, list[tuple]], now: datetime | None = None) -> Activity:
     last: dict[Key, datetime] = {}
     days: dict[Key, set[date]] = {}
     gap: dict[Key, float] = {}
@@ -154,10 +166,13 @@ def parse(results: dict[str, list[tuple]]) -> Activity:
             for rep, h, n in results.get(f"{src}_hourly", []):
                 hourly.setdefault((src, rep), {})[_naive_utc(h)] = int(n)
     drift: dict[str, DriftRow] = {}
-    for rep, t, n_fault, n_drift, faults, reminders in results.get("drift_latest", []):
-        if t is None:
+    for rep, t, ing, n_fault, n_drift, faults, reminders in results.get("drift_latest", []):
+        if t is None or ing is None:
             continue
-        drift[rep] = DriftRow(_naive_utc(t), int(n_fault), int(n_drift),
+        t, ing = _naive_utc(t), _naive_utc(ing)
+        if now is not None and (t - now).total_seconds() > DRIFT_FUTURE_S:
+            continue
+        drift[rep] = DriftRow(t, ing, int(n_fault), int(n_drift),
                               _json_list(faults), _json_list(reminders))
     return Activity(
         drift=drift,
@@ -170,5 +185,8 @@ def parse(results: dict[str, list[tuple]]) -> Activity:
 
 def fetch(client, now: datetime) -> Activity:
     """Run every query on `client` (clickhouse_connect) and parse the rows."""
-    return parse({name: client.query(sql).result_rows
-                  for name, sql in queries(now).items()})
+    results = {name: client.query(sql).result_rows for name, sql in queries(now).items()}
+    for rep, n in results.get("drift_future", []):
+        print("sources: ignoring %d drift row(s) of %s stamped over %d s ahead"
+              % (n, rep, DRIFT_FUTURE_S), file=sys.stderr, flush=True)
+    return parse(results, now)

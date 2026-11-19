@@ -14,11 +14,12 @@ healthy, while its verdict still shows the condition and n_acked counts them.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 
 from .alarms import LIVE, alarm_hours, live_map
-from .checks import Finding, drift_stale, expected_sources, live_subjects, spots_vs_usual, verdict
+from .checks import DRIFT_CHECKS, Finding, drift_stale, item_kind, expected_sources, live_subjects, spots_vs_usual, verdict
 from .sources import BASELINE_DAYS, SOURCES, USUAL_SOURCES
 
 SCHEMAS = {
@@ -82,8 +83,32 @@ def _drift_json(sa, now):
         return ""
     return json.dumps({"n_fault": row.n_fault, "n_drift": row.n_drift,
                        "n_reminder": len(row.reminders),
-                       "stale": drift_stale(sa, now), "time_utc": _unix(row.time)},
+                       "stale": drift_stale(sa, now),
+                       "time_utc": _unix(row.ingested or row.time)},
                       sort_keys=True)
+
+
+def _public_alarm(a):
+    """(subject, numbers) as published.  A drift alarm's detail, fix, key and
+    reminder text hold paths, commands and operator prose; they stay in the
+    private fleet.alarm table.  The public row keeps kind, severity, a canned
+    text and an opaque id (8 hex of sha256 of the private key) so open and close
+    still pair."""
+    if a.check not in DRIFT_CHECKS:
+        return a.subject, a.numbers
+    try:
+        n = json.loads(a.numbers or "{}")
+    except ValueError:
+        n = {}
+    key = str(n.get("key") or a.subject)
+    kind = item_kind(key)
+    oid = hashlib.sha256(key.encode("utf-8", "replace")).hexdigest()[:8]
+    if a.check == "test_restore":
+        text, sev = "test ending: " + kind, n.get("severity", "reminder")
+    else:
+        text, sev = "drift fault: " + kind, "fault"
+    return ("%s %s %s" % (a.station, kind, oid),
+            json.dumps({"id": oid, "kind": kind, "severity": sev, "text": text}, sort_keys=True))
 
 
 def build(stations, acts, alarms, findings: list[Finding], built_at: float,
@@ -129,8 +154,10 @@ def build(stations, acts, alarms, findings: list[Finding], built_at: float,
 
     for i, r in enumerate(sorted(rows, key=order)):
         r["rank"] = i
-    arows = [{"station": a.station, "check": a.check, "subject": a.subject,
-              "first_seen_utc": _unix(a.first_seen), "last_seen_utc": _unix(a.last_seen),
-              "state": a.state, "numbers": a.numbers, "built_at_utc": built_at}
-             for a in sorted(live, key=lambda a: (a.station, a.check, a.subject, a.first_seen))]
+    arows = []
+    for a in sorted(live, key=lambda a: (a.station, a.check, a.subject, a.first_seen)):
+        subject, numbers = _public_alarm(a)
+        arows.append({"station": a.station, "check": a.check, "subject": subject,
+                      "first_seen_utc": _unix(a.first_seen), "last_seen_utc": _unix(a.last_seen),
+                      "state": a.state, "numbers": numbers, "built_at_utc": built_at})
     return {"fleet_board": rows, "fleet_alarms": arows}

@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 from fleetboard import alarms as al
 from fleetboard import board, ddl, sources
-from fleetboard.checks import evaluate
+from fleetboard.checks import drift_hold, evaluate
 from fleetboard.stations import fold, load_map, parse_map_lines
 from sigmondb import publish
 from sigmondb.cli import connect
@@ -162,6 +162,7 @@ def cmd_run(a):
     findings = evaluate(stations, acts, now, hours, live=al.live_map(prev))
     hold = {s for f in findings if f.check == "ingest_stalled"
             for s in f.numbers.get("silent", ())}
+    hold |= drift_hold(stations, acts, now)
     changed = al.step(prev, findings, acks, now, hold=hold)
     if changed:
         _insert(client, "fleet.alarm", [[getattr(c, k) for k in ALARM_COLS] for c in changed],

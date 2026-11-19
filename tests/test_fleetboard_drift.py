@@ -18,6 +18,7 @@ for _mod in ('clickhouse_connect', 'clickhouse_driver'):
 from fleetboard import alarms as al  # noqa: E402
 from fleetboard.board import build  # noqa: E402
 from fleetboard.checks import evaluate  # noqa: E402
+from fleetboard.checks import drift_hold  # noqa: E402
 from fleetboard.sources import Activity, DriftRow, parse, queries  # noqa: E402
 from fleetboard.stations import Station, StationActivity, fold  # noqa: E402
 
@@ -30,8 +31,8 @@ def _fault(key, detail="d", fix="smd fix"):
 
 
 def _row(age_h=1, faults=(), reminders=(), n_drift=0):
-    return DriftRow(NOW - timedelta(hours=age_h), len(faults), n_drift,
-                    tuple(faults), tuple(reminders))
+    t = NOW - timedelta(hours=age_h)
+    return DriftRow(t, t, len(faults), n_drift, tuple(faults), tuple(reminders))
 
 
 def _st(name="A"):
@@ -105,6 +106,7 @@ def test_one_station_many_faults_one_alarm_each():
 def test_alias_reporter_row_folds_onto_its_station():
     st = Station(name="AC0G-B4", grid6="EN16ov",
                  reporters={"wspr_noise": ("AC0G-B4",), "ft8": ("AC0G/B4",)})
+    assert fold(Activity(drift={"AC0G-B4": _row()}), [st])["AC0G-B4"].drift is not None
     row = _row(faults=[_fault("unit:x.service")])
     act = Activity(drift={"AC0G/B4": row})
     assert fold(act, [st])["AC0G-B4"].drift == row
@@ -112,8 +114,89 @@ def test_alias_reporter_row_folds_onto_its_station():
 
 
 def test_parse_reads_the_latest_row():
-    res = {"drift_latest": [("A", NOW, 1, 2, json.dumps([_fault("unit:x")]), "not json")]}
+    res = {"drift_latest": [("A", NOW, NOW, 1, 2, json.dumps([_fault("unit:x")]), "not json")]}
     r = parse(res).drift["A"]
     assert (r.n_fault, r.n_drift, r.reminders) == (1, 2, ())
     assert r.faults[0]["key"] == "unit:x"
     assert "drift_latest" in queries(NOW)
+
+
+def _public(findings, now=NOW):
+    live = al.step([], findings, [], now)
+    sa = StationActivity(last_arrival={"ft8": now})
+    return build([_st()], {"A": sa}, live, findings, now.replace(tzinfo=timezone.utc).timestamp(),
+                 now=now)
+
+
+def test_public_rows_carry_no_path_command_or_operator_text():
+    secret = ["/etc/sigmond/overrides.toml", "smd admin instance remove", "deadbeef", "'10.3.2.1'",
+              "mjh", "lab box behind"]
+    f = _fault("stray:/opt/secret/dir", detail="/etc/sigmond/overrides.toml sets x = '10.3.2.1' deadbeef",
+               fix="smd admin instance remove a b")
+    rem = {"station": "A", "key": "unit:x.service", "by": "mjh", "reason": "lab box behind NAT",
+           "until": "2026-11-19", "fix": "smd admin instance remove a b"}
+    fs = _findings(_row(faults=[f], reminders=[rem]))
+    assert any("/etc" in x.numbers["detail"] for x in fs)           # private keeps it
+    out = _public(fs)
+    blob = json.dumps(out)
+    for bad in secret + ["/opt", "secret", "dir"]:
+        assert bad not in blob, bad
+    subjects = [a["subject"] for a in out["fleet_alarms"]]
+    assert len(set(subjects)) == 2 and all(x.startswith("A ") for x in subjects)
+    texts = sorted(json.loads(a["numbers"])["text"] for a in out["fleet_alarms"])
+    assert texts == ["drift fault: stray", "test ending: unit"]
+
+
+def test_public_id_is_stable_so_open_and_close_pair():
+    f = _fault("unit:x.service")
+    a = _public(_findings(_row(faults=[f])))["fleet_alarms"][0]
+    b = _public(_findings(_row(faults=[f])))["fleet_alarms"][0]
+    assert a["subject"] == b["subject"]
+
+
+def test_stale_row_holds_live_drift_alarms_open():
+    fs = _findings(_row(faults=[_fault("unit:x.service")]))
+    prev = al.step([], fs, [], NOW)
+    stale = StationActivity(drift=_row(age_h=60, faults=[_fault("unit:x.service")]))
+    later = NOW + timedelta(hours=1)
+    findings = evaluate([_st()], {"A": stale}, later, {})
+    hold = drift_hold([_st()], {"A": stale}, later)
+    t = later
+    for _ in range(5):
+        assert al.step(prev, findings, [], t, hold=hold) == []
+        t += timedelta(hours=1)
+    # board shows it stale
+    out = build([_st()], {"A": stale}, prev, [], later.replace(tzinfo=timezone.utc).timestamp(),
+                now=later)
+    assert json.loads(out["fleet_board"][0]["drift"])["stale"] is True
+
+
+def test_hold_spares_other_checks_of_the_station():
+    prev = al.step([], [Finding_("off_air", "")], [], NOW)
+    out = al.step(prev, [], [], NOW + timedelta(hours=1),
+                  hold={("A", "drift_fault"), ("A", "test_restore")})
+    assert out and out[0].false_streak == 1
+
+
+def Finding_(check, subject):
+    from fleetboard.checks import Finding
+    return Finding("A", check, subject, {})
+
+
+def test_future_stamped_row_neither_wins_nor_keeps_fresh():
+    year = NOW + timedelta(days=365)
+    real = NOW - timedelta(hours=72)
+    res = {"drift_latest": [("A", year, real, 0, 0, "[]", "[]")]}
+    assert parse(res, now=NOW).drift == {}                  # time a year ahead: dropped
+    res = {"drift_latest": [("A", year, NOW, 0, 0, "[]", "[]")]}
+    assert parse(res, now=NOW).drift == {}
+    # a fast-but-sane station clock: freshness reads ingested, so it still goes stale
+    old = DriftRow(NOW + timedelta(minutes=5), NOW - timedelta(hours=72))
+    assert drift_hold([_st()], {"A": StationActivity(drift=old)}, NOW)
+    sql = queries(NOW)
+    assert "ingested_at DESC" in sql["drift_latest"] and "INTERVAL 600 SECOND" in sql["drift_latest"]
+
+
+def test_row_under_display_name_not_in_reporters_is_not_folded():
+    st = Station(name="AC0G-B4", grid6="", reporters={"ft8": ("AC0G/B4",)})
+    assert fold(Activity(drift={"AC0G-B4": _row()}), [st])["AC0G-B4"].drift is None

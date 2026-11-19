@@ -30,6 +30,7 @@ until a row arrives; a station with a live off_air alarm is judged, never grey.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from statistics import mean, median
@@ -254,8 +255,34 @@ def _source_findings(station: Station, sa: StationActivity, now: datetime,
     return out
 
 
+DRIFT_CHECKS = ("drift_fault", "test_restore")
+
+
+def drift_hold(stations, acts, now) -> set:
+    """(station, check) pairs of stations whose drift row went stale: their live
+    drift alarms stay frozen until a fresh row arrives."""
+    return {(st.name, c) for st in stations
+            if drift_stale(acts.get(st.name) or StationActivity(), now)
+            for c in DRIFT_CHECKS}
+
+
 def drift_stale(sa: StationActivity, now: datetime) -> bool:
-    return sa.drift is not None and (now - sa.drift.time).total_seconds() > DRIFT_STALE_S
+    """Stale by the server's clock (ingested_at); the station's own time only
+    stands in for a row without one."""
+    if sa.drift is None:
+        return False
+    return (now - (sa.drift.ingested or sa.drift.time)).total_seconds() > DRIFT_STALE_S
+
+
+_KIND = re.compile(r"[a-z][a-z0-9_-]{0,23}")
+
+
+def item_kind(key: str) -> str:
+    """The kind of a drift item key ("unit:x.service" -> "unit"), or "item" when
+    the key does not start with a plain kind word: a stray keyed by a path must
+    not leak the path as its kind."""
+    kind = key.partition(":")[0]
+    return kind if _KIND.fullmatch(kind) and ":" in key else "item"
 
 
 def _drift_findings(station: Station, sa: StationActivity, now: datetime) -> list[Finding]:
@@ -274,14 +301,16 @@ def _drift_findings(station: Station, sa: StationActivity, now: datetime) -> lis
         detail = str(it.get("detail", ""))
         check = "test_restore" if detail.startswith(TEST_ENDED) else "drift_fault"
         out[(check, key)] = Finding(station.name, check, "%s %s" % (station.name, key),
-                                    {"key": key, "detail": detail, "fix": str(it.get("fix", ""))})
+                                    {"key": key, "kind": item_kind(key), "severity": "fault",
+                                     "detail": detail, "fix": str(it.get("fix", ""))})
     for r in row.reminders:
         key = str(r.get("key", ""))
         text = "%s's test of %s (%s) ends %s; restore with: %s" % (
             r.get("by", "?"), key, r.get("reason", ""), r.get("until", "?"), r.get("fix", ""))
         out[("test_restore", key)] = Finding(station.name, "test_restore",
                                              "%s %s" % (station.name, key),
-                                             {"key": key, "text": text})
+                                             {"key": key, "kind": item_kind(key),
+                                              "severity": "reminder", "text": text})
     return list(out.values())
 
 

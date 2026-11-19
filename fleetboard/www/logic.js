@@ -5,7 +5,7 @@ const ENDPOINTS = ["https://db2.wspr.live/", "https://wd1.wsprdaemon.org/", "htt
 const FETCH_TIMEOUT_MS = 10000;
 const STALE_AFTER_S = 900;          // a board built more than 15 minutes ago greys out
 const LOW_FRACTION = 0.30;          // matches the server's LOW_FRACTION
-const COLUMNS = ["STATION", "ON AIR", "DEVICES", "CLIENTS", "SPOTS vs USUAL", "CAPACITY", "ALARMS"];
+const COLUMNS = ["STATION", "ON AIR", "DEVICES", "CLIENTS", "SPOTS vs USUAL", "CAPACITY", "DRIFT", "ALARMS"];
 const SOURCE_NAMES = {wspr_noise: "wspr noise", wspr_spots: "wspr spots", ft8: "ft8", codar: "codar", hfdl: "hfdl"};
 const SPOT_NAMES = {wspr_spots: "wspr", ft8: "ft8"};
 const NUMERIC_TYPE = /^(Nullable\()?(U?Int\d+|Float\d+)\)?$/;
@@ -94,6 +94,16 @@ function cellText(row, column, nowMs, stale) {
           (last >= LOW_FRACTION * usual ? (stale ? "" : " ✓") : " low");
       });
       return parts.length ? parts.join("; ") : "—";
+    }
+    case "DRIFT": {
+      if (!row.drift) return "—";
+      const d = parseJson(row.drift);
+      const parts = [];
+      if (Number(d.n_fault)) parts.push(d.n_fault + " fault");
+      if (Number(d.n_drift)) parts.push(d.n_drift + " drift");
+      if (Number(d.n_reminder)) parts.push(d.n_reminder + " test ending");
+      if (d.stale) parts.push("stale");
+      return parts.length ? parts.join(", ") : stale ? "—" : "✓";
     }
     case "ALARMS": {
       const open = Number(row.n_open) || 0, acked = Number(row.n_acked) || 0;

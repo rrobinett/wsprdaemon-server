@@ -138,3 +138,14 @@ test("alarmHeading marks an acknowledged alarm", () => {
   assert.equal(L.alarmHeading({check: "client_quiet", subject: "ft8", state: "acknowledged"}),
     "client_quiet ft8 (ACKNOWLEDGED: an admin is on it)");
 });
+
+test("cellText DRIFT: counts, stale, none", () => {
+  const d = (o) => JSON.stringify(Object.assign({n_fault: 0, n_drift: 0, n_reminder: 0, stale: false}, o));
+  assert.equal(L.cellText(row({}), "DRIFT"), "—");
+  assert.equal(L.cellText(row({drift: ""}), "DRIFT"), "—");
+  assert.equal(L.cellText(row({drift: d({})}), "DRIFT"), "✓");
+  assert.equal(L.cellText(row({drift: d({n_fault: 2, n_drift: 1, n_reminder: 1})}), "DRIFT"),
+    "2 fault, 1 drift, 1 test ending");
+  assert.equal(L.cellText(row({drift: d({n_drift: 3, stale: true})}), "DRIFT"), "3 drift, stale");
+  assert.equal(L.cellText(row({drift: "nope"}), "DRIFT"), "✓");
+});

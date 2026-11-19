@@ -53,11 +53,11 @@ class Ack:
 
 
 def step(prev, findings, acks, now, hold=frozenset()):
-    """hold: stations whose live alarms are left untouched (no streak change,
-    not returned)."""
+    """hold: stations, or (station, check) pairs, whose live alarms are left
+    untouched (no streak change, not returned)."""
     now = now.replace(microsecond=0)
     live = {(a.station, a.check, a.subject): a for a in prev if a.state in LIVE}
-    held = {k for k, a in live.items() if a.station in hold}
+    held = {k for k, a in live.items() if a.station in hold or (k[0], k[1]) in hold}
     changed: dict[tuple, Alarm] = {}
     found = set()
     for fd in findings:
