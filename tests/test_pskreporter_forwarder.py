@@ -477,3 +477,31 @@ def test_forwarder_reports_wd_software_version(monkeypatch):
     monkeypatch.delenv("PSKREPORTER_FORWARD_SOFTWARE", raising=False)
     inst = pf._pskreporter_for_station({}, rx_sign="AC0G/B4", rx_loc="EM38ww", dummy=True)
     assert inst.software == "WD_4.0"
+
+
+def test_forwarder_reports_wd_software_version_on_old_ftlib(monkeypatch):
+    """ftlib without software= (installed on wd30) still reports WD_4.0."""
+    class _Uploader:
+        receiverDelimiter = [0x99, 0x92]
+        def __init__(self, station):
+            self.station = station
+        def encodeString(self, s):
+            return [len(s)] + list(s.encode())
+        def pad(self, body, n):
+            return body + [0] * (-len(body) % n)
+        def getReceiverInformation(self):
+            return b"N1DQ-KA9Q-Radio/1.4"
+
+    class _OldPskReporter:
+        interval = 180
+        def __init__(self, *, callsign, grid, antenna, dummy=False, tcp=False):
+            self.station = {"callsign": callsign, "grid": grid, "antenna": antenna}
+            self.uploader = _Uploader(self.station)
+
+    mod = _types.ModuleType("pskreporter")
+    mod.PskReporter = _OldPskReporter
+    monkeypatch.setitem(sys.modules, "pskreporter", mod)
+    monkeypatch.delenv("PSKREPORTER_FORWARD_SOFTWARE", raising=False)
+    inst = pf._pskreporter_for_station({}, rx_sign="AC0G/B4", rx_loc="EM38ww", dummy=True)
+    info = inst.uploader.getReceiverInformation()
+    assert b"WD_4.0" in info and b"N1DQ" not in info

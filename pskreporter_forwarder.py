@@ -348,6 +348,38 @@ def _merge_base_enabled() -> bool:
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
+
+def forward_software() -> str:
+    """The decoding-software name PSKReporter shows for forwarded spots.
+    Without it ftlib reports its own default, "N1DQ-KA9Q-Radio/1.4"."""
+    return os.environ.get("PSKREPORTER_FORWARD_SOFTWARE", "WD_4.0")
+
+
+def _report_software(inst, software: str) -> None:
+    """Make an older ftlib (software name hardcoded in
+    Uploader.getReceiverInformation) report ``software`` instead.  Builds
+    the same receiver record that ftlib does, from the uploader's own
+    helpers, with only the software string changed."""
+    uploader = getattr(inst, "uploader", None)
+    if uploader is None or not hasattr(uploader, "encodeString"):
+        logger.warning("ftlib PskReporter has no uploader; reporting its default software name")
+        return
+    uploader_cls = type(uploader)
+
+    def getReceiverInformation():
+        st = uploader.station
+        body = [
+            b
+            for s in [st["callsign"], st["grid"], software, st.get("antenna", "")]
+            for b in uploader.encodeString(s or "")
+        ]
+        body = uploader.pad(body, 4)
+        return bytes(
+            uploader_cls.receiverDelimiter + list((len(body) + 4).to_bytes(2, "big")) + body
+        )
+
+    uploader.getReceiverInformation = getReceiverInformation
+
 def _pskreporter_for_station(
     cache: Dict[Tuple[str, str], object],
     *,
@@ -376,12 +408,10 @@ def _pskreporter_for_station(
     if inst is None:
         from pskreporter import PskReporter   # ftlib-pskreporter
         PskReporter.interval = upload_interval_sec()
-        inst = PskReporter(
+        kwargs = dict(
             callsign=rx_sign,
             grid=rx_loc,
             antenna="wsprdaemon-forwarded",
-            # Without this ftlib reports its own default, "N1DQ-KA9Q-Radio/1.4".
-            software=os.environ.get("PSKREPORTER_FORWARD_SOFTWARE", "WD_4.0"),
             dummy=dummy,
             # TCP path: ftlib's tcp_upload() opens a session per upload
             # and reports server-side errors back (UDP is silent on
@@ -390,6 +420,14 @@ def _pskreporter_for_station(
             # PSKReporter's end has identical session-id behavior.
             tcp=True,
         )
+        software = forward_software()
+        try:
+            inst = PskReporter(software=software, **kwargs)
+        except TypeError:
+            # ftlib before pjsg/ftlib-pskreporter#18 has no software=
+            # (and newer ftlib dropped the dt= field this module sends).
+            inst = PskReporter(**kwargs)
+            _report_software(inst, software)
         cache[key] = inst
     return inst
 
