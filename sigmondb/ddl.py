@@ -163,6 +163,22 @@ _SPEC = {
         part="toYYYYMM(time)",
         order="tx_id, reporter_id, time",
     ),
+    # One row a day per station, from `smd align --report` (sigmond drift report).
+    "station_drift": dict(
+        cols=[
+            ("time", "DateTime"), ("reporter_id", "String"),
+            ("host_key", "String"), ("hostname", "String"),
+            ("receivers_json", "String"),
+            ("release", "String"), ("baseline", "String"),
+            ("n_fault", "UInt32"), ("n_drift", "UInt32"), ("n_accepted", "UInt32"),
+            ("counts_json", "String"), ("faults_json", "String"),
+            ("reminders_json", "String"),
+            ("schema_version", "UInt16"),
+        ] + RECEIVED,
+        part="toYYYYMM(time)",
+        order="reporter_id, time",
+        ttl="time + INTERVAL 400 DAY",
+    ),
 }
 
 

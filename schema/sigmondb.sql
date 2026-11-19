@@ -225,6 +225,30 @@ ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMM(time)
 ORDER BY (tx_id, reporter_id, time);
 
+CREATE TABLE IF NOT EXISTS sigmondb.station_drift
+(
+    `time` DateTime CODEC(Delta(4), ZSTD(3)),
+    `reporter_id` String CODEC(ZSTD(3)),
+    `host_key` String CODEC(ZSTD(3)),
+    `hostname` String CODEC(ZSTD(3)),
+    `receivers_json` String CODEC(ZSTD(3)),
+    `release` String CODEC(ZSTD(3)),
+    `baseline` String CODEC(ZSTD(3)),
+    `n_fault` UInt32 CODEC(ZSTD(3)),
+    `n_drift` UInt32 CODEC(ZSTD(3)),
+    `n_accepted` UInt32 CODEC(ZSTD(3)),
+    `counts_json` String CODEC(ZSTD(3)),
+    `faults_json` String CODEC(ZSTD(3)),
+    `reminders_json` String CODEC(ZSTD(3)),
+    `schema_version` UInt16 CODEC(ZSTD(3)),
+    `received_at` Nullable(DateTime) CODEC(ZSTD(3)),
+    `ingested_at` DateTime DEFAULT now() CODEC(Delta(4), ZSTD(3))
+)
+ENGINE = ReplacingMergeTree(ingested_at)
+PARTITION BY toYYYYMM(time)
+ORDER BY (reporter_id, time)
+TTL time + INTERVAL 400 DAY;
+
 CREATE TABLE IF NOT EXISTS sigmondb.set_aside
 (
     `scope` LowCardinality(String) CODEC(ZSTD(3)),

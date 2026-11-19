@@ -159,3 +159,50 @@ def test_deeply_nested_line_costs_only_that_line(tmp_path):
     p.write_text(g + "\n" + "[" * 100000 + "\n" + g + "\n")
     rows, bad = read_chirp_file(p, "arrival", received_at=RA, fallback_reporter="AC0G/B4")
     assert (len(rows), bad) == (2, 1)
+
+
+DRIFT = dict(
+    time="2026-11-19T06:10:00Z", reporter_id="AC0G/B4", host_key="a1b2c3d4e5f6",
+    hostname="b4-vm", release="v3.94", baseline="v3.93", n_fault=1, n_drift=2,
+    n_accepted=3, counts_json='{"fault": 1}', faults_json='[{"kind": "x"}]',
+    reminders_json="[]", schema_version=1,
+    receivers_json=json.dumps([{"reporter_id": "AC0G/B4", "radiod_id": "r0",
+                                "grid6": "EN16ab", "pos_source": "gpsdo"}]))
+
+
+def test_ingest_station_drift_row():
+    t = chirp_row("station_drift", DRIFT, received_at=RA, fallback_reporter="AC0G/B4")
+    i = lambda c: idx(c, "station_drift")
+    assert len(t) == len(ddl.COLUMNS["station_drift"])
+    assert t[i("time")] == datetime(2026, 11, 19, 6, 10) and t[i("received_at")] == RA
+    assert (t[i("n_fault")], t[i("n_drift")], t[i("n_accepted")]) == (1, 2, 3)
+    assert t[i("faults_json")] == '[{"kind": "x"}]' and t[i("release")] == "v3.94"
+
+
+def test_station_drift_identity_columns_round_trip():
+    t = chirp_row("station_drift", DRIFT, received_at=RA, fallback_reporter="AC0G/B4")
+    i = lambda c: idx(c, "station_drift")
+    assert (t[i("host_key")], t[i("hostname")]) == ("a1b2c3d4e5f6", "b4-vm")
+    assert json.loads(t[i("receivers_json")]) == json.loads(DRIFT["receivers_json"])
+    # an older row without the identity columns still lands, with empty strings
+    old = {k: v for k, v in DRIFT.items() if k not in ("host_key", "hostname", "receivers_json")}
+    t = chirp_row("station_drift", old, received_at=RA, fallback_reporter="AC0G/B4")
+    assert (t[i("host_key")], t[i("hostname")], t[i("receivers_json")]) == ("", "", "")
+
+
+def test_ingest_station_drift_rejects_unknown_schema(tmp_path):
+    p = _lines(tmp_path, [DRIFT, dict(DRIFT, schema_version=2), DRIFT])
+    rows, bad = read_chirp_file(p, "station_drift", received_at=RA,
+                                fallback_reporter="AC0G/B4")
+    assert (len(rows), bad) == (2, 1)
+
+
+def test_station_drift_reporter_rule_applies(tmp_path):
+    with pytest.raises(RefusedReporter):
+        chirp_row("station_drift", dict(DRIFT, reporter_id="W1AW/B4"), received_at=RA,
+                  fallback_reporter="AC0G/B4")
+    refused = {}
+    rows, bad = read_chirp_file(_lines(tmp_path, [dict(DRIFT, reporter_id="W1AW/B4")]),
+                                "station_drift", received_at=RA,
+                                fallback_reporter="AC0G/B4", refused=refused)
+    assert (rows, bad, refused) == ([], 0, {"W1AW/B4": 1})

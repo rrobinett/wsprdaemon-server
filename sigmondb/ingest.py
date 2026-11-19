@@ -17,7 +17,7 @@ from sigmondb.rows import DATETIME_KEYS
 
 log = logging.getLogger(__name__)
 
-CHIRP_TABLES = ("arrival", "capture")
+CHIRP_TABLES = ("arrival", "capture", "station_drift")
 
 
 def _naive_utc(v):
