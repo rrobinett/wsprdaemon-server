@@ -9,6 +9,10 @@ condition that clears and returns opens a new instance that needs a new ack.
 Cleared alarms still feed alarm_hours: the usual-activity baseline must skip
 hours that fell inside an outage.
 
+The drift check adds two kinds: drift_fault, one per fault item, and
+test_restore, one per restore reminder or ended test.  Both name their subject
+"<station> <item key>" and clear like any other.
+
 `hold` names stations whose live alarms stay frozen this run.  When wd30's
 ingest stalls, its silent stations get no findings, and without the hold three
 such runs would clear a real outage (and drop its ack) on wd30's fault.

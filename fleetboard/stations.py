@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
-from .sources import SOURCES, Activity
+from .sources import SOURCES, Activity, DriftRow
 
 MAP_KEYS = ("name", "grid6", "source", "reporter", "is_alias", "expect_add", "expect_drop")
 _REQUIRED = ("name", "source", "reporter")
@@ -33,6 +33,7 @@ class StationActivity:
     days_active: dict[str, frozenset[date]] = field(default_factory=dict)
     usual_gap_s: dict[str, float] = field(default_factory=dict)
     hourly: dict[str, dict[datetime, int]] = field(default_factory=dict)
+    drift: DriftRow | None = None   # the station's latest drift row
 
 
 def _check_row(r) -> str | None:
@@ -123,5 +124,11 @@ def fold(activity: Activity, stations: list[Station]) -> dict[str, StationActivi
                     for t, n in h.items():
                         total[t] = total.get(t, 0) + n
                 sa.hourly[source] = total
+        # A drift row names the station's own reporter id; take the newest row
+        # under any name the station answers to, aliases included.
+        names = {st.name}.union(*(set(v) for v in st.reporters.values()))
+        rows = [activity.drift[n] for n in names if n in activity.drift]
+        if rows:
+            sa.drift = max(rows, key=lambda r: r.time)
         result[st.name] = sa
     return result

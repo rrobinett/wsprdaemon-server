@@ -58,11 +58,16 @@ INGEST_MIN_STATIONS = 4
 
 INGEST_STATION = "wd30"
 
+# The drift report: a row older than this is stale, and says nothing.
+DRIFT_STALE_S = 48 * 3600
+# A test whose exception ended arrives as a fault with this detail prefix.
+TEST_ENDED = "temporary test ended"
+
 
 @dataclass(frozen=True)
 class Finding:
     station: str
-    check: str      # off_air | client_quiet | never_started | activity_low | ingest_stalled
+    check: str      # off_air | client_quiet | never_started | activity_low | ingest_stalled | drift_fault | test_restore
     subject: str    # source name, or ""
     numbers: dict   # the inputs the verdict used; JSON-serialisable
 
@@ -249,6 +254,37 @@ def _source_findings(station: Station, sa: StationActivity, now: datetime,
     return out
 
 
+def drift_stale(sa: StationActivity, now: datetime) -> bool:
+    return sa.drift is not None and (now - sa.drift.time).total_seconds() > DRIFT_STALE_S
+
+
+def _drift_findings(station: Station, sa: StationActivity, now: datetime) -> list[Finding]:
+    """One finding per fault item and per reminder, from the latest drift row.
+
+    A stale row (older than DRIFT_STALE_S) yields none: the board shows it as
+    stale, and off_air already covers a dark station.  An ended test is a
+    test_restore, like a reminder, because the baseline wants restoring.  Drift
+    items with no fault raise nothing; the board counts them."""
+    row = sa.drift
+    if row is None or drift_stale(sa, now):
+        return []
+    out = {}
+    for it in row.faults:
+        key = str(it.get("key") or "%s:%s" % (it.get("kind", ""), it.get("subject", "")))
+        detail = str(it.get("detail", ""))
+        check = "test_restore" if detail.startswith(TEST_ENDED) else "drift_fault"
+        out[(check, key)] = Finding(station.name, check, "%s %s" % (station.name, key),
+                                    {"key": key, "detail": detail, "fix": str(it.get("fix", ""))})
+    for r in row.reminders:
+        key = str(r.get("key", ""))
+        text = "%s's test of %s (%s) ends %s; restore with: %s" % (
+            r.get("by", "?"), key, r.get("reason", ""), r.get("until", "?"), r.get("fix", ""))
+        out[("test_restore", key)] = Finding(station.name, "test_restore",
+                                             "%s %s" % (station.name, key),
+                                             {"key": key, "text": text})
+    return list(out.values())
+
+
 def evaluate(stations: list[Station], acts: dict[str, StationActivity], now: datetime,
              alarm_hours: dict[str, set[datetime]],
              live: dict[str, set[tuple[str, str]]] | None = None) -> list[Finding]:
@@ -278,6 +314,8 @@ def evaluate(stations: list[Station], acts: dict[str, StationActivity], now: dat
             continue
         live_quiet = {subj for check, subj in live.get(st.name, ()) if check == "client_quiet"}
         out += _source_findings(st, sa, now, alarm_hours.get(st.name, set()), expected, live_quiet)
+    for st in stations:
+        out += _drift_findings(st, acts.get(st.name) or StationActivity(), now)
     if stalled:
         out.append(Finding(INGEST_STATION, "ingest_stalled", "",
                            {"n_silent": len(off), "n_with_history": len(with_history),

@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
     'status_subdir': 'status',
     'max_status_per_insert': 50000,
     'batch_flush_status': 5000,
-    # sigmondb.{arrival,capture} ingestion (chirp/ peer subdir): off by
+    # sigmondb.{arrival,capture,station_drift} ingestion (chirp/ peer subdir): off by
     # default, like psk and status.
     # Flip via env WSPRDAEMON_INGEST_CHIRP=1 or --ingest-chirp.
     'ingest_chirp': False,
@@ -2421,7 +2421,7 @@ def main():
                             'status/ peer subdir '
                             '(also honors WSPRDAEMON_INGEST_STATUS=1 env var)')
     parser.add_argument('--ingest-chirp', action='store_true',
-                       help='Enable sigmondb.{arrival,capture} ingestion from the '
+                       help='Enable sigmondb.{arrival,capture,station_drift} ingestion from the '
                             'chirp/ peer subdir '
                             '(also honors WSPRDAEMON_INGEST_CHIRP=1 env var)')
     parser.add_argument('--ingest-psk', action='store_true',
@@ -2487,7 +2487,7 @@ def main():
             or os.environ.get('WSPRDAEMON_INGEST_CHIRP', '0') == '1'):
         config['ingest_chirp'] = True
         log(f"Chirp ingestion ENABLED: subdir={config['chirp_subdir']}/ "
-            f"-> sigmondb.{{arrival,capture}}", "INFO")
+            f"-> sigmondb.{{arrival,capture,station_drift}}", "INFO")
     else:
         log("Chirp ingestion disabled (use --ingest-chirp or "
             "WSPRDAEMON_INGEST_CHIRP=1)", "DEBUG")

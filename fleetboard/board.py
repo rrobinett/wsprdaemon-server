@@ -18,13 +18,13 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from .alarms import LIVE, alarm_hours, live_map
-from .checks import Finding, expected_sources, live_subjects, spots_vs_usual, verdict
+from .checks import Finding, drift_stale, expected_sources, live_subjects, spots_vs_usual, verdict
 from .sources import BASELINE_DAYS, SOURCES, USUAL_SOURCES
 
 SCHEMAS = {
     "fleet_board": [
         ("station", "String"), ("grid6", "String"), ("verdict", "String"),
-        ("sources", "String"), ("spots_vs_usual", "String"),
+        ("sources", "String"), ("spots_vs_usual", "String"), ("drift", "String"),
         ("n_open", "UInt16"), ("n_acked", "UInt16"), ("rank", "UInt16"),
         ("built_at_utc", "Float64"),
     ],
@@ -74,6 +74,18 @@ def _usual_json(sa, now, excluded, expected):
     return json.dumps(out, sort_keys=True)
 
 
+def _drift_json(sa, now):
+    """The drift column: counts from the station's latest drift report, or ''
+    with none.  A stale report shows its age and counts, and raises no alarm."""
+    row = sa.drift
+    if row is None:
+        return ""
+    return json.dumps({"n_fault": row.n_fault, "n_drift": row.n_drift,
+                       "n_reminder": len(row.reminders),
+                       "stale": drift_stale(sa, now), "time_utc": _unix(row.time)},
+                      sort_keys=True)
+
+
 def build(stations, acts, alarms, findings: list[Finding], built_at: float,
           excluded_hours=None, now: datetime | None = None) -> dict[str, list[dict]]:
     """alarms: the live alarms.  excluded_hours: station -> hours the baseline
@@ -99,6 +111,7 @@ def build(stations, acts, alarms, findings: list[Finding], built_at: float,
             "verdict": verdict(st, sa, findings),
             "sources": _sources_json(st, sa, findings, expected),
             "spots_vs_usual": _usual_json(sa, now, excluded_hours.get(st.name, set()), expected),
+            "drift": _drift_json(sa, now),
             "n_open": n_open.get(st.name, 0), "n_acked": n_acked.get(st.name, 0),
             "rank": 0, "built_at_utc": built_at,
         })

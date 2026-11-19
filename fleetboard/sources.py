@@ -11,6 +11,7 @@ without a database.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
@@ -39,6 +40,21 @@ _SPEC = {
 
 Key = tuple[str, str]
 
+# The drift report (sigmond `smd align --report`) lands one sigmondb.station_drift
+# row a day.  The latest row per reporter feeds the drift check; it is not an
+# arrival source, so it never counts toward liveness.
+DRIFT_TABLE = "sigmondb.station_drift"
+DRIFT_WINDOW_DAYS = 30
+
+
+@dataclass(frozen=True)
+class DriftRow:
+    time: datetime              # the station's own clock, naive UTC
+    n_fault: int = 0
+    n_drift: int = 0
+    faults: tuple = ()          # dicts: kind, subject, detail, fix, key
+    reminders: tuple = ()       # dicts: station, key, by, reason, until, fix
+
 
 @dataclass(frozen=True)
 class Activity:
@@ -46,6 +62,7 @@ class Activity:
     days_active: dict[Key, frozenset[date]] = field(default_factory=dict)
     usual_gap_s: dict[Key, float] = field(default_factory=dict)
     hourly: dict[Key, dict[datetime, int]] = field(default_factory=dict)
+    drift: dict[str, DriftRow] = field(default_factory=dict)  # reporter_id -> latest row
 
 
 def _lit(t: datetime) -> str:
@@ -99,7 +116,22 @@ def queries(now: datetime) -> dict[str, str]:
                 f"WHERE {_where('time', now, f'{BASELINE_DAYS * 24 + 3} HOUR', extra)} "
                 f"GROUP BY reporter, hour"
             )
+    out["drift_latest"] = (
+        f"SELECT reporter_id AS reporter, time, n_fault, n_drift, faults_json, reminders_json "
+        f"FROM {DRIFT_TABLE} "
+        f"WHERE time > {_lit(now)} - INTERVAL {DRIFT_WINDOW_DAYS} DAY "
+        f"ORDER BY reporter_id, time DESC LIMIT 1 BY reporter_id"
+    )
     return out
+
+
+def _json_list(text) -> tuple:
+    """A JSON list of objects, or () for anything else (a bad row says nothing)."""
+    try:
+        v = json.loads(text or "[]")
+    except (TypeError, ValueError):
+        return ()
+    return tuple(x for x in v if isinstance(x, dict)) if isinstance(v, list) else ()
 
 
 def parse(results: dict[str, list[tuple]]) -> Activity:
@@ -121,7 +153,14 @@ def parse(results: dict[str, list[tuple]]) -> Activity:
         if src in HOURLY_SOURCES:
             for rep, h, n in results.get(f"{src}_hourly", []):
                 hourly.setdefault((src, rep), {})[_naive_utc(h)] = int(n)
+    drift: dict[str, DriftRow] = {}
+    for rep, t, n_fault, n_drift, faults, reminders in results.get("drift_latest", []):
+        if t is None:
+            continue
+        drift[rep] = DriftRow(_naive_utc(t), int(n_fault), int(n_drift),
+                              _json_list(faults), _json_list(reminders))
     return Activity(
+        drift=drift,
         last_arrival=last,
         days_active={k: frozenset(v) for k, v in days.items()},
         usual_gap_s=gap,
