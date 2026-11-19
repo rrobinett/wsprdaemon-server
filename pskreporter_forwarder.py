@@ -380,6 +380,8 @@ def _pskreporter_for_station(
             callsign=rx_sign,
             grid=rx_loc,
             antenna="wsprdaemon-forwarded",
+            # Without this ftlib reports its own default, "N1DQ-KA9Q-Radio/1.4".
+            software=os.environ.get("PSKREPORTER_FORWARD_SOFTWARE", "WD_4.0"),
             dummy=dummy,
             # TCP path: ftlib's tcp_upload() opens a session per upload
             # and reports server-side errors back (UDP is silent on

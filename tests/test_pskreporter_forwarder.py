@@ -25,8 +25,9 @@ sys.path.insert(0, str(HERE.parent))
 class _FakeFtlibPskReporter:
     instances: list = []
     interval = 180          # ftlib's own default
-    def __init__(self, *, callsign, grid, antenna, dummy=False, tcp=False):
+    def __init__(self, *, callsign, grid, antenna, software=None, dummy=False, tcp=False):
         self.callsign = callsign
+        self.software = software
         self.grid = grid
         self.antenna = antenna
         self.dummy = dummy
@@ -468,3 +469,11 @@ class TestUploadInterval(unittest.TestCase):
     def test_garbage_env_falls_back_to_default(self):
         os.environ["PSKREPORTER_FORWARDER_UPLOAD_SEC"] = "soon"
         self.assertEqual(self._interval_after_forward(), 300)
+
+
+def test_forwarder_reports_wd_software_version(monkeypatch):
+    """Forwarded spots say WD_4.0, not ftlib's default 'N1DQ-KA9Q-Radio/1.4'."""
+    _install_fake_pskreporter()
+    monkeypatch.delenv("PSKREPORTER_FORWARD_SOFTWARE", raising=False)
+    inst = pf._pskreporter_for_station({}, rx_sign="AC0G/B4", rx_loc="EM38ww", dummy=True)
+    assert inst.software == "WD_4.0"
