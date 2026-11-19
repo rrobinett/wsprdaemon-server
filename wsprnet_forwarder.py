@@ -54,6 +54,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -61,7 +62,7 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("wsprnet_forwarder")
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 DEFAULT_LEADER_URL = "http://gw1.wsprdaemon.org/wsprnet-leader.txt"
 DEFAULT_WATERMARK_PATH = Path("/var/lib/wsprdaemon/wsprnet_forwarder/watermark")
@@ -105,6 +106,16 @@ MAX_SPOTS_PER_UPLOAD = 999
 # (see DEFAULT_HTTP_TIMEOUT).  A smaller transaction also means a failure
 # re-posts 250 spots, not 999.  Same figure as WD's client (8a48999).
 DEFAULT_MAX_PER_UPLOAD = 250
+# ⚡ HOW MANY REPORTERS POST AT ONCE.  Measured on wd30 2026-11-19: a
+# 250-spot POST takes ~40 s, against a 30 ms round trip — all of it
+# wsprnet's own per-spot processing (~160 ms/spot).  Posted one reporter
+# after another that caps the forwarder at ~22k spots/h, while proxied
+# stations were already sending 15-23k/h and growing as sigmond sites
+# move over: the watermark fell 5 h behind.  Before proxying, every one of
+# these stations posted to wsprnet ON ITS OWN, concurrently, so posting
+# reporters side by side asks of wsprnet only what the stations did.
+# Each reporter's chunks stay serial (see _post_group).
+DEFAULT_PARALLEL_POSTS = 8
 # Sized against the batching window below: one 5-minute window across this
 # fleet is ~8,000 rows (2.3 M WSPR spots/day), so a 2,000-row cap would have
 # meant four passes per window and a forwarder that falls permanently behind
@@ -706,13 +717,60 @@ def post_mept(url: str, body: bytes, *, timeout: float,
         return False, f"{type(exc).__name__}: {exc}", None
 
 
+def _post_group(call: str, grid: str, ver: str, pairs, *, url: str,
+                timeout: float, max_per_upload: int, opener=None
+                ) -> Tuple[int, int, Optional[datetime]]:
+    """POST one reporter's spots, chunk by chunk, IN ORDER.
+
+    Returns (posted, failed, stopped_at) for this reporter alone; the
+    caller combines reporters.  Chunks stay serial within a reporter: a
+    cut at chunk k means chunks after k would hit the same cutoff, and the
+    cut point is only meaningful if everything before it was read.
+    """
+    posted = failed = 0
+    lines = [ln for _r, ln in pairs]
+    for i in range(0, len(lines), max_per_upload):
+        chunk = lines[i:i + max_per_upload]
+        body = build_multipart(
+            version=ver, call=call, grid=grid,
+            allmept=("\n".join(chunk) + "\n").encode())
+        t0 = time.monotonic()
+        ok, detail, cut = post_mept(url, body, timeout=timeout,
+                                    expected=len(chunk), opener=opener)
+        took = time.monotonic() - t0
+        if not ok:
+            failed += len(chunk)
+            logger.warning("POST failed for %s/%s (%s, %d spots, %.1f s): %s",
+                           call, grid, ver, len(chunk), took, detail)
+            continue
+        posted += len(chunk) if cut is None else cut
+        logger.info("posted %d spot(s) as %s/%s (%s) in %.1f s — %s",
+                    len(chunk), call, grid, ver, took, detail)
+        if cut is None:
+            continue
+        # ⛔ wsprnet gave up partway.  Everything after row i+cut in THIS
+        # group was never processed, so the watermark must stop there — and
+        # there is no point posting this group's later chunks, which would
+        # hit the same cutoff and add only duplicates.
+        if cut <= 0:
+            # It read none of this chunk.  There is no safe point to
+            # advance to, so say FAILED and let the watermark hold
+            # outright — the existing, already-tested path.
+            failed += len(chunk)
+            return posted, failed, None
+        return posted, failed, pairs[min(i + cut - 1, len(pairs) - 1)][0].ingested_at
+    return posted, failed, None
+
+
 def forward_rows(rows: List[SpotRow], *, url: str, version: str = "",
                  overrides: Dict[str, Dict[str, str]],
                  timeout: float = DEFAULT_HTTP_TIMEOUT,
                  max_per_upload: int = DEFAULT_MAX_PER_UPLOAD,
                  opener=None,
-                 on_wsprnet=None) -> Tuple[int, int, Optional[datetime]]:
-    """Dedup, group by reporter, POST.
+                 on_wsprnet=None,
+                 parallel: int = DEFAULT_PARALLEL_POSTS
+                 ) -> Tuple[int, int, Optional[datetime]]:
+    """Dedup, group by reporter, POST — up to `parallel` reporters at once.
 
     Returns (posted, failed, stopped_at).  `stopped_at` is None when every
     chunk was read in full.  Otherwise it is the `ingested_at` of the LAST
@@ -759,44 +817,31 @@ def forward_rows(rows: List[SpotRow], *, url: str, version: str = "",
             logger.info("%d of %d already on wsprnet (wspr.rx); posting "
                         "the rest", sum(known), len(probes))
 
-    for call, grid, ver, pairs in prepared:
-        if not pairs:
-            continue
-        lines = [ln for _r, ln in pairs]
-        for i in range(0, len(lines), max_per_upload):
-            chunk = lines[i:i + max_per_upload]
-            body = build_multipart(
-                version=ver, call=call, grid=grid,
-                allmept=("\n".join(chunk) + "\n").encode())
-            ok, detail, cut = post_mept(url, body, timeout=timeout,
-                                        expected=len(chunk), opener=opener)
-            if not ok:
-                failed += len(chunk)
-                logger.warning("POST failed for %s/%s (%s, %d spots): %s",
-                               call, grid, ver, len(chunk), detail)
-                continue
-            posted += len(chunk) if cut is None else cut
-            logger.info("posted %d spot(s) as %s/%s (%s) — %s",
-                        len(chunk), call, grid, ver, detail)
-            if cut is None:
-                continue
-            # ⛔ wsprnet gave up partway.  Everything after row i+cut in
-            # THIS group was never processed, so the watermark must stop
-            # there — and there is no point posting this group's later
-            # chunks, which would hit the same cutoff and add only
-            # duplicates.  Take the EARLIEST such point across groups:
-            # one cursor serves them all, so the safe answer is the most
-            # conservative one.
-            if cut <= 0:
-                # It read none of this chunk.  There is no safe point to
-                # advance to, so say FAILED and let the watermark hold
-                # outright — the existing, already-tested path.
-                failed += len(chunk)
-                break
-            here = pairs[min(i + cut - 1, len(pairs) - 1)][0].ingested_at
-            if stopped_at is None or here < stopped_at:
-                stopped_at = here
-            break
+    work = [(c, g, v, pairs) for c, g, v, pairs in prepared if pairs]
+    if not work:
+        return posted, failed, stopped_at
+
+    def _one(item):
+        c, g, v, pairs = item
+        return _post_group(c, g, v, pairs, url=url, timeout=timeout,
+                           max_per_upload=max_per_upload, opener=opener)
+
+    # ⚡ ONE REPORTER PER WORKER, ITS OWN CHUNKS IN ORDER.  See
+    # DEFAULT_PARALLEL_POSTS for why the reporters run side by side.
+    workers = max(1, min(int(parallel or 1), len(work)))
+    if workers == 1:
+        results = [_one(item) for item in work]
+    else:
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="wsprnet-post") as pool:
+            results = list(pool.map(_one, work))
+    for p, f, here in results:
+        posted += p
+        failed += f
+        # Take the EARLIEST cut across groups: one cursor serves them all,
+        # so the safe answer is the most conservative one.
+        if here is not None and (stopped_at is None or here < stopped_at):
+            stopped_at = here
     return posted, failed, stopped_at
 
 
@@ -820,6 +865,7 @@ class ForwarderConfig:
     post_interval_sec: int = DEFAULT_POST_INTERVAL_SEC
     http_timeout: float = DEFAULT_HTTP_TIMEOUT
     max_per_upload: int = DEFAULT_MAX_PER_UPLOAD
+    parallel_posts: int = DEFAULT_PARALLEL_POSTS
     retry_holdoff_sec: float = RETRY_HOLDOFF_SEC
     dry_run: bool = False
     once: bool = False
@@ -928,7 +974,8 @@ def run_loop(cfg: ForwarderConfig, *, ch_client_factory=None) -> int:
                     rows, url=cfg.url, version=VERSION,
                     overrides=overrides, timeout=cfg.http_timeout,
                     max_per_upload=cfg.max_per_upload,
-                    on_wsprnet=on_wsprnet)
+                    on_wsprnet=on_wsprnet,
+                    parallel=cfg.parallel_posts)
                 # ⛔ ADVANCE ONLY ON A CLEAN PASS.  Advancing past spots
                 # that failed to post loses them with no record anywhere;
                 # re-posting a duplicate is harmless, since wsprnet
@@ -1049,6 +1096,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="before each POST, drop spots wspr.rx shows wsprnet "
                         "already holds (default on; "
                         "WSPRNET_FORWARDER_SKIP_KNOWN=0 disables)")
+    p.add_argument("--parallel-posts", type=int,
+                   default=int(os.environ.get(
+                       "WSPRNET_FORWARDER_PARALLEL_POSTS")
+                       or DEFAULT_PARALLEL_POSTS),
+                   help="reporters POSTed concurrently (1 = one at a time). "
+                        "Env: WSPRNET_FORWARDER_PARALLEL_POSTS")
     p.add_argument("--once", action="store_true")
     p.add_argument("-v", "--verbose", action="count", default=0)
     a = p.parse_args(argv)
@@ -1070,6 +1123,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         db_password=a.clickhouse_password, url=a.url,
         poll_sec=a.poll_sec, batch=a.batch,
         post_interval_sec=max(0, a.post_interval_sec),
+        parallel_posts=max(1, a.parallel_posts),
         dry_run=a.dry_run, once=a.once, skip_known=a.skip_known)
     logger.info("wsprnet_forwarder %s on %s → %s (leader: %s)",
                 VERSION, cfg.this_host, cfg.url,

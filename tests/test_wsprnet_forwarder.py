@@ -1267,3 +1267,167 @@ def test_the_lookup_is_BOUNDED_by_the_sorting_key_and_the_batch_window():
     assert sorted(params["calls"]) == ["AC0G", "K3LR"]
     assert params["t0"] == _epoch(T0)
     assert params["t1"] == _epoch(T0 + timedelta(minutes=8))
+
+
+# ---------- parallel posting across reporters ----------
+#
+# wd30, 2026-11-19.  A 250-spot POST took ~40 s against a 30 ms round trip:
+# wsprnet's own processing.  One reporter after another capped the
+# forwarder near 22k spots/h while proxied stations sent 15-23k/h, and the
+# watermark fell 5 h behind.  Reporters now post side by side; each
+# reporter's own chunks stay in order.
+
+import threading  # noqa: E402
+import time as _time  # noqa: E402
+
+
+def _reporters(n_sites, per_site):
+    return [_row(rx_sign=f"S{s}", rx_loc="FN21ei", tx_sign=f"W{i:04d}",
+                 frequency_mhz=14.0 + i * 0.001,
+                 ingested_at=T0 + timedelta(seconds=s * 1000 + i))
+            for s in range(n_sites) for i in range(per_site)]
+
+
+class _Tracker:
+    """An opener that records in-flight POSTs, per reporter and overall."""
+    def __init__(self, delay=0.05, fail_call=None):
+        self.delay, self.fail_call = delay, fail_call
+        self.lock = threading.Lock()
+        self.inflight, self.peak = 0, 0
+        self.per_call, self.per_call_peak = {}, {}
+        self.order = {}
+
+    def __call__(self, req, timeout=None):
+        call = req.data.split(b'name="call"\r\n\r\n')[1].split(b"\r\n")[0].decode()
+        first = _posted_calls([req])[0]
+        with self.lock:
+            self.inflight += 1
+            self.peak = max(self.peak, self.inflight)
+            n = self.per_call.get(call, 0) + 1
+            self.per_call[call] = n
+            self.per_call_peak[call] = max(self.per_call_peak.get(call, 0), n)
+            self.order.setdefault(call, []).append(first)
+        try:
+            _time.sleep(self.delay)
+            if call == self.fail_call:
+                raise OSError("connection reset")
+        finally:
+            with self.lock:
+                self.inflight -= 1
+                self.per_call[call] -= 1
+        class R:
+            status = 200
+            def read(self): return b"ok"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        return R()
+
+
+def test_DIFFERENT_reporters_post_AT_THE_SAME_TIME():
+    """⚡ Serial posting was the whole 5-hour backlog.  Eight reporters with
+    a slow wsprnet must overlap, not queue."""
+    tr = _Tracker(delay=0.2)
+    t0 = _time.monotonic()
+    posted, failed, cut = wf.forward_rows(
+        _reporters(8, 10), url="http://x/", version="1", overrides={},
+        opener=tr, parallel=8)
+    took = _time.monotonic() - t0
+    assert (posted, failed, cut) == (80, 0, None)
+    assert tr.peak == 8, f"expected 8 reporters in flight, saw {tr.peak}"
+    assert took < 1.0, f"8 x 0.2 s POSTs took {took:.2f} s — still serial"
+
+
+def test_ONE_reporters_chunks_stay_SERIAL_and_IN_ORDER():
+    """⛔ A cut at chunk k is only a safe cursor if every earlier chunk of
+    that reporter was read first, so a reporter never races itself."""
+    tr = _Tracker(delay=0.02)
+    posted, failed, _ = wf.forward_rows(
+        _reporters(3, 1000), url="http://x/", version="1", overrides={},
+        opener=tr, parallel=8)
+    assert (posted, failed) == (3000, 0)
+    assert all(p == 1 for p in tr.per_call_peak.values()), tr.per_call_peak
+    for call, firsts in tr.order.items():
+        assert firsts == ["W0000", "W0250", "W0500", "W0750"], (call, firsts)
+
+
+def test_parallel_ONE_is_strictly_one_POST_at_a_time():
+    tr = _Tracker(delay=0.01)
+    wf.forward_rows(_reporters(4, 10), url="http://x/", version="1",
+                    overrides={}, opener=tr, parallel=1)
+    assert tr.peak == 1
+
+
+def test_the_worker_count_is_CAPPED_by_the_setting():
+    tr = _Tracker(delay=0.1)
+    wf.forward_rows(_reporters(12, 5), url="http://x/", version="1",
+                    overrides={}, opener=tr, parallel=4)
+    assert tr.peak == 4
+
+
+def test_one_reporter_FAILING_does_not_stop_the_others_and_IS_COUNTED():
+    """The others still post; the failure still holds the watermark,
+    exactly as it did when reporters ran one after another."""
+    tr = _Tracker(delay=0.01, fail_call="S2")
+    posted, failed, cut = wf.forward_rows(
+        _reporters(5, 300), url="http://x/", version="1", overrides={},
+        opener=tr, parallel=8)
+    assert failed == 300 and posted == 1200 and cut is None
+
+
+def test_the_EARLIEST_cut_still_wins_when_reporters_finish_OUT_OF_ORDER():
+    """The site cut earliest in ingest order may well be the LAST thread to
+    finish.  The cursor must not depend on which thread came home first."""
+    early = [_row(rx_sign="EARLY", tx_sign=f"W{i:04d}",
+                  frequency_mhz=14.0 + i * 0.001,
+                  ingested_at=T0 + timedelta(seconds=i)) for i in range(300)]
+    late = [_row(rx_sign="LATE", tx_sign=f"K{i:04d}",
+                 frequency_mhz=10.0 + i * 0.001,
+                 ingested_at=T0 + timedelta(hours=1, seconds=i))
+            for i in range(300)]
+    cut_reply = (b"Upload limit of 1000 spots or 100 dupes reached.<br>"
+                 b"0 out of 100 spot(s) added<br>")
+
+    def opener(req, timeout=None):
+        if b'name="call"\r\n\r\nEARLY' in req.data:
+            _time.sleep(0.2)          # the earliest cut comes home LAST
+        class R:
+            status = 200
+            def read(self): return cut_reply
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        return R()
+    _p, _f, stopped_at = wf.forward_rows(
+        late + early, url="http://x/", version="1", overrides={},
+        opener=opener, parallel=8)
+    assert stopped_at == early[99].ingested_at
+
+
+def test_the_parallel_default_is_more_than_one_and_the_env_can_set_it():
+    assert wf.DEFAULT_PARALLEL_POSTS > 1
+    assert wf.ForwarderConfig(this_host="x").parallel_posts == \
+        wf.DEFAULT_PARALLEL_POSTS
+    seen = {}
+    with mock.patch.dict("os.environ",
+                         {"WSPRNET_FORWARDER_PARALLEL_POSTS": "3"}), \
+         mock.patch.object(wf, "run_loop",
+                           side_effect=lambda cfg: seen.setdefault("c", cfg) and 0):
+        wf.main(["--this-host", "x"])
+    assert seen["c"].parallel_posts == 3
+
+
+def test_the_loop_HANDS_the_parallel_setting_to_forward_rows():
+    seen = {}
+
+    def fwd(*a, **k):
+        seen.update(k)
+        return (1, 0, None)
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = wf.ForwarderConfig(this_host="wd20", pin_leader="wd20",
+                                 watermark_path=Path(tmp) / "wm", once=True,
+                                 parallel_posts=5)
+        with mock.patch.object(wf, "fetch_pending", return_value=[_row()]), \
+             mock.patch.object(wf, "forward_rows", side_effect=fwd), \
+             mock.patch.object(wf, "load_reporter_overrides", return_value={}):
+            wf._STOP = False
+            wf.run_loop(cfg, ch_client_factory=lambda: object())
+    assert seen["parallel"] == 5
