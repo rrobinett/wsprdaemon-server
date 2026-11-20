@@ -207,3 +207,8 @@ def test_station_drift_reporter_rule_applies(tmp_path):
                                 "station_drift", received_at=RA,
                                 fallback_reporter="AC0G/B4", refused=refused)
     assert (rows, bad, refused) == ([], 0, {"W1AW/B4": 1})
+
+
+def test_station_drift_row_carries_sender():
+    t = chirp_row("station_drift", DRIFT, received_at=RA, fallback_reporter="AC0G/B2")
+    assert t[list(ddl.COLUMN_TYPES["station_drift"]).index("sender")] == "AC0G/B2"

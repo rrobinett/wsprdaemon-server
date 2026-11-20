@@ -89,6 +89,10 @@ def chirp_row(table, row, *, received_at, fallback_reporter, warned=None):
         raise ValueError("schema_version %r, want %d" % (row.get("schema_version"), SCHEMA_VERSION))
     row = whitelist(table, row, warned)
     row["received_at"] = received_at
+    if table == "station_drift":
+        # The tar's path-derived RX_SITE.  Never read from the row: the row's own
+        # claim is what the board checks the sender against.
+        row["sender"] = fallback_reporter
     if not row.get("reporter_id"):
         row["reporter_id"] = fallback_reporter
     elif not isinstance(row["reporter_id"], str) or (

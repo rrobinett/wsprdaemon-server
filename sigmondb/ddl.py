@@ -174,6 +174,7 @@ _SPEC = {
             ("counts_json", "String"), ("faults_json", "String"),
             ("reminders_json", "String"),
             ("schema_version", "UInt16"),
+            ("sender", "String"),
         ] + RECEIVED,
         part="toYYYYMM(time)",
         order="reporter_id, time",
@@ -260,7 +261,9 @@ MIGRATIONS = tuple(
     "CODEC(ZSTD(3)) AFTER engineering" % t
     for t in ("capture", "arrival")) + (
     "ALTER TABLE sigmondb.arrival ADD COLUMN IF NOT EXISTS freq_hz Nullable(Float64) "
-    "CODEC(ZSTD(3)) AFTER delay_sigma_ns",)
+    "CODEC(ZSTD(3)) AFTER delay_sigma_ns",
+    "ALTER TABLE sigmondb.station_drift ADD COLUMN IF NOT EXISTS sender String "
+    "CODEC(ZSTD(3)) AFTER schema_version",)
 
 
 def is_nullable(typ):

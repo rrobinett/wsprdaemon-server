@@ -241,6 +241,7 @@ CREATE TABLE IF NOT EXISTS sigmondb.station_drift
     `faults_json` String CODEC(ZSTD(3)),
     `reminders_json` String CODEC(ZSTD(3)),
     `schema_version` UInt16 CODEC(ZSTD(3)),
+    `sender` String CODEC(ZSTD(3)),
     `received_at` Nullable(DateTime) CODEC(ZSTD(3)),
     `ingested_at` DateTime DEFAULT now() CODEC(Delta(4), ZSTD(3))
 )
@@ -290,3 +291,5 @@ ALTER TABLE sigmondb.capture ADD COLUMN IF NOT EXISTS received_at Nullable(DateT
 ALTER TABLE sigmondb.arrival ADD COLUMN IF NOT EXISTS received_at Nullable(DateTime) CODEC(ZSTD(3)) AFTER engineering;
 
 ALTER TABLE sigmondb.arrival ADD COLUMN IF NOT EXISTS freq_hz Nullable(Float64) CODEC(ZSTD(3)) AFTER delay_sigma_ns;
+
+ALTER TABLE sigmondb.station_drift ADD COLUMN IF NOT EXISTS sender String CODEC(ZSTD(3)) AFTER schema_version;
