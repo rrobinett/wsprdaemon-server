@@ -40,6 +40,41 @@ def test_a_key_that_cannot_give_s_gives_none(gkey):
     assert hs.period_and_sweep(gkey) is None
 
 
+# A crafted key must not raise in the arithmetic (a period that rounds to 0 ns divides by
+# zero; inf and nan overflow round()).  Bounds: 1e-3 s <= S <= P <= 3600 s, all finite.
+@pytest.mark.parametrize("gkey", [
+    "4.4630 -25.73 0s", "4.4630 -25.73 1e-10s", "4.4630 -25.73 infs", "4.4630 -25.73 nans",
+    "4.4630 -25.73 -1s", "4.4630 -25.73 sweepinfs", "4.4630 -25.73 sweepnans",
+    "4.4630 -25.73 sweep1e-10s", "4.4630 -25.73 sweep0.0005s", "4.4630 -25.73 4000s",
+    "4.4630 -25.73 sweep2s", "4.4630 -25.73 2s sweep3s"])
+def test_a_key_out_of_bounds_gives_none_and_the_row_is_left_out(gkey, capsys):
+    assert hs.period_and_sweep(gkey) is None
+    row = _row(gkey, "codar-sounder/0.7.0", 700 * MS)
+    assert hs.sweep_start_delay(row) is None
+    assert hs.to_sweep_start([row, _row("4.4630 -25.73", "codar-sounder/0.7.0", 700 * MS)],
+                             "solve") == [dict(row, group_key="4.4630 -25.73", delay_ns=200 * MS)]
+    assert "solve: 1 codar-sounder" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("gkey", ["4.4630 -25.73 0.001s", "4.4630 -25.73 3600s",
+                                  "4.4630 -25.73 sweep0.001s"])
+def test_the_bounds_are_inclusive(gkey):
+    assert hs.period_and_sweep(gkey) is not None
+
+
+@pytest.mark.parametrize("ps", [(0.0, 1.0), (1e-12, 1e-12), (float("inf"), 1.0),
+                                (1.0, float("nan"))])
+def test_one_bad_row_never_aborts_the_read(monkeypatch, capsys, ps):
+    # The second guard: whatever reaches the arithmetic, the row drops out, the rest stay.
+    real = hs.period_and_sweep
+    monkeypatch.setattr(hs, "period_and_sweep",
+                        lambda gk: ps if gk == "crafted" else real(gk))
+    rows = [_row("crafted", "codar-sounder/0.7.0", 700 * MS),
+            _row("4.4630 -25.73", "codar-sounder/0.7.0", 700 * MS)]
+    assert [r["delay_ns"] for r in hs.to_sweep_start(rows, "attribute")] == [200 * MS]
+    assert "attribute: 1 codar-sounder" in capsys.readouterr().err
+
+
 # --- the version gate -----------------------------------------------------------------------
 
 @pytest.mark.parametrize("dv", ["codar-sounder/0.7.0", "codar-sounder/0.1.3",
@@ -166,3 +201,10 @@ def test_the_wd30_check_only_reads():
                  "RENAME", "EXCHANGE", "OPTIMIZE", "GRANT", "SYSTEM"):
         assert not re.search(r"\b%s\b" % word, body, re.I), word
     assert "8000" in body and "codar-sounder/" in body              # the 0.8.0 gate
+
+
+def test_a_row_with_no_delay_is_left_out_not_raised(capsys):
+    rows = [_row("4.4630 -25.73", "codar-sounder/0.7.0", None),
+            _row("4.4630 -25.73", "codar-sounder/0.7.0", 700 * MS)]
+    assert [r["delay_ns"] for r in hs.to_sweep_start(rows, "solve")] == [200 * MS]
+    assert "solve: 1 codar-sounder" in capsys.readouterr().err

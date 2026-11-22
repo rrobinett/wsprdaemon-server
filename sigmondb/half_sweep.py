@@ -14,12 +14,17 @@ S and the period come from the row's group key, written by hamsci-dsp's sigmondb
 runs shorter than the period.  sweep_of and period_of in chirp-recorder's compare.py read the same
 tokens, so the two programs agree on S.  Nothing here writes a corrected value back.
 """
+import math
 import re
 import sys
 
 FIXED_FROM = (0, 8, 0)          # the first codar-sounder release that counts from the sweep start
 _PREFIX = "codar-sounder/"
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
+# The bounds a group key's S and P must hold, in seconds: 1e-3 <= S <= P <= 3600.  Real sweeps sit
+# far inside them (CODAR 0.25-2 s, ionosondes a few hundred s).  A key outside them gives no S, so
+# a crafted key cannot reach the arithmetic with a zero, sub-ns, infinite or NaN period.
+MIN_S, MAX_S = 1e-3, 3600.0
 
 
 def codar_version(detector_version):
@@ -49,7 +54,8 @@ def period_and_sweep(group_key):
 
     The period comes from the "<P>s" token, 1 s if none; the sweep from "sweep<S>s", the period
     if none (a continuous sweep).  A key whose centre or rate is not a number, or that carries
-    any other token, gives None: this function never guesses S."""
+    any other token, gives None: this function never guesses S.  So does a key whose S and P fall
+    outside MIN_S <= S <= P <= MAX_S, or are not finite."""
     parts = str(group_key or "").split()
     if len(parts) < 2:
         return None
@@ -71,7 +77,9 @@ def period_and_sweep(group_key):
             return None
     if sweep is None:
         sweep = period
-    if not (period > 0 and sweep > 0):
+    if not (math.isfinite(period) and math.isfinite(sweep)
+            and MIN_S <= sweep <= period <= MAX_S
+            and round(period * 1e9) >= 1 and round(sweep * 1e9) >= 1):
         return None
     return period, sweep
 
@@ -94,11 +102,15 @@ def sweep_start_delay(row):
 def to_sweep_start(rows, who):
     """New dicts with delay_ns counted from the sweep start (sweep_start_delay).
 
-    An old codar-sounder row whose group key cannot give S is left out of the result, and one
-    line on stderr, per call, names how many and which keys."""
+    An old codar-sounder row whose group key cannot give S is left out of the result, and so is
+    one whose arithmetic raises (a delay_ns of None, say); one line on stderr, per call, names
+    how many and which keys."""
     out, lost = [], {}
     for r in rows:
-        d = sweep_start_delay(r)
+        try:
+            d = sweep_start_delay(r)
+        except (OverflowError, ZeroDivisionError, ValueError, TypeError):
+            d = None            # a second guard: one bad row must never abort the read
         if d is None:
             gk = r.get("group_key")
             lost[gk] = lost.get(gk, 0) + 1
