@@ -18,9 +18,10 @@ RX = [K3LR, WB6CXC]
 
 def _arrivals(centre, n=40, spread=2_000, night_h=(3, 9), day_h=(15, 20), u=230.0,
               tx_id="", day_centre=None, seed=1, reporter_id="K3LR/D", rate=RATE,
-              day=datetime(2026, 11, 7)):
+              day=datetime(2026, 11, 7), group_key="4.4630 -25.73", period_ns=None):
     """Alternate night and day arrivals.  Defaults: K3LR on 11-07, 03-09 Z (local night)
-    and 15-20 Z (local day, sun above +12 deg)."""
+    and 15-20 Z (local day, sun above +12 deg).  period_ns folds each delay into [0, P), as a
+    recorder stores it."""
     rnd = random.Random(seed)
     out = []
     for i in range(n):
@@ -29,10 +30,10 @@ def _arrivals(centre, n=40, spread=2_000, night_h=(3, 9), day_h=(15, 20), u=230.
         span_s = (hi - lo) * 3600 - 60
         t = day + timedelta(hours=lo, seconds=((i // 2) * 997) % span_s)
         c = centre if (night or day_centre is None) else day_centre
-        out.append(dict(time=t, reporter_id=reporter_id, tx_id=tx_id, group_key="4.4630 -25.73",
-                        rate_hz_per_s=rate,
-                        delay_ns=round(c + rnd.uniform(-spread, spread) / 2), u_epoch_ns=u,
-                        origin="t6_anchor"))
+        d = round(c + rnd.uniform(-spread, spread) / 2)
+        out.append(dict(time=t, reporter_id=reporter_id, tx_id=tx_id, group_key=group_key,
+                        rate_hz_per_s=rate, delay_ns=d % period_ns if period_ns else d,
+                        u_epoch_ns=u, origin="t6_anchor"))
     return out
 
 
@@ -144,6 +145,88 @@ def test_unswept_arrivals_never_form_a_ground_wave_cluster():
     assert "unswept" in aside["K3LR/D"]
 
 
+# --- the wrap at the sweep period -----------------------------------------------------------
+# delay_ns lives modulo the period P of its group key (half_sweep.period_and_sweep).  A cluster
+# whose delays scatter across 0/P is one cluster, and its median is a circular one.
+
+P1 = 1_000_000_000
+P05 = 500_000_000
+KEY_05 = "4.4630 -25.73 0.5s"
+
+
+def _wrapped(centre, P, **kw):
+    return _arrivals(centre, period_ns=P, **kw)
+
+
+def _circ_err(a, b, P):
+    x = (a - b) % P
+    return min(x, P - x)
+
+
+def test_a_cluster_straddling_one_second_stays_whole_with_its_median_just_below_p():
+    arr = _wrapped(P1 - 300, P1, spread=4_000)
+    assert any(r["delay_ns"] < 5_000 for r in arr) and any(r["delay_ns"] > P1 - 5_000 for r in arr)
+    got = fixed_clusters(arr, RX)
+    assert len(got) == 1
+    c = got[0]
+    assert c["n_arrivals"] == 40
+    assert 0 <= c["fixed_delay_ns"] < P1
+    assert _circ_err(c["fixed_delay_ns"], P1 - 300, P1) < 1_000
+    assert c["fixed_delay_ns"] > P1 - 2_000                    # folded back below P
+    # the key's us token folds too: just below P names the same cluster as just above 0
+    assert c["cluster_key"] == "K3LR/D|4.4630 -25.73|%d" % (
+        round(c["fixed_delay_ns"] / 1000.0) % (P1 // 1000))
+    assert c["delay_sd_ns"] < 3_000                            # not ~P/2
+
+
+def test_a_cluster_straddling_one_second_with_its_median_just_above_zero():
+    got = fixed_clusters(_wrapped(300, P1, spread=4_000), RX)
+    assert len(got) == 1
+    assert 0 <= got[0]["fixed_delay_ns"] < 2_000
+    assert _circ_err(got[0]["fixed_delay_ns"], 300, P1) < 1_000
+
+
+def test_a_cluster_straddling_half_a_second_stays_whole():
+    arr = _wrapped(P05 - 500, P05, spread=4_000, group_key=KEY_05)
+    assert any(r["delay_ns"] < 5_000 for r in arr)
+    got = fixed_clusters(arr, RX)
+    assert len(got) == 1
+    c = got[0]
+    assert 0 <= c["fixed_delay_ns"] < P05
+    assert _circ_err(c["fixed_delay_ns"], P05 - 500, P05) < 1_000
+    assert c["cluster_key"] == "K3LR/D|%s|%d" % (
+        KEY_05, round(c["fixed_delay_ns"] / 1000.0) % (P05 // 1000))
+
+
+def test_day_and_night_medians_agree_across_the_wrap():
+    # night sits 3 us below P, day 3 us above 0: 6 us apart on the circle, inside 20 us
+    arr = _wrapped(P1 - 3_000, P1, day_centre=P1 + 3_000)
+    got = fixed_clusters(arr, RX)
+    assert len(got) == 1
+    assert _circ_err(got[0]["fixed_delay_ns"], 0, P1) < 3_000
+    # 60 us apart across the wrap: a drift, as it would be anywhere else
+    assert fixed_clusters(_wrapped(P1 - 30_000, P1, day_centre=P1 + 30_000), RX) == []
+
+
+def test_a_cluster_away_from_the_wrap_keeps_its_linear_median():
+    arr = _arrivals(958_940_000, seed=3)
+    got = fixed_clusters(arr, RX)
+    assert len(got) == 1
+    import statistics
+    assert got[0]["fixed_delay_ns"] == int(round(statistics.median(r["delay_ns"] for r in arr)))
+    assert abs(got[0]["delay_sd_ns"] - statistics.stdev(r["delay_ns"] for r in arr)) < 1e-6
+
+
+def test_a_group_key_with_no_period_clusters_linearly():
+    # The key gives no period (half_sweep.period_and_sweep returns None): no wrap is assumed,
+    # so delays just above 0 and just below 1 s stay two clusters.
+    key = "KFS-OMNI 4.4750"
+    arr = (_arrivals(2_000, group_key=key, seed=1)
+           + _arrivals(P1 - 2_000, group_key=key, seed=2))
+    got = fixed_clusters(arr, RX)
+    assert sorted(c["fixed_delay_ns"] < P1 // 2 for c in got) == [False, True]
+
+
 # --- solutions ------------------------------------------------------------------------------
 
 def _tx(lat=41.0, lon=-80.0, sig=10.0, tx_id="hfrnet:Rutgers"):
@@ -201,3 +284,21 @@ def test_unnamed_cluster_has_no_offset():
     assert sol[0]["offset_ns"] is None and sol[0]["tx_id"] == ""
     again = ground_wave_solutions(cl, [], [], "v")
     assert again[0]["inputs_digest"] == sol[0]["inputs_digest"]
+
+
+def test_offset_is_a_phase_nearest_zero_for_a_cluster_just_below_the_period():
+    # 958.94 ms of a 1 s period: the transmitter emits 41.06 ms early, not 958.94 ms late
+    cl = fixed_clusters(_arrivals(958_940_000, tx_id="hfrnet:Rutgers"), RX)
+    rx = [dict(reporter_id="K3LR/D", lat=41.0, lon=-81.0, pos_sigma_m=3000.0)]
+    s = ground_wave_solutions(cl, _tx(), rx, "v")[0]
+    assert abs(s["offset_ns"] - (958_940_000 - P1 - 279_925)) < 2_000
+
+
+def test_offset_of_a_cluster_straddling_the_wrap_does_not_jump_by_a_period():
+    rx = [dict(reporter_id="K3LR/D", lat=41.0, lon=-81.0, pos_sigma_m=3000.0)]
+    for centre in (P1 - 300, 300):
+        cl = fixed_clusters(_wrapped(centre, P1, spread=4_000, tx_id="hfrnet:Rutgers"), RX)
+        assert len(cl) == 1
+        s = ground_wave_solutions(cl, _tx(), rx, "v")[0]
+        want = (centre - 279_925 + P1 // 2) % P1 - P1 // 2
+        assert abs(s["offset_ns"] - want) < 2_000, centre

@@ -745,3 +745,14 @@ def test_two_station_fit_needs_the_upper_bound_under_the_limit():
     assert null_flag(2, 10, 400) is None
     assert null_flag(2, 21, 400).startswith("fake sites match as well")   # point estimate still fails
     assert null_flag(2, 0, 0) is None                       # no fakes: no test, as before
+
+
+def test_a_name_reaches_a_cluster_straddling_the_wrap():
+    # The fixed delay sits a few us from 0/P; the attribution row's delay may sit on either side.
+    centre = 1_000_000_000 - 1_000
+    for d in (centre, centre - 1_000_000_000 + 3_000, 2_000):
+        cl = fixed_clusters(_gw_base(centre, spread=4_000, reporter_id="UACNJ",
+                                     period_ns=1_000_000_000), RX_ROWS)
+        assert len(cl) == 1
+        assert apply_attribution(cl, [_attr("hfrnet:HOOK", "named", "UACNJ", d)]) == {}
+        assert cl[0]["tx_ids"] == ["hfrnet:HOOK"], d

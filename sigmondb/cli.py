@@ -20,7 +20,7 @@ from sigmondb.load import insert_file, insert_rows
 from sigmondb.rows import read_rows, write_rows
 
 DEFAULT_CONF = "/etc/wsprdaemon/clickhouse.conf"
-SOLVER_VERSION = "groundwave-3"
+SOLVER_VERSION = "groundwave-4"
 _LINE = re.compile(r'^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.*?)\s*$')
 
 

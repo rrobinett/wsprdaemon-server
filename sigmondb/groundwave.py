@@ -7,6 +7,13 @@ seen in several captures.  Here a cluster must also show up by day and by night 
 medians that agree.  Only anchored rows count (u_epoch_ns not null and <= 1000), and only
 swept signals (rate_hz_per_s != 0): a chirp gives the delay, a fixed tone does not.
 
+delay_ns lives modulo the sweep period P, which the group key gives (half_sweep.period_and_sweep,
+the parser the readers already use).  So clustering runs on the circle: the scan starts in the
+widest gap, a cluster may run across 0/P, and its median, day/night test and SD come from the
+delays unwrapped around the cluster; the median folds back into [0, P).  A group whose key gives
+no period clusters on the line, as before: nothing tells where its wrap falls.  The offset, a
+phase modulo P too, comes out in [-P/2, P/2).
+
 Day and night come from the sun's elevation at the receiver, arrival by arrival: night below
 -12 deg, day above +12 deg, and twilight between counts for neither.  No UTC hours are fixed,
 so the test holds at any longitude.  The transmitter's sky does not enter: an unnamed cluster
@@ -17,6 +24,8 @@ import math
 import statistics
 from collections import defaultdict
 from datetime import datetime
+
+from sigmondb.half_sweep import period_and_sweep
 
 C_M_PER_S = 299_792_458.0
 EARTH_R_M = 6_371_008.8
@@ -66,6 +75,42 @@ def _positions(receivers):
     return out
 
 
+def period_ns(group_key):
+    """The sweep period of a group key in ns (half_sweep.period_and_sweep), or None."""
+    ps = period_and_sweep(group_key)
+    return round(ps[0] * 1e9) if ps else None
+
+
+def _split(rs, gap_ns, P):
+    """Gap clusters of rows by delay_ns, as [(rows, delays)].
+
+    With a period P the delays sit on a circle: the scan starts after the widest gap, so a
+    cluster that runs across 0/P stays whole, and each cluster's delays come back unwrapped
+    from its first one (they may pass P).  With P None the scan runs on the line and the
+    delays come back as stored."""
+    if not P:
+        rs = sorted(rs, key=lambda r: r["delay_ns"])
+        pos = [r["delay_ns"] for r in rs]
+    else:
+        rs = sorted(rs, key=lambda r: r["delay_ns"] % P)
+        pos = [r["delay_ns"] % P for r in rs]
+        n = len(rs)
+        widest = max(range(n), key=lambda i: ((pos[(i + 1) % n] - pos[i]) % P, -i))
+        start = (widest + 1) % n
+        rs, pos = rs[start:] + rs[:start], pos[start:] + pos[:start]
+    out, cur, xs = [], [rs[0]], [pos[0]]
+    for r, x in zip(rs[1:], pos[1:]):
+        step = (x - xs[-1]) % P if P else x - xs[-1]
+        if step > gap_ns:
+            out.append((cur, xs))
+            cur, xs = [r], [x]
+        else:
+            cur.append(r)
+            xs.append(xs[-1] + step)
+    out.append((cur, xs))
+    return out
+
+
 def fixed_clusters(arrivals, receivers, gap_ns=120_000, min_captures=6, max_sd_ns=20_000.0,
                    night_deg=NIGHT_DEG, day_deg=DAY_DEG, set_aside=None):
     """Clusters that hold one delay by day and by night at their receiver.
@@ -99,37 +144,35 @@ def fixed_clusters(arrivals, receivers, gap_ns=120_000, min_captures=6, max_sd_n
     out = []
     for (rid, gkey), rs in sorted(groups.items()):
         lat, lon = pos[rid]
-        rs = sorted(rs, key=lambda r: r["delay_ns"])
-        clusters, cur = [], [rs[0]]
-        for r in rs[1:]:
-            if r["delay_ns"] - cur[-1]["delay_ns"] > gap_ns:
-                clusters.append(cur)
-                cur = []
-            cur.append(r)
-        clusters.append(cur)
-        for cl in clusters:
+        P = period_ns(gkey)
+        found = []
+        for cl, xs in _split(rs, gap_ns, P):
             if len({r["time"] for r in cl}) < min_captures:
                 continue
             el = [solar_elevation_deg(r["time"], lat, lon) for r in cl]
-            dn = [r["delay_ns"] for r, e in zip(cl, el) if e < night_deg]
-            dd = [r["delay_ns"] for r, e in zip(cl, el) if e > day_deg]
+            dn = [x for x, e in zip(xs, el) if e < night_deg]
+            dd = [x for x, e in zip(xs, el) if e > day_deg]
             if len(dn) < MIN_PART or len(dd) < MIN_PART:
                 continue
             if abs(statistics.median(dn) - statistics.median(dd)) > max_sd_ns:
                 continue
-            delays = [r["delay_ns"] for r in cl]
-            sd = statistics.stdev(delays)
+            sd = statistics.stdev(xs)
             if sd > max_sd_ns:
                 continue
-            med = int(round(statistics.median(delays)))
+            med = int(round(statistics.median(xs)))
+            tok = round(med / 1000.0)
+            if P:
+                med %= P
+                tok %= max(1, round(P / 1000.0))    # 999.9997 ms of 1 s names the 0 us cluster
             times = [r["time"] for r in cl]
-            out.append(dict(
-                cluster_key="%s|%s|%d" % (rid, gkey, round(med / 1000.0)),
+            found.append(dict(
+                cluster_key="%s|%s|%d" % (rid, gkey, tok),
                 fixed_delay_ns=med, delay_sd_ns=sd, n_arrivals=len(cl),
                 n_night=len(dn), n_day=len(dd),
                 window_from=min(times), window_to=max(times), reporter_ids=[rid],
                 group_key=gkey, tx_ids=sorted({r.get("tx_id") or "" for r in cl}),
                 arrival_keys=sorted(_key(r) for r in cl)))
+        out.extend(sorted(found, key=lambda c: c["fixed_delay_ns"]))
     return out
 
 
@@ -158,6 +201,10 @@ def ground_wave_solutions(clusters, transmitters, receivers, solver_version,
 
         offset_sigma = sqrt((delay_sd / sqrt(n))^2 + (sqrt(rx_sigma^2 + tx_sigma^2) / c)^2).
 
+    The offset, a phase modulo the group key's period P, comes back in [-P/2, P/2): a fixed
+    delay of 958.94 ms in a 1 s period gives about -41 ms (early), not +959 ms (late).  A key
+    with no period leaves the offset unfolded.
+
     An unknown position sigma counts as 0 and set_aside names it.  Beyond max_ground_km the
     path is not a ground wave: no offset, and set_aside["range"] gives the distance.
     """
@@ -179,6 +226,9 @@ def ground_wave_solutions(clusters, transmitters, receivers, solver_version,
                     aside["range"] = "%.0f km" % (d / 1000.0)
                 else:
                     offset = c["fixed_delay_ns"] - round(d / C_M_PER_S * 1e9)
+                    P = period_ns(c.get("group_key"))
+                    if P:               # a phase modulo P: the value nearest zero
+                        offset = (offset + P // 2) % P - P // 2
                     rs, ts = rx.get("pos_sigma_m"), sig
                     if rs is None:
                         aside["rx_pos_sigma"] = "unknown"

@@ -495,7 +495,7 @@ def test_solve_write_db_inserts_solutions_and_tolerates_an_empty_attribution_tab
     assert cli.main(["solve", "--from-db", "--write-db"]) == 0
     assert any(t == "sigmondb.solution" for t, _ in c.inserted)
     assert any("CREATE TABLE IF NOT EXISTS sigmondb.solution" in s for s in c.commands)
-    assert all(r["tx_id"] == "" and r["solver_version"] == "groundwave-3" for r in _sols(c))
+    assert all(r["tx_id"] == "" and r["solver_version"] == "groundwave-4" for r in _sols(c))
 
 
 class _NoAttrTableUntilEnsured(QueryClient):
