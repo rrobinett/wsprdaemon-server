@@ -216,8 +216,37 @@ def test_transmitter_offsets_take_the_latest_solution_per_tx():
     a = got["hfrnet:A"]
     assert a == dict(tx_id="hfrnet:A", kind="codar", offset_ms=2.5, sigma_ms=0.15,
                      last_confirmed_utc=_utc(2026, 11, 12).timestamp(), n_confirming=2,
-                     confirming_reporters=[], built_at_utc=BUILT)
+                     confirming_reporters=[], period_s=None, built_at_utc=BUILT)
     assert got["hfrnet:C"]["kind"] == "oth" and got["hfrnet:C"]["offset_ms"] == -0.5
+
+
+def test_transmitter_offsets_carry_the_sweep_period_from_the_cluster_key():
+    """offset_ms is a phase modulo the sweep period P, in [-P/2, P/2).  A consumer folds its
+    residual modulo P, so the row carries P, read from the solution's cluster_key
+    ("<reporter>|<group key>|<us>") by the parser the readers use."""
+    sols = [dict(_sol("hfrnet:A", _utc(2026, 11, 12), -41_060_000),
+                 cluster_key="K3LR/D|4.4750 -25.73|958940"),
+            dict(_sol("hfrnet:B", _utc(2026, 11, 12), 1_000),
+                 cluster_key="AC0G/B4|4.4630 -25.73 0.5s|12"),
+            dict(_sol("hfrnet:C", _utc(2026, 11, 12), 1_000),
+                 cluster_key="AC0G/B4|4.4630 -25.73 2s sweep0.5s|12"),
+            dict(_sol("hfrnet:D", _utc(2026, 11, 12), 1_000), cluster_key="X|KFS-OMNI|0"),
+            _sol("hfrnet:E", _utc(2026, 11, 12), 1_000)]
+    got = {r["tx_id"]: r for r in publish.build_transmitter_offsets(sols, [], BUILT)}
+    assert got["hfrnet:A"]["period_s"] == 1.0 and got["hfrnet:A"]["offset_ms"] == -41.06
+    assert got["hfrnet:B"]["period_s"] == 0.5
+    assert got["hfrnet:C"]["period_s"] == 2.0
+    assert got["hfrnet:D"]["period_s"] is None          # the key gives no period
+    assert got["hfrnet:E"]["period_s"] is None          # no cluster_key at all
+    assert ("period_s", "Nullable(Float64)") in publish.SCHEMAS["transmitter_offsets"]
+    assert "cluster_key" in publish.SOURCE_COLUMNS["solution"]
+    for r in got.values():
+        assert set(r) == {c for c, _ in publish.SCHEMAS["transmitter_offsets"]}
+
+
+def test_the_offset_docstring_states_the_range_and_the_fold():
+    doc = publish.__doc__
+    assert "[-P/2, P/2)" in doc and "period_s" in doc and "modulo P" in doc
 
 
 def test_confirming_reporters_are_the_chosen_solutions_reporter_ids():

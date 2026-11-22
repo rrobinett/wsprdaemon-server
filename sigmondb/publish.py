@@ -16,6 +16,14 @@ transmitter_offsets: the latest solution per tx_id (by window_to) that has an of
   the sweep start on UTC.  So offset_ns is the time the transmitter emitted minus the UTC
   instant it should have: a transmitter keying 2.5 ms late gives +2_500_000.  The published
   offset_ms keeps that sign: EMISSION MINUS UTC, positive when the transmitter runs late.
+  RANGE.  An offset is a phase modulo the sweep period P: a transmitter 41 ms early and one
+  959 ms late look alike on a 1 s sweep.  The solver gives the value nearest zero, in
+  [-P/2, P/2) (groundwave-4 on; earlier solver versions gave [-d/c, P - d/c)).  period_s
+  carries P, read from the solution's group key (half_sweep.period_and_sweep); it is NULL
+  when the key gives no period, and that offset is unfolded.  THE FOLD a consumer must apply:
+  pick the sweep start nearest the arrival, i.e. fold its residual modulo P into [-P/2, P/2).
+  A consumer that instead labels each arrival with the sweep start before it (the floor, as a
+  recorder counts delay_ns) misplaces it by exactly P whenever the offset is negative.
 
 trust: one row per reporter, from its latest receiver version.
   RULE.  trusted = 1 when a_level is "A1", else 0.  a_level names the state of the
@@ -48,6 +56,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 from sigmondb.groundwave import _latest, great_circle_m
+from sigmondb.half_sweep import period_and_sweep
 from sigmondb.paths import gc_midpoint, match_group, path_kind
 from sigmondb.receivers import grid_to_latlon
 from sigmondb.set_aside import not_set_aside, solution_not_set_aside
@@ -61,7 +70,7 @@ SCHEMAS = {
         ("tx_id", "String"), ("kind", "String"), ("offset_ms", "Float64"),
         ("sigma_ms", "Float64"), ("last_confirmed_utc", "Float64"),
         ("n_confirming", "UInt16"), ("confirming_reporters", "Array(String)"),
-        ("built_at_utc", "Float64")],
+        ("period_s", NF64), ("built_at_utc", "Float64")],
     "trust": [
         ("reporter_id", "String"), ("a_level", "String"), ("trusted", "UInt8"),
         ("built_at_utc", "Float64")],
@@ -99,7 +108,7 @@ SCHEMAS = {
 # What read_source() takes from wd30's sigmondb, each table read FINAL.
 SOURCE_COLUMNS = {
     "solution": ("tx_id", "solve_id", "window_to", "offset_ns", "offset_sigma_ns",
-                 "n_stations", "reporter_ids"),
+                 "n_stations", "reporter_ids", "cluster_key"),
     "transmitter": ("tx_id", "kind", "network", "name", "status", "lat", "lon",
                     "pos_sigma_m", "valid_from", "version"),
     "receiver": ("reporter_id", "lat", "lon", "a_level", "valid_from", "version"),
@@ -146,6 +155,16 @@ AGG_QUERIES = {
 def emission_minus_utc_ms(offset_ns):
     """solution.offset_ns (emission minus UTC, ns) in ms, sign kept."""
     return offset_ns / 1e6
+
+
+def sweep_period_s(cluster_key):
+    """The sweep period, in s, of a solution's cluster_key "<reporter>|<group key>|<us>"
+    (groundwave.fixed_clusters), or None when the key gives none."""
+    parts = str(cluster_key or "").rsplit("|", 2)
+    if len(parts) != 3:
+        return None
+    ps = period_and_sweep(parts[1])
+    return ps[0] if ps else None
 
 
 def _unix(t):
@@ -195,7 +214,7 @@ def build_transmitter_offsets(solutions, transmitters, built_at):
             sigma_ms=s["offset_sigma_ns"] / 1e6, last_confirmed_utc=k[0],
             n_confirming=int(s.get("n_stations") or 0),
             confirming_reporters=sorted(set(s.get("reporter_ids") or [])),
-            built_at_utc=built_at))
+            period_s=sweep_period_s(s.get("cluster_key")), built_at_utc=built_at))
     return out
 
 
