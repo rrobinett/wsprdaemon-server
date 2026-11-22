@@ -151,3 +151,18 @@ def test_the_two_readers_agree(monkeypatch, capsys):
     out = capsys.readouterr()
     assert "solve: 1 codar-sounder" in out.err and "attribute: 1 codar-sounder" in out.err
 
+
+# --- the wd30 check -------------------------------------------------------------------------
+
+def test_the_wd30_check_only_reads():
+    import re
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sql = open(os.path.join(here, "sigmondb", "sql", "half_sweep_check.sql")).read()
+    body = "\n".join(ln.split("--", 1)[0] for ln in sql.splitlines())     # comments out
+    stmts = [s.strip() for s in body.split(";") if s.strip()]
+    assert len(stmts) == 4
+    assert all(re.match(r"(SELECT|WITH)\b", s) for s in stmts)
+    for word in ("INSERT", "ALTER", "DELETE", "UPDATE", "DROP", "CREATE", "TRUNCATE",
+                 "RENAME", "EXCHANGE", "OPTIMIZE", "GRANT", "SYSTEM"):
+        assert not re.search(r"\b%s\b" % word, body, re.I), word
+    assert "8000" in body and "codar-sounder/" in body              # the 0.8.0 gate
