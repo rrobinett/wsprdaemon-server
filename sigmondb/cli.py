@@ -13,6 +13,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from sigmondb import ddl
+from sigmondb.half_sweep import to_sweep_start
 from sigmondb.set_aside import not_set_aside
 from sigmondb.groundwave import fixed_clusters, ground_wave_solutions
 from sigmondb.load import insert_file, insert_rows
@@ -263,7 +264,8 @@ def _from_db(a, client=None):
     re-ingested row counts once.  Arrivals: anchored only, within --days; by default the
     latest detector_version per (reporter_id, group_key, time), judged after each arrival
     counts at the receiver whose radiod heard it (_carried); --detector-version picks one.
-    Rows inside an active 'codar' or 'all' set-aside window never come back (set_aside.py)."""
+    Rows inside an active 'codar' or 'all' set-aside window never come back (set_aside.py).
+    codar-sounder rows before 0.8.0 come back half a sweep earlier (half_sweep.py)."""
     client = client or connect(a.conf)
 
     def fetch(table, where="", params=None):
@@ -282,6 +284,7 @@ def _from_db(a, client=None):
                             latest_detector=not a.detector_version)
     if dropped:
         print("solve: %d duplicate carried arrivals dropped" % dropped, file=sys.stderr)
+    arr = to_sweep_start(arr, "solve")      # as _attribution_inputs does (half_sweep.py)
     return arr, fetch("transmitter"), rx
 
 
@@ -297,7 +300,8 @@ def _attribution_inputs(client, days):
 
     arrivals: T6-anchored, CLEAN 'A', chirped, within `days`, outside every active 'codar' or
     'all' set-aside window; the latest detector per capture;
-    live when engineering carries sweep_repetition_hz; counted at their radiod.
+    live when engineering carries sweep_repetition_hz; counted at their radiod; codar-sounder
+    rows before 0.8.0 half a sweep earlier, exactly as _from_db (half_sweep.py).
     sites: the latest codar transmitter row per tx_id with a position, one site per waveform
     (latest per centre); a transmitter with no waveform drops out.  Sorted by tx_id, so ties
     break the same way every run.
@@ -340,6 +344,7 @@ def _attribution_inputs(client, days):
     arr, dropped = _carried(arr, rx)
     if dropped:
         print("attribute: %d duplicate carried arrivals dropped" % dropped)
+    arr = to_sweep_start(arr, "attribute")  # as _from_db does (half_sweep.py)
     return arr, sites, rxpos, coherence
 
 

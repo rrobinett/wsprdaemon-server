@@ -273,7 +273,8 @@ def test_live_and_backfill_rows_of_one_group_both_survive(monkeypatch):
         _arr("W2NAF", "4.4630 -25.73", "codar-sounder/0.7.0", t=t2, delay=2),
         _arr("W2NAF", "4.4630 -25.73", "codar-sounder/0.7.0", t=t1, delay=3)]})
     arr, _, _ = cli._from_db(_ns())
-    assert sorted(r["delay_ns"] for r in arr) == [1, 2]   # t1: offline wins; t2: live kept
+    # t1: offline wins; t2: live kept, half a 1 s sweep earlier (codar-sounder 0.7.0, half_sweep.py)
+    assert sorted(r["delay_ns"] for r in arr) == [1, 500_000_002]
 
 
 # --- attribute ------------------------------------------------------------------------------
