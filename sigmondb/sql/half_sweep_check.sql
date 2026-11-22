@@ -23,7 +23,7 @@ SELECT
     reporter_id,
     group_key,
     detector_version,
-    count()   AS n_arrivals,
+    count()   AS n_old_arrivals,
     min(time) AS first_time,
     max(time) AS last_time
 FROM sigmondb.arrival FINAL
@@ -47,6 +47,8 @@ ORDER BY reporter_id, group_key, detector_version;
 -- (KFS-MAIN) at the receiver whose radiod heard it (KFS-OMNI), so a solution's reporter_ids
 -- can differ from the arrival's reporter_id.  n_old_same_reporter counts the direct matches;
 -- a row with n_old_same_reporter = 0 deserves a look at arrival_reporters.
+-- No output alias repeats a column name (tx, w_from, w_to, fixed_ns, ...), so the s.-qualified
+-- names in WHERE and countIf resolve to columns under the old analyzer as well as the new.
 WITH old_arrivals AS (
     SELECT reporter_id, group_key, time, delay_ns, detector_version
     FROM sigmondb.arrival FINAL
@@ -67,25 +69,25 @@ solutions AS (
 SELECT
     s.solve_id,
     s.cluster_key,
-    any(s.tx_id)                              AS tx_id,
-    any(s.window_from)                        AS window_from,
-    any(s.window_to)                          AS window_to,
-    any(s.reporter_ids)                       AS reporter_ids,
-    any(s.fixed_delay_ns)                     AS fixed_delay_ns,
+    any(s.tx_id)                              AS tx,
+    any(s.window_from)                        AS w_from,
+    any(s.window_to)                          AS w_to,
+    any(s.reporter_ids)                       AS solution_reporters,
+    any(s.fixed_delay_ns)                     AS fixed_ns,
     any(s.offset_ns) / 1e6                    AS offset_ms,
     any(s.offset_sigma_ns) / 1e6              AS sigma_ms,
-    any(s.n_arrivals)                         AS n_arrivals,
+    any(s.n_arrivals)                         AS n_solution_arrivals,
     count()                                   AS n_old_arrivals,
     countIf(has(s.reporter_ids, a.reporter_id)) AS n_old_same_reporter,
     groupUniqArray(a.reporter_id)             AS arrival_reporters,
     groupUniqArray(a.detector_version)        AS old_versions,
-    any(s.solver_version)                     AS solver_version
+    any(s.solver_version)                     AS solver
 FROM solutions AS s
 INNER JOIN old_arrivals AS a ON a.group_key = s.gkey
 WHERE a.time >= s.window_from AND a.time <= s.window_to
   AND abs(a.delay_ns - s.fixed_delay_ns) <= 500000
 GROUP BY s.solve_id, s.cluster_key
-ORDER BY window_to, s.cluster_key;
+ORDER BY w_to, s.cluster_key;
 
 
 -- 3. wd30.  Of those solutions, the ones publish.py could have put in transmitter_offsets:

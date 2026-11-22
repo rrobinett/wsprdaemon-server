@@ -14,6 +14,7 @@ from test_sigmondb_cli import RX_ROWS, TX, WF, _db, _ns  # noqa: E402
 from test_sigmondb_load import valid_row  # noqa: E402
 
 MS = 1_000_000
+NO_S = "codar-sounder before 0.8.0 whose group key gives no sweep duration"
 _T = datetime(2026, 11, 10, 3, tzinfo=timezone.utc)
 
 
@@ -35,7 +36,10 @@ def test_period_and_sweep_follow_the_group_key(gkey, want):
 
 @pytest.mark.parametrize("gkey", ["", "g", "4.4630", "x -25.73", "4.4630 -25.73 xyz",
                                   "4.4630 -25.73 sweepXs", "4.4630 -25.73 abcs",
-                                  "4.4630 -25.73 0s", "4.4630 -25.73 sweep0s"])
+                                  "4.4630 -25.73 0s", "4.4630 -25.73 sweep0s",
+                                  # two period or two sweep tokens: never pick one
+                                  "4.4630 -25.73 2s 3s", "4.4630 -25.73 sweep0.5s sweep0.6s",
+                                  "4.4630 -25.73 2s sweep1s 3s", "4.4630 -25.73 1s 1s"])
 def test_a_key_that_cannot_give_s_gives_none(gkey):
     assert hs.period_and_sweep(gkey) is None
 
@@ -53,7 +57,7 @@ def test_a_key_out_of_bounds_gives_none_and_the_row_is_left_out(gkey, capsys):
     assert hs.sweep_start_delay(row) is None
     assert hs.to_sweep_start([row, _row("4.4630 -25.73", "codar-sounder/0.7.0", 700 * MS)],
                              "solve") == [dict(row, group_key="4.4630 -25.73", delay_ns=200 * MS)]
-    assert "solve: 1 codar-sounder" in capsys.readouterr().err
+    assert "solve: 1 arrival(s) left out: 1 " + NO_S in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("gkey", ["4.4630 -25.73 0.001s", "4.4630 -25.73 3600s",
@@ -72,7 +76,9 @@ def test_one_bad_row_never_aborts_the_read(monkeypatch, capsys, ps):
     rows = [_row("crafted", "codar-sounder/0.7.0", 700 * MS),
             _row("4.4630 -25.73", "codar-sounder/0.7.0", 700 * MS)]
     assert [r["delay_ns"] for r in hs.to_sweep_start(rows, "attribute")] == [200 * MS]
-    assert "attribute: 1 codar-sounder" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "attribute: 1 arrival(s) left out: 1 whose correction raised " in err
+    assert "'crafted'" in err and NO_S not in err
 
 
 # --- the version gate -----------------------------------------------------------------------
@@ -129,7 +135,8 @@ def test_to_sweep_start_leaves_out_rows_it_cannot_correct_and_says_so_once(capsy
     assert rows == before                                   # inputs untouched
     err = capsys.readouterr().err
     assert err.count("\n") == 1                             # one line per call, not per row
-    assert "solve: 3 codar-sounder" in err and "'4.4630 -25.73 xyz'" in err and "''" in err
+    assert "solve: 3 arrival(s) left out: 3 " + NO_S in err
+    assert "'4.4630 -25.73 xyz'" in err and "''" in err
 
 
 def test_to_sweep_start_is_silent_when_every_row_corrects(capsys):
@@ -184,7 +191,8 @@ def test_the_two_readers_agree(monkeypatch, capsys):
     key = lambda r: (r["reporter_id"], r["group_key"], r["time"], r["delay_ns"])  # noqa: E731
     assert sorted(map(key, solver)) == sorted(map(key, attr))
     out = capsys.readouterr()
-    assert "solve: 1 codar-sounder" in out.err and "attribute: 1 codar-sounder" in out.err
+    assert "solve: 1 arrival(s) left out: 1 " + NO_S in out.err
+    assert "attribute: 1 arrival(s) left out: 1 " + NO_S in out.err
 
 
 # --- the wd30 check -------------------------------------------------------------------------
@@ -207,4 +215,46 @@ def test_a_row_with_no_delay_is_left_out_not_raised(capsys):
     rows = [_row("4.4630 -25.73", "codar-sounder/0.7.0", None),
             _row("4.4630 -25.73", "codar-sounder/0.7.0", 700 * MS)]
     assert [r["delay_ns"] for r in hs.to_sweep_start(rows, "solve")] == [200 * MS]
-    assert "solve: 1 codar-sounder" in capsys.readouterr().err
+    assert "solve: 1 arrival(s) left out: 1 with no delay_ns" in capsys.readouterr().err
+
+
+def test_a_row_without_delay_ns_is_left_out_not_raised(capsys):
+    old = {"group_key": "4.4630 -25.73", "detector_version": "codar-sounder/0.7.0"}
+    kept = {"group_key": "4.4630 -25.73", "detector_version": "offline-2026-11"}
+    good = _row("4.4630 -25.73", "codar-sounder/0.7.0", 700 * MS)
+    assert [r["delay_ns"] for r in hs.to_sweep_start([old, kept, good], "solve")] == [200 * MS]
+    err = capsys.readouterr().err
+    assert "solve: 2 arrival(s) left out: 2 with no delay_ns" in err and NO_S not in err
+
+
+def test_the_stderr_line_names_each_real_reason_once(monkeypatch, capsys):
+    real = hs.period_and_sweep
+    monkeypatch.setattr(hs, "period_and_sweep",
+                        lambda gk: (0.0, 1.0) if gk == "crafted" else real(gk))
+    rows = [_row("4.4630 -25.73 xyz", "codar-sounder/0.7.0", 1 * MS),     # no S
+            _row("4.4630 -25.73 xyz", "codar-sounder/0.7.0", 2 * MS),     # no S
+            _row("4.4630 -25.73", "codar-sounder/0.7.0", None),           # no delay
+            _row("crafted", "codar-sounder/0.7.0", 3 * MS),               # arithmetic raised
+            _row("4.4630 -25.73", "codar-sounder/0.7.0", 700 * MS)]
+    assert [r["delay_ns"] for r in hs.to_sweep_start(rows, "solve")] == [200 * MS]
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert err.startswith("solve: 4 arrival(s) left out: ")
+    assert "2 " + NO_S + " ('4.4630 -25.73 xyz')" in err
+    assert "1 with no delay_ns ('4.4630 -25.73')" in err
+    assert "1 whose correction raised ZeroDivisionError ('crafted')" in err
+
+
+def test_no_aggregate_alias_in_the_wd30_check_shadows_a_column():
+    # The old ClickHouse analyzer can swap an s.-qualified column for an aggregate alias of
+    # the same name, and then refuses the query (ILLEGAL_AGGREGATION in WHERE).
+    import re
+    from sigmondb import ddl
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sql = open(os.path.join(here, "sigmondb", "sql", "half_sweep_check.sql")).read()
+    body = "\n".join(ln.split("--", 1)[0] for ln in sql.splitlines())
+    aliases = re.findall(r"\b(?:any|count|countIf|groupUniqArray|min|max)\((?:[^()]|\([^()]*\))*\)"
+                         r"(?:\s*/\s*1e6)?\s+AS\s+(\w+)", body)
+    assert len(aliases) >= 15
+    columns = set(ddl.COLUMNS["arrival"]) | set(ddl.COLUMNS["solution"])
+    assert not set(aliases) & columns

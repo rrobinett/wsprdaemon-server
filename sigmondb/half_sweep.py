@@ -54,7 +54,8 @@ def period_and_sweep(group_key):
 
     The period comes from the "<P>s" token, 1 s if none; the sweep from "sweep<S>s", the period
     if none (a continuous sweep).  A key whose centre or rate is not a number, or that carries
-    any other token, gives None: this function never guesses S.  So does a key whose S and P fall
+    any other token, or a second period or sweep token, gives None: this function never
+    guesses S.  So does a key whose S and P fall
     outside MIN_S <= S <= P <= MAX_S, or are not finite."""
     parts = str(group_key or "").split()
     if len(parts) < 2:
@@ -64,17 +65,23 @@ def period_and_sweep(group_key):
         float(parts[1])
     except ValueError:
         return None
-    period, sweep = 1.0, None
+    period, sweep = None, None
     for tok in parts[2:]:
         if not tok.endswith("s"):
             return None
         try:
             if tok.startswith("sweep"):
+                if sweep is not None:
+                    return None             # a second sweep token: never pick one
                 sweep = float(tok[5:-1])
             else:
+                if period is not None:
+                    return None             # a second period token: never pick one
                 period = float(tok[:-1])
         except ValueError:
             return None
+    if period is None:
+        period = 1.0
     if sweep is None:
         sweep = period
     if not (math.isfinite(period) and math.isfinite(sweep)
@@ -99,26 +106,39 @@ def sweep_start_delay(row):
     return (int(row["delay_ns"]) - round(sweep * 1e9 / 2)) % round(period * 1e9)
 
 
+NO_S = "codar-sounder before %s whose group key gives no sweep duration" % (
+    ".".join(map(str, FIXED_FROM)))
+NO_DELAY = "with no delay_ns"
+
+
 def to_sweep_start(rows, who):
     """New dicts with delay_ns counted from the sweep start (sweep_start_delay).
 
-    An old codar-sounder row whose group key cannot give S is left out of the result, and so is
-    one whose arithmetic raises (a delay_ns of None, say); one line on stderr, per call, names
-    how many and which keys."""
+    A row drops out of the result when it carries no delay_ns, when it needs the correction and
+    its group key cannot give S, or when the correction raises (a second guard: one bad row must
+    never abort the read).  One line on stderr, per call, names how many rows left for each
+    reason, and their group keys."""
     out, lost = [], {}
     for r in rows:
-        try:
-            d = sweep_start_delay(r)
-        except (OverflowError, ZeroDivisionError, ValueError, TypeError):
-            d = None            # a second guard: one bad row must never abort the read
-        if d is None:
+        if r.get("delay_ns") is None:
+            reason = NO_DELAY
+        else:
+            try:
+                d = sweep_start_delay(r)
+                reason = None if d is not None else NO_S
+            except (OverflowError, ZeroDivisionError, ValueError, TypeError, KeyError) as e:
+                reason = "whose correction raised %s" % type(e).__name__
+        if reason:
+            keys = lost.setdefault(reason, {})
             gk = r.get("group_key")
-            lost[gk] = lost.get(gk, 0) + 1
+            keys[gk] = keys.get(gk, 0) + 1
             continue
         out.append(dict(r, delay_ns=d))
     if lost:
-        print("%s: %d codar-sounder arrivals before %s left out: their group key gives no sweep "
-              "duration (%s)" % (who, sum(lost.values()), ".".join(map(str, FIXED_FROM)),
-                                 ", ".join("%r" % k for k in sorted(lost, key=str))),
+        parts = ["%d %s (%s)" % (sum(keys.values()), reason,
+                                 ", ".join("%r" % k for k in sorted(keys, key=str)))
+                 for reason, keys in lost.items()]
+        print("%s: %d arrival(s) left out: %s"
+              % (who, sum(sum(k.values()) for k in lost.values()), "; ".join(parts)),
               file=sys.stderr)
     return out
