@@ -294,6 +294,22 @@ SCRIPT = ("<script>function cp(el,t){var a=document.createElement('textarea');"
           "+\"2>/dev/null || { ssh-keygen -f \"+k+\" -R '[\"+g+']:'+p+\"' >/dev/null 2>&1; \""
           "+'ssh-copy-id -p '+p+o+' -o StrictHostKeyChecking=accept-new '+u+'@'+g+'; }; '"
           "+'ssh -p '+p+o+' '+u+'@'+g;}"
+          # Click-to-run (rob, 2026-11-22): with "ssh opens a terminal" ticked
+          # (per browser, localStorage), a click on an ssh link opens
+          # racssh://USER@GW:PORT?n=NAME instead of copying.  RAC SSH.app on
+          # the Mac (~/ham/ClaudeCode/rac-ssh) handles it and runs the same
+          # login/re-key/ssh-copy-id steps as sshfull() in an iTerm2 tab.
+          # Option-click still copies.  Only user, gateway and port travel;
+          # the helper allow-lists the gateway and never runs URL text.
+          "function runon(){try{return localStorage.getItem('racRun')==='1';}catch(e){return false;}}"
+          "function setrun(cb){try{localStorage.setItem('racRun',cb.checked?'1':'0');}catch(e){}}"
+          "function sshgo(el,ev){if(!runon()||(ev&&ev.altKey)){cp(el,sshfull(el));return;}"
+          "var n=(el.dataset.n||'').replace(/[^A-Za-z0-9_.-]/g,'_').slice(0,64);"
+          "location.href='racssh://'+el.dataset.user+'@'+window.GW+':'+el.dataset.port"
+          "+(n?'?n='+n:'');var o=el.textContent;el.textContent='opening';"
+          "setTimeout(function(){el.textContent=o;},900);}"
+          "document.addEventListener('DOMContentLoaded',function(){"
+          "var c=document.getElementById('racrun');if(c)c.checked=runon();});"
           # The pencil beside an ssh link: save this RAC's login name on the
           # gateway (blank = back to the default).
           "function ed(el){var d=el.dataset,u=prompt('Login name for '+d.n+' ('+d.w+'), '"
@@ -734,7 +750,9 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
               f' &middot; <span id="gwnote">ssh links use <code>{link_ip}</code></span>')
     nact = sum(1 for n in names if stat.get(n, {}).get('active') or n in vis)
     b.append(f'<div class="sub">via {html.escape(HOST_LABEL)} <code>{gw_ip}</code> &middot; {tl} &middot; '
-             f'{nact} active / {len(names)} known{nav}{ipnote} &middot; auto-refresh 30s</div>')
+             f'{nact} active / {len(names)} known{nav}{ipnote} &middot; auto-refresh 30s'
+             ' &middot; <label title="Needs RAC SSH.app on this Mac. Option-click an ssh link to copy instead.">'
+             '<input type="checkbox" id="racrun" onchange="setrun(this)"> ssh opens a terminal</label></div>')
     def th(col, label):
         # clicking the current sort column flips direction
         d = '&amp;d=1' if (sort == col and not desc) else ''
@@ -889,9 +907,9 @@ def render_main(gw_ip, tier, sort='name', desc=False, only_sonde=False):
                 # The page builds that command in the browser (sshfull() in
                 # SCRIPT), from the address the VPN probe settled on.
                 b.append('<td class="svc"><a class="act ssh" href="#" title="%s" '
-                         'data-port="%s" data-user="%s" '
-                         'onclick="cp(this,sshfull(this));return false">ssh</a>%s%s</td>'
-                         % (cmd, svc['port'], user,
+                         'data-port="%s" data-user="%s" data-n="%s" '
+                         'onclick="sshgo(this,event);return false">ssh</a>%s%s</td>'
+                         % (cmd, svc['port'], user, html.escape(name),
                             ('<a class="ed" href="#" title="change the login name '
                              '(remembered for this RAC)" data-n="%s" data-rac="%s" '
                              'data-slot="%s" data-w="%s" data-user="%s" '
