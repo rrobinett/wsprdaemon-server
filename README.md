@@ -138,6 +138,21 @@ sudo chown wsprdaemon:wsprdaemon /etc/wsprdaemon/*.json
 sudo chmod 644 /etc/wsprdaemon/*.json
 ```
 
+## ClickHouse system log retention
+
+`install-servers.sh` installs `/etc/clickhouse-server/config.d/wd-system-log-ttl.xml`
+(source: `clickhouse-config/`), a TTL of 7 days on ClickHouse's own `system.*`
+log tables (3 days for `trace_log`, `metric_log`, `asynchronous_metric_log`).
+A restart of `clickhouse-server` is needed to load it. It only applies to log
+tables created afterwards; ClickHouse renames a table whose definition changed
+to `<name>_0`, `_1`, ... and those leftovers keep their disk space.
+For tables that already exist, run the opt-in helper (never run automatically):
+
+    ch-system-log-ttl            # print ALTER TABLE system.<t> MODIFY TTL ... and list *_N leftovers
+    sudo ch-system-log-ttl --apply
+
+`install-servers.sh --validate` reports the drop-in and each system log table's size.
+
 ## Service Management
 
 ### WSPRNET Scraper

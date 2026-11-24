@@ -17,7 +17,7 @@
 
 set -e
 
-VERSION="2.5.2"
+VERSION="2.6.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_USER="wsprdaemon"
 INSTALL_DIR="/opt/wsprdaemon-server"
@@ -291,6 +291,18 @@ print(ver)
             VALIDATE_OK=false
         fi
 
+
+        echo ""
+        echo "  ClickHouse system log TTL drop-in:"
+        if [[ -f /etc/clickhouse-server/config.d/wd-system-log-ttl.xml ]]; then
+            echo "    wd-system-log-ttl.xml present ✓"
+        else
+            echo "    wd-system-log-ttl.xml MISSING ✗ (re-run install-servers.sh)"
+            VALIDATE_OK=false
+        fi
+        echo "  system.* log table sizes:"
+        $CH --query "SELECT t.name, ifNull(sum(p.bytes_on_disk),0) AS b, formatReadableSize(b), ifNull(sum(p.rows),0) FROM system.tables t LEFT JOIN system.parts p ON p.database=t.database AND p.table=t.name AND p.active WHERE t.database='system' AND match(t.name, '_log(_[0-9]+)?\$') GROUP BY t.name ORDER BY b DESC FORMAT TSV" 2>/dev/null \
+            | while IFS=$'\t' read -r name _ size rows; do printf "    %-32s %12s %14s rows\n" "$name" "$size" "$rows"; done || true
         echo ""
         echo "  Tables in wsprdaemon database:"
         tables=$($CH --query "SHOW TABLES FROM wsprdaemon" 2>/dev/null || echo "")
@@ -377,6 +389,7 @@ usage() {
     echo "       $0 --sync        # Repair broken/missing symlinks (requires sudo)"
     echo "       $0 --validate    # Check services and ClickHouse tables are running"
     echo "       $0 --version     # Show version"
+    echo "  (existing system.* log tables: run ch-system-log-ttl [--apply], never automatic)"
     echo ""
     echo "Required arguments for full install:"
     echo "  --ch-admin USERNAME           ClickHouse root admin username"
@@ -747,6 +760,30 @@ XMLEOF
     echo "    sudo systemctl restart clickhouse-server"
 else
     echo "  backup-allowed-paths.xml already present (leaving as-is)"
+fi
+
+# Cap ClickHouse's own system.* log tables (query_log, trace_log, ...) with a
+# TTL; unbounded they reached hundreds of GB per server.  Idempotent: a
+# differing existing file is backed up before being overwritten.
+# NOTE: only affects log tables created after the config is loaded; existing
+# tables are NOT touched here.  Run the opt-in helper by hand:
+#   ch-system-log-ttl            # print ALTER ... MODIFY TTL statements
+#   ch-system-log-ttl --apply    # run them
+SYSLOG_SRC="$SCRIPT_DIR/clickhouse-config/wd-system-log-ttl.xml"
+SYSLOG_DST=/etc/clickhouse-server/config.d/wd-system-log-ttl.xml
+chmod +x "$SCRIPT_DIR/ch-system-log-ttl.sh"
+ln -sf "$SCRIPT_DIR/ch-system-log-ttl.sh" /usr/local/sbin/ch-system-log-ttl
+if [[ -f "$SYSLOG_DST" ]] && cmp -s "$SYSLOG_SRC" "$SYSLOG_DST"; then
+    echo "  wd-system-log-ttl.xml already up to date"
+else
+    if [[ -f "$SYSLOG_DST" ]]; then
+        SYSLOG_BAK="$SYSLOG_DST.bak.$(date +%Y%m%d%H%M%S)"
+        cp -p "$SYSLOG_DST" "$SYSLOG_BAK"
+        echo "  Backed up differing wd-system-log-ttl.xml to $SYSLOG_BAK"
+            fi
+    install -m 644 "$SYSLOG_SRC" "$SYSLOG_DST"
+    echo "  Installed wd-system-log-ttl.xml (system log TTL: 7d, 3d for trace/metric logs)"
+    echo "  Restart clickhouse-server to load it; existing tables need: sudo ch-system-log-ttl --apply"
 fi
 
 # ============================================================================
