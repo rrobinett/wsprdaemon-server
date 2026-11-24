@@ -5,7 +5,7 @@ const ENDPOINTS = ["https://db2.wspr.live/", "https://wd1.wsprdaemon.org/", "htt
 const FETCH_TIMEOUT_MS = 10000;
 const STALE_AFTER_S = 900;          // a board built more than 15 minutes ago greys out
 const LOW_FRACTION = 0.30;          // matches the server's LOW_FRACTION
-const COLUMNS = ["STATION", "ON AIR", "DEVICES", "CLIENTS", "SPOTS vs USUAL", "CAPACITY", "DRIFT", "ALARMS"];
+const COLUMNS = ["STATION", "ON AIR", "VERSION", "DEVICES", "CLIENTS", "SPOTS vs USUAL", "CAPACITY", "DRIFT", "ALARMS"];
 const SOURCE_NAMES = {wspr_noise: "wspr noise", wspr_spots: "wspr spots", ft8: "ft8", codar: "codar", hfdl: "hfdl"};
 const SPOT_NAMES = {wspr_spots: "wspr", ft8: "ft8"};
 const NUMERIC_TYPE = /^(Nullable\()?(U?Int\d+|Float\d+)\)?$/;
@@ -78,6 +78,20 @@ function cellText(row, column, nowMs, stale) {
       if (row.verdict !== "off") return stale ? "stale" : "✓";
       const t = newestArrival(sources);
       return t === null ? "✗" : "✗ " + ageText((nowMs === undefined ? Date.now() : nowMs) / 1000 - t);
+    }
+    case "VERSION": {
+      // The release the station last aligned to, against the newest blessed one.
+      if (!row.version) return "—";
+      const v = parseJson(row.version);
+      if (!v.release) return "—";
+      const old = v.stale ? " (report old)" : "";
+      switch (v.state) {
+        case "current": return v.release + (stale || v.stale ? "" : " ✓") + old;
+        case "behind": return v.release + " → " + v.latest + " update" + old;
+        case "ahead": return v.release + " ahead" + old;
+        case "candidate": return v.release + " candidate" + old;
+        default: return v.release + old;
+      }
     }
     case "DEVICES":
     case "CAPACITY": return "—";

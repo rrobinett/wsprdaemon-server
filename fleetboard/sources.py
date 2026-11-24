@@ -59,6 +59,8 @@ class DriftRow:
     n_drift: int = 0
     faults: tuple = ()          # dicts: kind, subject, detail, fix, key
     reminders: tuple = ()       # dicts: station, key, by, reason, until, fix
+    release: str | None = None  # the release the station last aligned to (aligned.json)
+    baseline: str = ""          # "blessed" | "candidate" | "none"
 
 
 @dataclass(frozen=True)
@@ -125,7 +127,7 @@ def queries(now: datetime) -> dict[str, str]:
     # Latest by the server's ingested_at, never the station's own `time`.
     out["drift_latest"] = (
         f"SELECT reporter_id AS reporter, time, ingested_at, n_fault, n_drift, "
-        f"faults_json, reminders_json FROM {DRIFT_TABLE} "
+        f"faults_json, reminders_json, release, baseline FROM {DRIFT_TABLE} "
         f"WHERE ingested_at > {_lit(now)} - INTERVAL {DRIFT_WINDOW_DAYS} DAY AND {future} "
         f"ORDER BY reporter_id, ingested_at DESC LIMIT 1 BY reporter_id"
     )
@@ -166,14 +168,16 @@ def parse(results: dict[str, list[tuple]], now: datetime | None = None) -> Activ
             for rep, h, n in results.get(f"{src}_hourly", []):
                 hourly.setdefault((src, rep), {})[_naive_utc(h)] = int(n)
     drift: dict[str, DriftRow] = {}
-    for rep, t, ing, n_fault, n_drift, faults, reminders in results.get("drift_latest", []):
+    for rep, t, ing, n_fault, n_drift, faults, reminders, *ver in results.get("drift_latest", []):
         if t is None or ing is None:
             continue
         t, ing = _naive_utc(t), _naive_utc(ing)
         if now is not None and (t - now).total_seconds() > DRIFT_FUTURE_S:
             continue
+        rel, base = (list(ver) + [None, None])[:2]
         drift[rep] = DriftRow(t, ing, int(n_fault), int(n_drift),
-                              _json_list(faults), _json_list(reminders))
+                              _json_list(faults), _json_list(reminders),
+                              release=rel or None, baseline=base or "")
     return Activity(
         drift=drift,
         last_arrival=last,

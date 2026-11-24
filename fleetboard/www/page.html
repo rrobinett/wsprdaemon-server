@@ -76,6 +76,7 @@ tr.v-off td:first-child { border-left-color: var(--off); }
     <div>Data: the public, read-only tables fleet_board and fleet_alarms of sigmondb_public, rebuilt every five minutes.  Positions show a 6-character grid square, never the exact site.</div>
     <div>ALARMS counts open alarms; "(+2 acked)" adds alarms an admin has acknowledged and is working on, which no longer lift a station up the board.</div>
     <div>Row colour never stands alone: the ON AIR column also says ✓, ✗ with an age, or "no data yet".  Grey means no history yet, or a board older than 15 minutes.  DEVICES and CAPACITY arrive in a later stage.</div>
+    <div>VERSION is the sigmond release the station last aligned to, from its daily drift report: ✓ when it is the newest blessed release, "→ v3.xx update" when the station has fallen behind, "candidate" on a canary.  "(report old)" means no report for two days.</div>
   </footer>
 </div>
 <!-- LOGIC -->

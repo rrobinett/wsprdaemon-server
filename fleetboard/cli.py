@@ -16,13 +16,16 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from fleetboard import alarms as al
-from fleetboard import board, ddl, sources
+from fleetboard import board, ddl, release, sources
 from fleetboard.checks import drift_hold, evaluate
 from fleetboard.stations import fold, load_map, parse_map_lines
 from sigmondb import publish
 from sigmondb.cli import connect
 
 DEFAULT_CONF = "/etc/wsprdaemon/clickhouse.conf"
+# The newest blessed sigmond tag, asked of GitHub at most hourly (release.latest).
+RELEASE_CACHE = os.environ.get("FLEETBOARD_RELEASE_CACHE",
+                               os.path.expanduser("~/.cache/fleetboard/latest-release.json"))
 ALARM_COLS = ["station", "check", "subject", "first_seen", "last_seen", "state",
               "false_streak", "numbers", "updated_at"]
 ACK_COLS = ["station", "check", "subject", "first_seen", "acked_by", "note", "acked_at"]
@@ -178,8 +181,13 @@ def cmd_run(a):
             merged.pop(key, None)
     if a.no_publish:
         return 0
+    latest = release.latest(RELEASE_CACHE, now)
+    if latest is None:
+        print("run: no blessed sigmond release known (GitHub unanswered, no cache); "
+              "the version column judges no station", file=sys.stderr, flush=True)
     tables = board.build(stations, acts, list(merged.values()), findings,
-                         publish.now_utc(), excluded_hours=hours, now=now)
+                         publish.now_utc(), excluded_hours=hours, now=now,
+                         latest_release=latest)
     fails = publish.publish(tables, hosts, user, password, timeout=a.timeout,
                             out=lambda s: print(s, flush=True), names=tuple(board.SCHEMAS),
                             schemas=board.SCHEMAS, database=publish.DATABASE)

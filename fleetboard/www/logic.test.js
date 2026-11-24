@@ -149,3 +149,20 @@ test("cellText DRIFT: counts, stale, none", () => {
   assert.equal(L.cellText(row({drift: d({n_drift: 3, stale: true})}), "DRIFT"), "3 drift, stale");
   assert.equal(L.cellText(row({drift: "nope"}), "DRIFT"), "✓");
 });
+
+test("VERSION: current, behind, candidate, ahead, none", () => {
+  const ver = (o) => row({version: JSON.stringify(Object.assign({release: "v3.94", baseline: "blessed", latest: "v3.94", state: "current", stale: false}, o))});
+  assert.equal(L.cellText(ver({}), "VERSION", NOW, false), "v3.94 ✓");
+  assert.equal(L.cellText(ver({}), "VERSION", NOW, true), "v3.94", "no ✓ on a stale board");
+  assert.equal(L.cellText(ver({release: "v3.93", state: "behind"}), "VERSION", NOW, false), "v3.93 → v3.94 update");
+  assert.equal(L.cellText(ver({release: "v3.95", baseline: "candidate", state: "candidate"}), "VERSION", NOW, false), "v3.95 candidate");
+  assert.equal(L.cellText(ver({release: "v3.95", state: "ahead"}), "VERSION", NOW, false), "v3.95 ahead");
+  assert.equal(L.cellText(ver({state: "unjudged", latest: null}), "VERSION", NOW, false), "v3.94");
+  assert.equal(L.cellText(ver({stale: true}), "VERSION", NOW, false), "v3.94 (report old)");
+  assert.equal(L.cellText(row({}), "VERSION", NOW, false), "—");
+  assert.equal(L.cellText(ver({release: null, state: "unknown"}), "VERSION", NOW, false), "—");
+});
+
+test("COLUMNS puts VERSION after ON AIR", () => {
+  assert.equal(L.COLUMNS.indexOf("VERSION"), L.COLUMNS.indexOf("ON AIR") + 1);
+});

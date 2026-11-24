@@ -19,6 +19,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from .alarms import LIVE, alarm_hours, live_map
+from .release import version_state
 from .checks import DRIFT_CHECKS, Finding, drift_stale, item_kind, expected_sources, live_subjects, spots_vs_usual, verdict
 from .sources import BASELINE_DAYS, SOURCES, USUAL_SOURCES
 
@@ -26,6 +27,7 @@ SCHEMAS = {
     "fleet_board": [
         ("station", "String"), ("grid6", "String"), ("verdict", "String"),
         ("sources", "String"), ("spots_vs_usual", "String"), ("drift", "String"),
+        ("version", "String"),
         ("n_open", "UInt16"), ("n_acked", "UInt16"), ("rank", "UInt16"),
         ("built_at_utc", "Float64"),
     ],
@@ -88,6 +90,18 @@ def _drift_json(sa, now):
                       sort_keys=True)
 
 
+def _version_json(sa, now, latest):
+    """The version column: the release the station last aligned to, judged
+    against the newest blessed one (`latest`, None when unknown), or '' with no
+    drift report.  The report arrives daily, so a stale one is marked."""
+    row = sa.drift
+    if row is None:
+        return ""
+    return json.dumps({"release": row.release, "baseline": row.baseline, "latest": latest,
+                       "state": version_state(row.release, row.baseline, latest),
+                       "stale": drift_stale(sa, now)}, sort_keys=True)
+
+
 def _public_alarm(a):
     """(subject, numbers) as published.  A drift alarm's detail, fix, key and
     reminder text hold paths, commands and operator prose; they stay in the
@@ -112,8 +126,10 @@ def _public_alarm(a):
 
 
 def build(stations, acts, alarms, findings: list[Finding], built_at: float,
-          excluded_hours=None, now: datetime | None = None) -> dict[str, list[dict]]:
-    """alarms: the live alarms.  excluded_hours: station -> hours the baseline
+          excluded_hours=None, now: datetime | None = None,
+          latest_release: str | None = None) -> dict[str, list[dict]]:
+    """alarms: the live alarms.  latest_release: the newest blessed sigmond tag
+    (release.latest), None when unknown.  excluded_hours: station -> hours the baseline
     skips (the run passes the full alarm history; default reads `alarms`).
     now: the check time (default: built_at)."""
     if now is None:
@@ -137,6 +153,7 @@ def build(stations, acts, alarms, findings: list[Finding], built_at: float,
             "sources": _sources_json(st, sa, findings, expected),
             "spots_vs_usual": _usual_json(sa, now, excluded_hours.get(st.name, set()), expected),
             "drift": _drift_json(sa, now),
+            "version": _version_json(sa, now, latest_release),
             "n_open": n_open.get(st.name, 0), "n_acked": n_acked.get(st.name, 0),
             "rank": 0, "built_at_utc": built_at,
         })
