@@ -126,6 +126,10 @@ SUFFIXES = [
     # page showed a phantom "DASI-006.W3USR_06-vm-contest" machine whose ssh
     # link was refused (rob, 2026-11-08).
     ('-vm-contest', 'web', 'http', 'shareable', 'Contest'),
+    # rob, 2026-11-24: the WSPR/FST4W carrier browser (wspr-recorder's
+    # wspr-carrier-browser, VM :8089), off by default, so few stations carry
+    # it.  Band 41800+rac, beside GRAPE's 40800.
+    ('-vm-carrier', 'web', 'http', 'shareable', 'Carrier browser'),  # 41800+rac
     ('-ssh',      'ssh', 'ssh',   'mesh-only', 'SSH'),        # receiver (smd)
     ('-web',      'web', 'http',  'shareable', 'ka9q-web'),   # receiver (smd)
 ]
@@ -159,6 +163,9 @@ COLUMNS = [
     # --- the Proxmox host underneath it ---
     ('Proxmox UI',      ['Proxmox UI'],              'web'),
     ('Proxmox box SSH', ['host SSH'],                'ssh'),
+    # rob, 2026-11-24: the carrier browser goes LAST, after the Proxmox host:
+    # only a few stations will enable it.
+    ('VM Carrier',      ['Carrier browser'],         'web'),
     # --- neither: a Wsprsonde host (Wsprsondes tab only) ---
     ('Sonde SSH',       ['Sonde SSH'],               'ssh'),
 ]
@@ -546,14 +553,15 @@ def parse(name):
 
 def rac_of(svcs):
     """Derive the RAC number from any of a client's ports — every band
-    (35800 ssh/vm-ssh, 45800 web/vm-web, 46800/47800 vm-web2/3, 50800 host-ssh, 55800 host-ui)
+    (35800 ssh/vm-ssh, 40800 vm-grape, 41800 vm-carrier, 45800 web/vm-web,
+    46800/47800 vm-web2/3, 50800 host-ssh, 55800 host-ui)
     is base + rac."""
     for s in svcs.values():
         p = s.get('port')
         if isinstance(p, int):
             if 37800 <= p <= 37899:      # Wsprsonde band: ID 2000-2099
                 return p - 35800
-            for base in (35800, 40800, 45800, 46800, 47800, 50800, 55800):
+            for base in (35800, 40800, 41800, 45800, 46800, 47800, 50800, 55800):
                 if base <= p <= base + 999:
                     return p - base
     return None
