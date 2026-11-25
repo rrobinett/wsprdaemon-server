@@ -12,6 +12,12 @@
       ch-system-log-ttl (opt-in, see README); *_N leftovers must be
       dropped by hand.
     * Keep in sync with ch-system-log-ttl, which reads this file.
+    * THIS FILE IS A TEMPLATE, NOT INSTALLED VERBATIM.  A <foo_log> section
+      in config.d ENABLES that log even if the server has it off, so
+      install-servers.sh renders a copy containing only the log tables that
+      already exist on the running server (clickhouse-config/
+      render-system-log-ttl.py).  The <ttl> values here are the single
+      source of truth for both the installer and ch-system-log-ttl.
 -->
 <clickhouse>
     <trace_log>
@@ -71,7 +77,10 @@
     <transactions_info_log>
         <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
     </transactions_info_log>
-    <opentelemetry_span_log>
-        <ttl>finish_date + INTERVAL 7 DAY DELETE</ttl>
-    </opentelemetry_span_log>
+    <!-- opentelemetry_span_log deliberately omitted: on ClickHouse 25.11
+         ALTER TABLE system.opentelemetry_span_log MODIFY TTL fails with
+         Code 44 ILLEGAL_COLUMN ("Cannot add subcolumn attribute.values:
+         column with this name already exists").  Neither the installer nor
+         ch-system-log-ttl touches it.
+         (It would be: finish_date + INTERVAL 7 DAY DELETE) -->
 </clickhouse>

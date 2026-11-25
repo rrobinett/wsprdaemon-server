@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ch-system-log-ttl.sh - apply the system-log TTL to EXISTING system.* tables
-# Version: 1.0.0
+# Version: 1.1.0
 #
 # config.d/wd-system-log-ttl.xml only affects system log tables created after
 # it is loaded.  This opt-in helper runs ALTER TABLE ... MODIFY TTL on the
@@ -11,12 +11,22 @@
 # Usage: ch-system-log-ttl.sh            # print the statements only
 #        sudo ch-system-log-ttl.sh --apply   # run them
 #
-# TTL values are read from the drop-in XML so there is one source of truth.
+# TTL values are read from the repo template XML (single source of truth).
+# The installed drop-in is a filtered copy; if it is absent the template next
+# to this script is used.  The ClickHouse password is never put on argv: it
+# goes in a 0600 client --config-file under a mktemp dir removed on exit.
+# opentelemetry_span_log is skipped (see SKIP_TABLES).
 
 set -euo pipefail
 
 CH_CONF="/etc/wsprdaemon/clickhouse.conf"
-XML="/etc/clickhouse-server/config.d/wd-system-log-ttl.xml"
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+XML="$SELF_DIR/clickhouse-config/wd-system-log-ttl.xml"
+[[ -f "$XML" ]] || XML="/etc/clickhouse-server/config.d/wd-system-log-ttl.xml"
+# ALTER TABLE system.opentelemetry_span_log MODIFY TTL fails on ClickHouse
+# 25.11 with Code 44 ILLEGAL_COLUMN ("Cannot add subcolumn attribute.values:
+# column with this name already exists"), so never attempt it.
+SKIP_TABLES=" opentelemetry_span_log "
 APPLY=false
 
 case "${1:-}" in
@@ -26,11 +36,24 @@ case "${1:-}" in
     *) echo "Unknown option: $1" >&2; exit 1 ;;
 esac
 
-[[ -f "$XML" ]] || { echo "ERROR: $XML not found - run install-servers.sh first" >&2; exit 1; }
+[[ -f "$XML" ]] || { echo "ERROR: TTL template/drop-in XML not found" >&2; exit 1; }
 [[ -f "$CH_CONF" ]] || { echo "ERROR: $CH_CONF not found" >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$CH_CONF"
-CH=(clickhouse-client --user "$CLICKHOUSE_ROOT_ADMIN_USER" --password "$CLICKHOUSE_ROOT_ADMIN_PASSWORD")
+
+umask 077
+CH_TMP=$(mktemp -d)
+trap 'rm -rf "$CH_TMP"' EXIT
+# credentials go to python via its environment, not argv (argv shows in ps)
+CH_U="$CLICKHOUSE_ROOT_ADMIN_USER" CH_P="$CLICKHOUSE_ROOT_ADMIN_PASSWORD" \
+python3 -I - "$CH_TMP/client.xml" <<'PY'
+import os, sys
+from xml.sax.saxutils import escape
+with open(sys.argv[1], "w") as f:
+    f.write("<config><user>%s</user><password>%s</password></config>\n"
+            % (escape(os.environ["CH_U"]), escape(os.environ["CH_P"])))
+PY
+CH=(clickhouse-client --config-file "$CH_TMP/client.xml")
 
 existing=$("${CH[@]}" --query "SELECT name FROM system.tables WHERE database='system'")
 
@@ -46,6 +69,10 @@ PY
 
 echo "-- Existing system log tables: MODIFY TTL"
 while IFS=$'\t' read -r table ttl; do
+    if [[ "$SKIP_TABLES" == *" $table "* ]]; then
+        echo "-- skipping system.$table (Code 44 ILLEGAL_COLUMN on ClickHouse 25.11)"
+        continue
+    fi
     grep -qx "$table" <<< "$existing" || continue
     stmt="ALTER TABLE system.$table MODIFY TTL $ttl"
     if $APPLY; then

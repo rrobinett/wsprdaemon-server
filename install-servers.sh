@@ -160,6 +160,27 @@ if [[ "${1:-}" == "--sync" ]]; then
     exit $?
 fi
 
+# Make a root-only clickhouse-client config file holding user+password so the
+# password never appears on a command line (visible in ps).  Sets CH_TMP_DIR
+# (removed by the EXIT trap) and CH_CFG.  Credentials pass via environment.
+make_ch_client_cfg() {
+    local user="$1" pw="$2"
+    if [[ -z "${CH_TMP_DIR:-}" ]]; then
+        CH_TMP_DIR=$(umask 077; mktemp -d)
+        trap 'rm -rf "$CH_TMP_DIR"' EXIT
+    fi
+    CH_CFG="$CH_TMP_DIR/client-$RANDOM.xml"
+    ( umask 077
+      CH_U="$user" CH_P="$pw" python3 -I -c '
+import os, sys
+from xml.sax.saxutils import escape
+with open(sys.argv[1], "w") as f:
+    f.write("<config><user>%s</user><password>%s</password></config>\n"
+            % (escape(os.environ["CH_U"]), escape(os.environ["CH_P"])))
+' "$CH_CFG" )
+    chmod 600 "$CH_CFG"
+}
+
 # Handle --validate argument
 if [[ "${1:-}" == "--validate" ]]; then
     if [[ $EUID -ne 0 ]]; then
@@ -282,9 +303,10 @@ print(ver)
         VALIDATE_OK=false
     else
         source /etc/wsprdaemon/clickhouse.conf
-        CH="clickhouse-client --user $CLICKHOUSE_ROOT_ADMIN_USER --password $CLICKHOUSE_ROOT_ADMIN_PASSWORD"
+        make_ch_client_cfg "$CLICKHOUSE_ROOT_ADMIN_USER" "$CLICKHOUSE_ROOT_ADMIN_PASSWORD"
+        CH=(clickhouse-client --config-file "$CH_CFG")
 
-        if $CH --query "SELECT 1" >/dev/null 2>&1; then
+        if "${CH[@]}" --query "SELECT 1" >/dev/null 2>&1; then
             echo "  ClickHouse connectivity: OK ✓"
         else
             echo "  ClickHouse connectivity: FAILED ✗"
@@ -301,18 +323,18 @@ print(ver)
             VALIDATE_OK=false
         fi
         echo "  system.* log table sizes:"
-        $CH --query "SELECT t.name, ifNull(sum(p.bytes_on_disk),0) AS b, formatReadableSize(b), ifNull(sum(p.rows),0) FROM system.tables t LEFT JOIN system.parts p ON p.database=t.database AND p.table=t.name AND p.active WHERE t.database='system' AND match(t.name, '_log(_[0-9]+)?\$') GROUP BY t.name ORDER BY b DESC FORMAT TSV" 2>/dev/null \
+        "${CH[@]}" --query "SELECT t.name, ifNull(sum(p.bytes_on_disk),0) AS b, formatReadableSize(b), ifNull(sum(p.rows),0) FROM system.tables t LEFT JOIN system.parts p ON p.database=t.database AND p.table=t.name AND p.active WHERE t.database='system' AND match(t.name, '_log(_[0-9]+)?\$') GROUP BY t.name ORDER BY b DESC FORMAT TSV" 2>/dev/null \
             | while IFS=$'\t' read -r name _ size rows; do printf "    %-32s %12s %14s rows\n" "$name" "$size" "$rows"; done || true
         echo ""
         echo "  Tables in wsprdaemon database:"
-        tables=$($CH --query "SHOW TABLES FROM wsprdaemon" 2>/dev/null || echo "")
+        tables=$("${CH[@]}" --query "SHOW TABLES FROM wsprdaemon" 2>/dev/null || echo "")
         if [[ -z "$tables" ]]; then
             echo "    (none yet - service may still be starting)"
         else
             while IFS= read -r table; do
-                row_count=$($CH --query "SELECT count() FROM wsprdaemon.$table" 2>/dev/null || echo "error")
-                min_time=$($CH --query "SELECT min(time) FROM wsprdaemon.$table" 2>/dev/null || echo "")
-                max_time=$($CH --query "SELECT max(time) FROM wsprdaemon.$table" 2>/dev/null || echo "")
+                row_count=$("${CH[@]}" --query "SELECT count() FROM wsprdaemon.$table" 2>/dev/null || echo "error")
+                min_time=$("${CH[@]}" --query "SELECT min(time) FROM wsprdaemon.$table" 2>/dev/null || echo "")
+                max_time=$("${CH[@]}" --query "SELECT max(time) FROM wsprdaemon.$table" 2>/dev/null || echo "")
                 printf "    %-30s %12s rows  %s .. %s
 " "$table" "$row_count" "$min_time" "$max_time"
                 # Warn if table is empty after services have been running
@@ -326,9 +348,9 @@ print(ver)
         # Check recent data - warn if newest spot is older than 30 minutes AND queue is empty
         echo ""
         if echo "$tables" | grep -q "^spots$"; then
-            newest=$($CH --query "SELECT max(time) FROM wsprdaemon.spots" 2>/dev/null || echo "")
+            newest=$("${CH[@]}" --query "SELECT max(time) FROM wsprdaemon.spots" 2>/dev/null || echo "")
             if [[ -n "$newest" && "$newest" != "1970-01-01 00:00:00" ]]; then
-                age_seconds=$($CH --query "SELECT toUnixTimestamp(now()) - toUnixTimestamp(max(time)) FROM wsprdaemon.spots" 2>/dev/null || echo "9999")
+                age_seconds=$("${CH[@]}" --query "SELECT toUnixTimestamp(now()) - toUnixTimestamp(max(time)) FROM wsprdaemon.spots" 2>/dev/null || echo "9999")
                 age_minutes=$(( age_seconds / 60 ))
                 # Count queued tbz files across all incoming dirs
                 queued_tbz=0
@@ -770,19 +792,35 @@ fi
 #   ch-system-log-ttl            # print ALTER ... MODIFY TTL statements
 #   ch-system-log-ttl --apply    # run them
 SYSLOG_SRC="$SCRIPT_DIR/clickhouse-config/wd-system-log-ttl.xml"
+SYSLOG_RENDER="$SCRIPT_DIR/clickhouse-config/render-system-log-ttl.py"
 SYSLOG_DST=/etc/clickhouse-server/config.d/wd-system-log-ttl.xml
 chmod +x "$SCRIPT_DIR/ch-system-log-ttl.sh"
 ln -sf "$SCRIPT_DIR/ch-system-log-ttl.sh" /usr/local/sbin/ch-system-log-ttl
-if [[ -f "$SYSLOG_DST" ]] && cmp -s "$SYSLOG_SRC" "$SYSLOG_DST"; then
+# A <foo_log> section in config.d ENABLES that log even if the server has it
+# off, so the drop-in lists only system *_log tables that already exist on
+# the running server (renamed *_N leftovers excluded).  If ClickHouse is not
+# reachable we install nothing rather than the full list.  The repo file is a
+# template and the single source of TTL values.
+make_ch_client_cfg "$CH_ADMIN_USER" "$CH_ADMIN_PASSWORD"
+SYSLOG_TABLES="$CH_TMP_DIR/system-log-tables.txt"
+SYSLOG_NEW="$CH_TMP_DIR/wd-system-log-ttl.xml"
+if ! clickhouse-client --config-file "$CH_CFG" --query \
+        "SELECT name FROM system.tables WHERE database='system' AND match(name, '_log\$') ORDER BY name" \
+        > "$SYSLOG_TABLES" 2>/dev/null; then
+    echo "  SKIPPED wd-system-log-ttl.xml: ClickHouse not reachable, cannot tell which"
+    echo "  system logs are enabled.  Start clickhouse-server and re-run install-servers.sh."
+elif ! python3 -I "$SYSLOG_RENDER" "$SYSLOG_SRC" "$SYSLOG_TABLES" > "$SYSLOG_NEW"; then
+    echo "  ERROR: could not render wd-system-log-ttl.xml (skipped)"
+elif [[ -f "$SYSLOG_DST" ]] && cmp -s "$SYSLOG_NEW" "$SYSLOG_DST"; then
     echo "  wd-system-log-ttl.xml already up to date"
 else
     if [[ -f "$SYSLOG_DST" ]]; then
         SYSLOG_BAK="$SYSLOG_DST.bak.$(date +%Y%m%d%H%M%S)"
         cp -p "$SYSLOG_DST" "$SYSLOG_BAK"
         echo "  Backed up differing wd-system-log-ttl.xml to $SYSLOG_BAK"
-            fi
-    install -m 644 "$SYSLOG_SRC" "$SYSLOG_DST"
-    echo "  Installed wd-system-log-ttl.xml (system log TTL: 7d, 3d for trace/metric logs)"
+    fi
+    install -m 644 "$SYSLOG_NEW" "$SYSLOG_DST"
+    echo "  Installed wd-system-log-ttl.xml for existing logs: $(paste -sd' ' "$SYSLOG_TABLES" | wc -w) tables on this server"
     echo "  Restart clickhouse-server to load it; existing tables need: sudo ch-system-log-ttl --apply"
 fi
 
@@ -915,7 +953,8 @@ systemctl daemon-reload
 # ============================================================================
 echo ""
 echo "Validating ClickHouse connectivity..."
-if clickhouse-client --user "$CH_ADMIN_USER" --password "$CH_ADMIN_PASSWORD" \
+make_ch_client_cfg "$CH_ADMIN_USER" "$CH_ADMIN_PASSWORD"
+if clickhouse-client --config-file "$CH_CFG" \
         --query "SELECT 1" >/dev/null 2>&1; then
     echo "  ClickHouse reachable as $CH_ADMIN_USER ✓"
 else
@@ -971,4 +1010,5 @@ echo "      no reinstall or restart needed for script changes."
 echo ""
 
 # Run full validation
+rm -rf "${CH_TMP_DIR:-}"
 exec "$0" --validate
