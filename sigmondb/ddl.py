@@ -180,6 +180,63 @@ _SPEC = {
         order="reporter_id, time",
         ttl="time + INTERVAL 400 DAY",
     ),
+    # The scout's rows (a station's own spectrum view): one row per streak, one per dwell.
+    "sweep": dict(
+        cols=[
+            ("time", "DateTime64(3)"), ("reporter_id", "String"), ("view", LC),
+            ("centre_hz", "Float64"), ("span_hz", "Float64"),
+            ("rate_hz_per_s", "Float64"), ("period_s", "Float64"),
+            ("duration_s", NF64), ("snr_db", "Float32"), ("n_sweeps", "UInt32"),
+            ("fit_score", NF32), ("clipped", "UInt8"), ("matched_key", "String"),
+            ("bin_hz", "Float32"), ("frame_s", "Float32"),
+            ("detector_version", LC), ("schema_version", "UInt16"),
+        ] + ENGINEERING + RECEIVED,
+        part="toYYYYMM(time)",
+        order="reporter_id, centre_hz, rate_hz_per_s, time, detector_version",
+    ),
+    "scout_dwell": dict(
+        cols=[
+            ("time", "DateTime64(3)"), ("reporter_id", "String"), ("view", LC),
+            ("centre_hz", "Float64"), ("span_hz", "Float64"),
+            ("bin_hz", "Float32"), ("frame_s", "Float32"), ("duration_s", "Float32"),
+            ("n_frames", "UInt32"), ("noise_db", NF32), ("n_streaks", "UInt16"),
+            ("detector_version", LC), ("schema_version", "UInt16"),
+        ] + ENGINEERING + RECEIVED,
+        part="toYYYYMM(time)",
+        order="reporter_id, view, centre_hz, time, detector_version",
+    ),
+    # Chirp lifecycle.  Written by seeding and the chirp-state job, never by `load`.
+    "chirp": dict(
+        cols=[
+            ("chirp_id", "String"), ("group_key", LC), ("kind", LC), ("state", LC),
+            ("state_since", "DateTime"), ("centre_hz", "Float64"), ("span_hz", NF64),
+            ("rate_hz_per_s", "Float64"), ("period_s", NF64), ("duration_s", NF64),
+            ("gate_period_s", NF64), ("lat", NF64), ("lon", NF64),
+            ("pos_sigma_m", NF32), ("pos_source", LC),
+            ("offset_ns", "Nullable(Int64)"), ("offset_sigma_ns", NF64),
+            ("first_heard", "DateTime"), ("last_heard", "Nullable(DateTime)"),
+            ("reporter_ids", "Array(String)"), ("n_stations", "UInt16"),
+            ("heard_hours", "UInt32"), ("tx_id", "String"),
+            ("prior_ids", "Array(String)"), ("suggested_name", "String"),
+            ("pin", LC), ("pin_by", "String"), ("pin_why", "String"),
+            ("rules_version", LC), ("updated_at", "DateTime"),
+        ],
+        part=None,
+        order="chirp_id",
+        engine="ReplacingMergeTree(updated_at)",
+        bulk=False,
+    ),
+    "chirp_log": dict(
+        cols=[
+            ("at", "DateTime"), ("chirp_id", "String"), ("from_state", LC),
+            ("to_state", LC), ("actor", "String"), ("why", "String"),
+            ("evidence", "Map(String, String)"), ("reporter_ids", "Array(String)"),
+            ("rules_version", LC),
+        ],
+        part="toYYYYMM(at)",
+        order="chirp_id, at, to_state, actor",
+        bulk=False,
+    ),
 }
 
 
@@ -201,10 +258,11 @@ def _create_table(name, cols, part, order, engine=None, ttl=None):
 TABLES = {}
 COLUMNS = {}
 COLUMN_TYPES = {}  # table -> {column: ClickHouse type}, insertable columns only
-TABLE_ORDER = tuple(_SPEC)  # the insert order: every row table, in DDL order
+TABLE_ORDER = tuple(n for n, _s in _SPEC.items() if _s.get("bulk", True))  # insert order for `load`
 for _name, _s in _SPEC.items():
     COLUMN_TYPES[_name] = dict(_s["cols"])
-    TABLES[_name] = _create_table(_name, _s["cols"], _s["part"], _s["order"], ttl=_s.get("ttl"))
+    TABLES[_name] = _create_table(_name, _s["cols"], _s["part"], _s["order"],
+                              engine=_s.get("engine"), ttl=_s.get("ttl"))
     COLUMNS[_name] = tuple(n for n, _ in _s["cols"])
 
 # set_aside: windows of rows that must never feed a product (sigmondb/set_aside.py).
@@ -223,6 +281,23 @@ TABLES["set_aside"] = (
                              for n, t in _SET_ASIDE_COLS)))
 COLUMN_TYPES["set_aside"] = dict(_SET_ASIDE_COLS + [("active", "UInt8")])
 COLUMNS["set_aside"] = tuple(COLUMN_TYPES["set_aside"])
+
+# chirp_reject_local: a station's own refusal of a streak, as set_aside is a refusal of rows.
+# Same pattern: no ingested_at, set_at is the version, active = 0 withdraws.  Not in TABLE_ORDER.
+_CHIRP_REJECT_LOCAL_COLS = [
+    ("reporter_id", "String"), ("centre_hz", "Float64"),
+    ("rate_hz_per_s", "Float64"), ("period_s", "Float64"), ("span_hz", NF64),
+    ("chirp_id", "String"), ("reason", "String"), ("set_by", "String"),
+    ("set_at", "DateTime"),
+]
+TABLES["chirp_reject_local"] = (
+    "CREATE TABLE IF NOT EXISTS %s.chirp_reject_local\n(\n%s,\n    `active` UInt8 DEFAULT 1\n)\n"
+    "ENGINE = ReplacingMergeTree(set_at)\n"
+    "ORDER BY (reporter_id, centre_hz, rate_hz_per_s, period_s)" % (
+        DATABASE, ",\n".join(("    `%s` %s %s" % (n, t, _codec(t))).rstrip()
+                             for n, t in _CHIRP_REJECT_LOCAL_COLS)))
+COLUMN_TYPES["chirp_reject_local"] = dict(_CHIRP_REJECT_LOCAL_COLS + [("active", "UInt8")])
+COLUMNS["chirp_reject_local"] = tuple(COLUMN_TYPES["chirp_reject_local"])
 
 # heard: last arrival time and level per (receiver, transmitter, group).
 # The target table keeps aggregate states; the materialized view feeds it

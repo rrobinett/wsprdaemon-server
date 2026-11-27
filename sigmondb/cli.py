@@ -168,7 +168,8 @@ def _fetch(client, table, cols, where="", params=None):
     out = [dict(zip(cols, r)) for r in res.result_rows]
     for r in out:
         for c in ("time", "valid_from", "window_from", "window_to", "run_at",
-                  "from_time", "to_time", "set_at"):
+                  "from_time", "to_time", "set_at", "at", "state_since", "updated_at",
+                  "first_heard", "last_heard"):
             if c in r:
                 r[c] = _utc_naive(r[c])
     return out

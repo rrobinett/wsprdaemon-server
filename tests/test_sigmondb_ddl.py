@@ -91,3 +91,57 @@ def test_attribution_key_and_place():
     assert "PARTITION BY toYYYYMM(run_at)" in a
     names = list(ddl.TABLES)
     assert names.index("solution") < names.index("attribution") < names.index("path")
+
+
+CHIRP_NEW = ("sweep", "scout_dwell", "chirp", "chirp_log", "chirp_reject_local")
+
+
+def test_chirp_tables_created():
+    names = list(ddl.TABLES)
+    for t in CHIRP_NEW:
+        assert t in names, t
+    assert names[-1] == "heard"
+
+
+def test_chirp_keys():
+    expect = {
+        "sweep": "ORDER BY (reporter_id, centre_hz, rate_hz_per_s, time, detector_version)",
+        "scout_dwell": "ORDER BY (reporter_id, view, centre_hz, time, detector_version)",
+        "chirp": "ORDER BY (chirp_id)",
+        "chirp_log": "ORDER BY (chirp_id, at, to_state, actor)",
+        "chirp_reject_local": "ORDER BY (reporter_id, centre_hz, rate_hz_per_s, period_s)",
+    }
+    for t, o in expect.items():
+        assert o in _norm(ddl.TABLES[t]), t
+    assert "PARTITION BY toYYYYMM(time)" in _norm(ddl.TABLES["sweep"])
+    assert "PARTITION BY toYYYYMM(time)" in _norm(ddl.TABLES["scout_dwell"])
+    assert "PARTITION BY toYYYYMM(at)" in _norm(ddl.TABLES["chirp_log"])
+    assert "PARTITION BY" not in ddl.TABLES["chirp"]
+
+
+def test_chirp_log_keeps_every_change():
+    s = _norm(ddl.TABLES["chirp_log"])
+    assert re.search(r"ORDER BY \([^)]*\bat\b", s)
+    assert "ENGINE = ReplacingMergeTree(ingested_at)" in s
+    assert "ENGINE = ReplacingMergeTree(updated_at)" in _norm(ddl.TABLES["chirp"])
+
+
+def test_reject_local_versioned_by_set_at():
+    s = _norm(ddl.TABLES["chirp_reject_local"])
+    assert "ReplacingMergeTree(set_at)" in s
+    assert "`active` UInt8 DEFAULT 1" in s
+    assert "ingested_at" not in s
+
+
+def test_scout_tables_in_load_order():
+    assert "sweep" in ddl.TABLE_ORDER and "scout_dwell" in ddl.TABLE_ORDER
+    for t in ("chirp", "chirp_log", "chirp_reject_local"):
+        assert t not in ddl.TABLE_ORDER
+
+
+def test_sweep_columns_contract():
+    assert ddl.COLUMNS["sweep"] == (
+        "time", "reporter_id", "view", "centre_hz", "span_hz", "rate_hz_per_s",
+        "period_s", "duration_s", "snr_db", "n_sweeps", "fit_score", "clipped",
+        "matched_key", "bin_hz", "frame_s", "detector_version", "schema_version",
+        "engineering", "received_at")

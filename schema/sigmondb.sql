@@ -250,6 +250,110 @@ PARTITION BY toYYYYMM(time)
 ORDER BY (reporter_id, time)
 TTL time + INTERVAL 400 DAY;
 
+CREATE TABLE IF NOT EXISTS sigmondb.sweep
+(
+    `time` DateTime64(3) CODEC(Delta(8), ZSTD(3)),
+    `reporter_id` String CODEC(ZSTD(3)),
+    `view` LowCardinality(String) CODEC(ZSTD(3)),
+    `centre_hz` Float64 CODEC(ZSTD(3)),
+    `span_hz` Float64 CODEC(ZSTD(3)),
+    `rate_hz_per_s` Float64 CODEC(ZSTD(3)),
+    `period_s` Float64 CODEC(ZSTD(3)),
+    `duration_s` Nullable(Float64) CODEC(ZSTD(3)),
+    `snr_db` Float32 CODEC(ZSTD(3)),
+    `n_sweeps` UInt32 CODEC(ZSTD(3)),
+    `fit_score` Nullable(Float32) CODEC(ZSTD(3)),
+    `clipped` UInt8 CODEC(ZSTD(3)),
+    `matched_key` String CODEC(ZSTD(3)),
+    `bin_hz` Float32 CODEC(ZSTD(3)),
+    `frame_s` Float32 CODEC(ZSTD(3)),
+    `detector_version` LowCardinality(String) CODEC(ZSTD(3)),
+    `schema_version` UInt16 CODEC(ZSTD(3)),
+    `engineering` Map(String, String),
+    `received_at` Nullable(DateTime) CODEC(ZSTD(3)),
+    `ingested_at` DateTime DEFAULT now() CODEC(Delta(4), ZSTD(3))
+)
+ENGINE = ReplacingMergeTree(ingested_at)
+PARTITION BY toYYYYMM(time)
+ORDER BY (reporter_id, centre_hz, rate_hz_per_s, time, detector_version);
+
+CREATE TABLE IF NOT EXISTS sigmondb.scout_dwell
+(
+    `time` DateTime64(3) CODEC(Delta(8), ZSTD(3)),
+    `reporter_id` String CODEC(ZSTD(3)),
+    `view` LowCardinality(String) CODEC(ZSTD(3)),
+    `centre_hz` Float64 CODEC(ZSTD(3)),
+    `span_hz` Float64 CODEC(ZSTD(3)),
+    `bin_hz` Float32 CODEC(ZSTD(3)),
+    `frame_s` Float32 CODEC(ZSTD(3)),
+    `duration_s` Float32 CODEC(ZSTD(3)),
+    `n_frames` UInt32 CODEC(ZSTD(3)),
+    `noise_db` Nullable(Float32) CODEC(ZSTD(3)),
+    `n_streaks` UInt16 CODEC(ZSTD(3)),
+    `detector_version` LowCardinality(String) CODEC(ZSTD(3)),
+    `schema_version` UInt16 CODEC(ZSTD(3)),
+    `engineering` Map(String, String),
+    `received_at` Nullable(DateTime) CODEC(ZSTD(3)),
+    `ingested_at` DateTime DEFAULT now() CODEC(Delta(4), ZSTD(3))
+)
+ENGINE = ReplacingMergeTree(ingested_at)
+PARTITION BY toYYYYMM(time)
+ORDER BY (reporter_id, view, centre_hz, time, detector_version);
+
+CREATE TABLE IF NOT EXISTS sigmondb.chirp
+(
+    `chirp_id` String CODEC(ZSTD(3)),
+    `group_key` LowCardinality(String) CODEC(ZSTD(3)),
+    `kind` LowCardinality(String) CODEC(ZSTD(3)),
+    `state` LowCardinality(String) CODEC(ZSTD(3)),
+    `state_since` DateTime CODEC(Delta(4), ZSTD(3)),
+    `centre_hz` Float64 CODEC(ZSTD(3)),
+    `span_hz` Nullable(Float64) CODEC(ZSTD(3)),
+    `rate_hz_per_s` Float64 CODEC(ZSTD(3)),
+    `period_s` Nullable(Float64) CODEC(ZSTD(3)),
+    `duration_s` Nullable(Float64) CODEC(ZSTD(3)),
+    `gate_period_s` Nullable(Float64) CODEC(ZSTD(3)),
+    `lat` Nullable(Float64) CODEC(ZSTD(3)),
+    `lon` Nullable(Float64) CODEC(ZSTD(3)),
+    `pos_sigma_m` Nullable(Float32) CODEC(ZSTD(3)),
+    `pos_source` LowCardinality(String) CODEC(ZSTD(3)),
+    `offset_ns` Nullable(Int64) CODEC(ZSTD(3)),
+    `offset_sigma_ns` Nullable(Float64) CODEC(ZSTD(3)),
+    `first_heard` DateTime CODEC(Delta(4), ZSTD(3)),
+    `last_heard` Nullable(DateTime) CODEC(ZSTD(3)),
+    `reporter_ids` Array(String),
+    `n_stations` UInt16 CODEC(ZSTD(3)),
+    `heard_hours` UInt32 CODEC(ZSTD(3)),
+    `tx_id` String CODEC(ZSTD(3)),
+    `prior_ids` Array(String),
+    `suggested_name` String CODEC(ZSTD(3)),
+    `pin` LowCardinality(String) CODEC(ZSTD(3)),
+    `pin_by` String CODEC(ZSTD(3)),
+    `pin_why` String CODEC(ZSTD(3)),
+    `rules_version` LowCardinality(String) CODEC(ZSTD(3)),
+    `updated_at` DateTime CODEC(Delta(4), ZSTD(3)),
+    `ingested_at` DateTime DEFAULT now() CODEC(Delta(4), ZSTD(3))
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (chirp_id);
+
+CREATE TABLE IF NOT EXISTS sigmondb.chirp_log
+(
+    `at` DateTime CODEC(Delta(4), ZSTD(3)),
+    `chirp_id` String CODEC(ZSTD(3)),
+    `from_state` LowCardinality(String) CODEC(ZSTD(3)),
+    `to_state` LowCardinality(String) CODEC(ZSTD(3)),
+    `actor` String CODEC(ZSTD(3)),
+    `why` String CODEC(ZSTD(3)),
+    `evidence` Map(String, String),
+    `reporter_ids` Array(String),
+    `rules_version` LowCardinality(String) CODEC(ZSTD(3)),
+    `ingested_at` DateTime DEFAULT now() CODEC(Delta(4), ZSTD(3))
+)
+ENGINE = ReplacingMergeTree(ingested_at)
+PARTITION BY toYYYYMM(at)
+ORDER BY (chirp_id, at, to_state, actor);
+
 CREATE TABLE IF NOT EXISTS sigmondb.set_aside
 (
     `scope` LowCardinality(String) CODEC(ZSTD(3)),
@@ -263,6 +367,22 @@ CREATE TABLE IF NOT EXISTS sigmondb.set_aside
 )
 ENGINE = ReplacingMergeTree(set_at)
 ORDER BY (scope, reporter_id, from_time);
+
+CREATE TABLE IF NOT EXISTS sigmondb.chirp_reject_local
+(
+    `reporter_id` String CODEC(ZSTD(3)),
+    `centre_hz` Float64 CODEC(ZSTD(3)),
+    `rate_hz_per_s` Float64 CODEC(ZSTD(3)),
+    `period_s` Float64 CODEC(ZSTD(3)),
+    `span_hz` Nullable(Float64) CODEC(ZSTD(3)),
+    `chirp_id` String CODEC(ZSTD(3)),
+    `reason` String CODEC(ZSTD(3)),
+    `set_by` String CODEC(ZSTD(3)),
+    `set_at` DateTime CODEC(Delta(4), ZSTD(3)),
+    `active` UInt8 DEFAULT 1
+)
+ENGINE = ReplacingMergeTree(set_at)
+ORDER BY (reporter_id, centre_hz, rate_hz_per_s, period_s);
 
 CREATE TABLE IF NOT EXISTS sigmondb.heard_state
 (
