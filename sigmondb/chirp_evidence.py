@@ -8,11 +8,17 @@ Evidence per chirp and does no I/O.  Times are naive UTC datetimes throughout.
 Rules that shape the evidence (spec: tasks/chirp-registry/2026-11-13-chirp-scout-design.md):
 - "Heard" means a matching sweep or a matching arrival of any origin, so a chirp that
   chirp-recorder still hears never reads as silent because the scout missed it.
-- Silence counts only where a scout listened: a station is covered-silent for an hour when
-  it dwelled over the chirp's centre (|centre - dwell centre| <= dwell span / 2) and
-  reported no matching sweep or arrival.
+- Silence counts only where a scout listened: a station is silent for an hour when it
+  dwelled over the chirp's centre (|centre - dwell centre| <= dwell span / 2) and reported
+  no matching sweep or arrival.  A station counts each silent hour once, however many
+  dwells and views (coarse and fine) covered it, so a dwell count means distinct hours.
+- covered_silent, the silence that can make a chirp dormant or retired, counts only hours
+  after the chirp's last hearing: silence before it says nothing about whether the chirp
+  went quiet.  silent_hours counts the whole window; a candidate's local reject reads it.
 - A sweep matching a reporter's active local reject never counts for that reporter, as
-  hearing or as silence; a co-sited partner's own dwells still count.
+  hearing or as silence; a co-sited partner's own dwells still count.  So too a withheld
+  sweep (the job's: one that matched a rejected chirp): for any chirp it matches, its
+  (reporter, hour) is neither hearing nor silence.
 - Reporters at one site (one coherence group, or within independence.co_site_km) count once.
 """
 import math
@@ -90,7 +96,8 @@ class Evidence:
     hearers: dict = field(default_factory=dict)          # independent station -> hours heard
     heard_hours_bits: int = 0                            # bit h: heard in UTC hour h, history window
     last_heard: Optional[datetime] = None
-    covered_silent: dict = field(default_factory=dict)   # independent station -> silent covering dwells
+    covered_silent: dict = field(default_factory=dict)   # station -> silent covering hours after last_heard
+    silent_hours: dict = field(default_factory=dict)     # station -> silent covering hours, whole window
     probe_stations: set = field(default_factory=set)
     probe_found: set = field(default_factory=set)
     waveform_agree: int = 0
@@ -213,16 +220,20 @@ def _named(chirp_row, sig, attributions, rules, now):
     return next(iter(names)) if len(names) == 1 else None
 
 
-def gather(chirps, aggregates, arrivals_t6, receivers, attributions, rules, now, rejects=()):
+def gather(chirps, aggregates, arrivals_t6, receivers, attributions, rules, now, rejects=(),
+           withheld=()):
     """{chirp_id: Evidence} from already-fetched rows.
 
     aggregates: AGG_SQL name -> rows (dicts); a missing name counts as no rows.
     arrivals_t6: T6 arrivals as the attribution inputs give them (cli._ATTR_WHERE, _carried):
     time, reporter_id, group_key, delay_ns.  receivers: receiver rows.  attributions: rows of
     sigmondb.attribution.  rejects: chirp_reject_local rows; withdrawn ones (active = 0) do
-    not apply.  now: naive UTC."""
+    not apply.  withheld: sweep_hourly rows that count for no chirp as hearing or as silence
+    (the job passes the sweeps that matched a rejected chirp).  now: naive UTC."""
     aggregates = aggregates or {}
     sweeps = list(aggregates.get("sweep_hourly") or ())
+    n_kept = len(sweeps)
+    sweeps += list(withheld or ())
     dwells = list(aggregates.get("dwell_hourly") or ())
     caps = list(aggregates.get("capture_recent") or ())
     arrs = list(aggregates.get("arrival_hourly") or ())
@@ -235,8 +246,8 @@ def gather(chirps, aggregates, arrivals_t6, receivers, attributions, rules, now,
     max_mad = rules.established.max_cluster_mad_us
 
     sweep_sigs = [_row_sig(s) for s in sweeps]
-    rejected = [any(matches(r, sg, rules) for r in rej.get(s["reporter_id"], ()))
-                for s, sg in zip(sweeps, sweep_sigs)]
+    rejected = [i >= n_kept or any(matches(r, sg, rules) for r in rej.get(s["reporter_id"], ()))
+                for i, (s, sg) in enumerate(zip(sweeps, sweep_sigs))]
     t6_keys = []
     for a in t6:
         try:
@@ -257,7 +268,7 @@ def gather(chirps, aggregates, arrivals_t6, receivers, attributions, rules, now,
         ev.shared_signature = sorted(o for o, osig in sigs.items()
                                      if o != cid and matches(sig, osig, rules))
         heard = {}                     # site -> set of hours (counted sweeps and arrivals)
-        blocked = set()                # (reporter, hour) with a sweep on that reporter's reject
+        blocked = set()                # (reporter, hour) with a rejected or withheld sweep
         whole = {}                     # site -> whole matching sweep rows
         for i in sweep_ix.candidates(sig):
             s, sg, rj = sweeps[i], sweep_sigs[i], rejected[i]
@@ -283,15 +294,18 @@ def gather(chirps, aggregates, arrivals_t6, receivers, attributions, rules, now,
             if h >= bits_from:
                 ev.heard_hours_bits |= 1 << h.hour
 
-        silent = {}
+        silent = {}                    # site -> hours it dwelled over the chirp and heard nothing
         for d in dwells:
             if abs(sig.centre_hz - d["centre_hz"]) > d["span_hz"] / 2:
                 continue
             st = site.get(d["reporter_id"], d["reporter_id"])
             if d["hour"] in heard.get(st, ()) or (d["reporter_id"], d["hour"]) in blocked:
                 continue
-            silent[st] = silent.get(st, 0) + int(d.get("n") or 0)
-        ev.covered_silent = dict(sorted(silent.items()))
+            silent.setdefault(st, set()).add(d["hour"])
+        ev.silent_hours = {st: len(hs) for st, hs in sorted(silent.items())}
+        after = {st: sum(1 for h in hs if ev.last_heard is None or h > ev.last_heard)
+                 for st, hs in sorted(silent.items())}
+        ev.covered_silent = {st: n for st, n in after.items() if n}
 
         for i in cap_ix.candidates(sig):
             p = caps[i]

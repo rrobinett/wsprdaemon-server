@@ -615,3 +615,25 @@ def test_located_counts_fresh_locates_and_relocated_recovery(monkeypatch):
     second = run(JobClient(tables, aggs))
     assert (second.located, second.relocated) == (0, 1)
     assert [t["tx_id"] for t in second.transmitter_rows] == [CID]
+
+
+# --- final review -----------------------------------------------------------------------------
+
+def test_vetoed_chirp_never_turns_a_siblings_dwell_into_silence():
+    """Important 5: X (vetoed) and Y (established, named) share a signature.  Scout-only S1
+    heard Y by an arrival 40 h ago, then its sweeps matched X while it dwelled over the
+    band.  Those (S1, hour) pairs are neither hearing nor silence for Y, so Y stays."""
+    since = NOW - timedelta(days=5)
+    tables = {"chirp": [chirp_row("X", state="rejected", pin="veto"),
+                        chirp_row("Y", state="established", tx_id="SITE-Y")],
+              "chirp_log": [log_row("X", "rejected", since, "probing"),
+                            log_row("Y", "established", since, "probing")],
+              "receiver": list(RX)}
+    aggs = {"sweep_hourly": [sweep("S1", H(k)) for k in range(1, 8)],
+            "dwell_hourly": [dict(reporter_id="S1", centre_hz=CENTRE, span_hz=200_000.0,
+                                  hour=H(k), n=2) for k in range(1, 8)],
+            "arrival_hourly": [dict(reporter_id="S1", centre_hz=CENTRE, rate_hz_per_s=RATE,
+                                    hour=H(40), n=5, n_t6=0)]}
+    res = run(JobClient(tables, aggs))
+    assert res.log_rows == []
+    assert res.states == {"established": 1, "rejected": 1}

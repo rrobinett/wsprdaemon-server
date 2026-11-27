@@ -24,7 +24,8 @@ Rules the job keeps (plan Task 9 and the controller's rulings of 2026-11-27):
 - State comes from the latest chirp_log row per chirp (current_states), never from chirp.state.
 - One move per chirp per run.  A chirp founded in this run moves on the next run.
 - A sweep that matches a rejected chirp counts only for that chirp: it founds nothing and
-  feeds no other chirp's evidence.  A rejected chirp heard again does not move; the run counts
+  feeds no other chirp's evidence, as hearing or as silence (a sibling sharing the signature
+  reads that reporter's hour as neither).  A rejected chirp heard again does not move; the run counts
   it as heard_while_rejected.
 - Priors (transmitter rows with source hfrnet or giro) fill prior_ids, suggested_name and a
   kind.  They never change a state.
@@ -370,12 +371,13 @@ def run(client, rules, now, out=print):
     aggs = inp["aggs"]
     sigs = [ce.chirp_signature(c) for c in live]
     index = ce._ByCentre(sigs, rules)
-    unmatched, kept = [], []
+    unmatched, kept, withheld = [], [], []
     for s in aggs.get("sweep_hourly") or ():
         sg = ce._row_sig(s)
         hit = [i for i in index.candidates(sg) if matches(sigs[i], sg, rules)]
         if any(live[i]["state"] == "rejected" for i in hit):
-            continue                    # counts only for the rejected chirp
+            withheld.append(s)          # counts only for the rejected chirp
+            continue
         kept.append(s)
         if not hit:
             unmatched.append(s)
@@ -421,7 +423,10 @@ def run(client, rules, now, out=print):
     common = (inp["t6"], inp["receivers"], inp["attributions"], rules, now)
     rejected = [c for c in everyone if c["state"] == "rejected"]
     others = [c for c in everyone if c["state"] != "rejected"]
-    evs = ce.gather(others, dict(aggs, sweep_hourly=kept), *common, rejects=inp["rejects"])
+    # A withheld sweep's (reporter, hour) is neither hearing nor silence for the rejected
+    # chirp's siblings: else the scout's covering dwell there would read as silence.
+    evs = ce.gather(others, dict(aggs, sweep_hourly=kept), *common, rejects=inp["rejects"],
+                    withheld=withheld)
     if rejected:
         evs.update(ce.gather(rejected, aggs, *common, rejects=inp["rejects"]))
 

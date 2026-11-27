@@ -92,11 +92,17 @@ def test_candidate_to_dropped():
 
 
 def test_local_only_goes_local_reject():
-    ev = heard({"S1": hours_ago(1, 2)}, covered_silent={"N1": 6, "N2": 9, "S1": 3})
+    ev = heard({"S1": hours_ago(1, 2)}, silent_hours={"N1": 6, "N2": 9, "S1": 3})
     m = next_state(a_chirp("candidate", since=NOW - 25 * H), ev, RULES, NOW, station_pos=POS)
     assert m.to_state == "dropped" and m.why == "local_only"
     assert m.local_reject == "S1"
     assert m.evidence["local_reject"] == "S1" and m.evidence["neighbours"] == "N1,N2"
+    assert m.evidence["silent_hours"] == "N1:6,N2:9"
+    # Neighbours count silent hours over the whole window, not only after the last hearing
+    # (the one station hears a local spur every hour): covered_silent plays no part.
+    assert next_state(a_chirp("candidate", since=NOW - 25 * H),
+                      heard({"S1": hours_ago(1, 2)}, covered_silent={"N1": 6, "N2": 9}),
+                      RULES, NOW, station_pos=POS) is None
     # Without station positions the move cannot fire.
     assert next_state(a_chirp("candidate", since=NOW - 25 * H), ev, RULES, NOW) is None
     # Too soon after becoming a candidate.
@@ -104,11 +110,11 @@ def test_local_only_goes_local_reject():
                       station_pos=POS) is None
     # One neighbour short of its dwells, the other too far away: not enough neighbours.
     for silent in ({"N1": 6, "N2": 5}, {"N1": 6, "FAR": 20}):
-        ev2 = heard({"S1": hours_ago(1)}, covered_silent=silent)
+        ev2 = heard({"S1": hours_ago(1)}, silent_hours=silent)
         assert next_state(a_chirp("candidate", since=NOW - 25 * H), ev2, RULES, NOW,
                           station_pos=POS) is None
     # Two stations hear it: not local.
-    ev3 = heard({"S1": hours_ago(1), "N1": hours_ago(1)}, covered_silent={"N2": 9, "FAR": 9})
+    ev3 = heard({"S1": hours_ago(1), "N1": hours_ago(1)}, silent_hours={"N2": 9, "FAR": 9})
     assert next_state(a_chirp("candidate", since=NOW - 25 * H), ev3, RULES, NOW,
                       station_pos=POS) is None
 
@@ -257,7 +263,7 @@ def test_evidence_strings():
         (a_chirp("seen"), heard({"S1": hours_ago(1, 3, 5, 7, 9, 11)}), {}),
         (a_chirp("seen"), heard({"S1": hours_ago(49)}), {}),
         (a_chirp("candidate", since=NOW - 25 * H),
-         heard({"S1": hours_ago(1)}, covered_silent={"N1": 6, "N2": 7}), {"station_pos": POS}),
+         heard({"S1": hours_ago(1)}, silent_hours={"N1": 6, "N2": 7}), {"station_pos": POS}),
         (a_chirp("probing"), established_ev(), {}),
         (a_chirp("probing", since=NOW - 29 * D), heard({"S1": hours_ago(1)}), {}),
         (a_chirp("established", since=NOW - 9 * D),

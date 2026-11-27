@@ -12,7 +12,10 @@ Terms, as every move uses them:
   counts matching sweeps and matching arrivals of any origin, so a chirp whose T6 arrivals
   continue never reads as unheard because the scout stopped hearing it.
 - "heard again": ev.last_heard is later than state_since.
-- "covered": a station sits in ev.covered_silent with at least the rule's dwell count.
+- "covered": a station sits in ev.covered_silent with at least the rule's dwell count: that
+  many distinct hours it dwelled over the chirp and heard nothing, all after the chirp's last
+  hearing.  A candidate's local neighbours read ev.silent_hours (the whole window) instead:
+  the one station that hears a local spur hears it every hour.
 - Stations are the independent site representatives Evidence already keys by.
 """
 from datetime import datetime, timedelta
@@ -70,21 +73,21 @@ def _heard_again(chirp, ev) -> bool:
 
 
 def _covered_past_hearers(ev, min_dwells) -> list:
-    """Past hearers (scout or T6) that dwelled over the chirp at least min_dwells times and
-    heard nothing."""
+    """Past hearers (scout or T6) that dwelled over the chirp in at least min_dwells hours
+    after its last hearing and heard nothing."""
     past = set(ev.hearers) | set(ev.t6_hearers)
     return sorted(st for st, n in ev.covered_silent.items() if st in past and n >= min_dwells)
 
 
 def _local_neighbours(station, ev, rules, station_pos) -> list:
     """Independent stations within local.neighbour_km of station's grid centre that dwelled
-    over the chirp at least local.min_covered_dwells times and never heard it."""
+    over the chirp in at least local.min_covered_dwells hours and never heard it."""
     lr = rules.local
     here = station_pos.get(station)
     if here is None:
         return []
     out = []
-    for st, n in ev.covered_silent.items():
+    for st, n in ev.silent_hours.items():
         if st == station or st in ev.hearers or n < lr.min_covered_dwells:
             continue
         there = station_pos.get(st)
@@ -141,7 +144,9 @@ def next_state(chirp: dict, ev, rules, now: datetime, *,
                               "local.neighbour_km": lr.neighbour_km,
                               "local.min_covered_dwells": lr.min_covered_dwells,
                               "local.after_h": lr.after_h},
-                             {"local_reject": station, "neighbours": ",".join(near)},
+                             {"local_reject": station, "neighbours": ",".join(near),
+                              "silent_hours": ",".join(f"{st}:{ev.silent_hours[st]}"
+                                                       for st in near)},
                              local_reject=station)
         if len(ev.probe_stations) >= rules.probing.min_capture_stations:
             return _move("probing", "probes_began", ev,

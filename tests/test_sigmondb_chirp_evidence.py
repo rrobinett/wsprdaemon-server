@@ -66,9 +66,10 @@ def test_uncovered_station_is_not_absence():
     receivers = [rx("FAR", 10.0, 20.0), rx("NEAR", 15.0, 20.0), rx("HEARS", 20.0, 20.0)]
     ev = ce.gather([a_chirp()], aggs(sweeps=[sweep("HEARS", H[1])], dwells=dwells), [],
                    receivers, [], RULES, NOW)["C1"]
-    assert "FAR" not in ev.covered_silent
-    assert "HEARS" not in ev.covered_silent      # it dwelled and heard: not silent
-    assert ev.covered_silent == {"NEAR": 8}      # two covering dwell hours, 4 dwells each
+    assert "FAR" not in ev.silent_hours
+    assert "HEARS" not in ev.silent_hours        # it dwelled and heard: not silent
+    assert ev.silent_hours == {"NEAR": 2}        # two covering dwell hours, each counted once
+    assert ev.covered_silent == {}               # both at or before the last hearing (H[1])
     assert list(ev.hearers) == ["HEARS"]
 
 
@@ -103,7 +104,7 @@ def test_local_reject_ignored_for_that_reporter():
     ev = ce.gather([a_chirp()], aggs(sweeps=sw, dwells=[dwell("R1", H[1])]), [], receivers, [],
                    RULES, NOW, rejects=rejects)["C1"]
     assert list(ev.hearers) == ["R2"]
-    assert "R1" not in ev.covered_silent      # a rejected streak is not silence either
+    assert "R1" not in ev.silent_hours        # a rejected streak is not silence either
 
 
 def t6_rows(rid, hours, base_ms, sd_us, rng, step_min=10):
@@ -213,7 +214,8 @@ def test_arrival_hour_is_not_silence():
     ev = ce.gather([a_chirp()], aggs(arrivals=arr, dwells=[dwell("R1", H[1]), dwell("R1", H[2])]),
                    [], [rx("R1", 10.0, 20.0)], [], RULES, NOW)["C1"]
     assert ev.hearers == {"R1": [H[1]]}
-    assert ev.covered_silent == {"R1": 4}        # H[2] only: in H[1] chirp-recorder heard it
+    assert ev.silent_hours == {"R1": 1}          # H[2] only: in H[1] chirp-recorder heard it
+    assert ev.covered_silent == {}               # and H[2] came before that hearing
 
 
 def test_reject_blocks_its_reporter_only():
@@ -226,7 +228,7 @@ def test_reject_blocks_its_reporter_only():
                                              dwell("KFS-OMNI", H[1], n=4)]),
                    [], receivers, [], RULES, NOW, rejects=rejects)["C1"]
     assert ev.hearers == {}
-    assert ev.covered_silent == {"KFS-OMNI": 4}  # the partner's own silent dwell counts
+    assert ev.covered_silent == {"KFS-OMNI": 1}  # the partner's own silent dwell counts
 
 
 def test_named_from_latest_run_per_group():
@@ -362,3 +364,41 @@ def test_no_alias_shadows_a_column_another_expression_uses():
     assert {n: alias_shadowing(sql) for n, sql in sqls.items()
             if alias_shadowing(sql)} == {}
     assert "min(clipped) AS all_clipped" in ce.AGG_SQL["sweep_hourly"][1]
+
+
+def test_silent_hour_counts_once_across_views_and_dwells():
+    """Pre-rollout A: a coarse and a fine view both covering the chirp in one hour, each with
+    several dwells, make one silent hour, so min_covered_dwells keeps its strict meaning."""
+    dw = [dwell("R1", H[1], span=2_000_000.0, n=5), dwell("R1", H[1], span=200_000.0, n=7),
+          dwell("R1", H[2], span=200_000.0, n=3)]
+    ev = ce.gather([a_chirp()], aggs(dwells=dw), [], [rx("R1", 10.0, 20.0)], [], RULES,
+                   NOW)["C1"]
+    assert ev.silent_hours == {"R1": 2} and ev.covered_silent == {"R1": 2}
+
+
+def test_covered_silent_counts_only_hours_after_the_last_hearing():
+    """Important 4: R2 dwelled silent over the chirp for six hours, then stopped reporting;
+    R1 heard it later.  Silence before the last hearing never counts toward dormancy."""
+    dw = [dwell("R2", H[k]) for k in range(35, 41)] + [dwell("R1", H[k]) for k in (2, 3)]
+    ev = ce.gather([a_chirp()], aggs(sweeps=[sweep("R1", H[30])], dwells=dw), [],
+                   [rx("R1", 10.0, 20.0), rx("R2", 30.0, 40.0)], [], RULES, NOW)["C1"]
+    assert ev.last_heard == H[30]
+    assert ev.silent_hours == {"R1": 2, "R2": 6}
+    assert ev.covered_silent == {"R1": 2}        # R2's silence all came before H[30]
+    from sigmondb.chirp_lifecycle import next_state
+    est = dict(chirp_id="C1", state="established", state_since=NOW - timedelta(days=9),
+               first_heard=NOW - timedelta(days=12), last_heard=None, pin="", tx_id="")
+    ev.t6_hearers = {"R2"}                       # R2 once heard it: a past hearer
+    assert next_state(est, dataclasses.replace(ev, covered_silent={"R2": 6}), RULES,
+                      NOW).to_state == "dormant"   # what the old count would have done
+    assert next_state(est, ev, RULES, NOW) is None
+
+
+def test_withheld_sweep_is_neither_hearing_nor_silence():
+    """Important 5: a withheld sweep (it matched a rejected chirp) blocks its (reporter,
+    hour) for every chirp it matches, so the reporter's covering dwell is not silence."""
+    dw = [dwell("R1", H[1]), dwell("R1", H[2])]
+    ev = ce.gather([a_chirp("SIB")], aggs(dwells=dw), [], [rx("R1", 10.0, 20.0)], [], RULES,
+                   NOW, withheld=[sweep("R1", H[1])])["SIB"]
+    assert ev.hearers == {} and ev.last_heard is None
+    assert ev.silent_hours == {"R1": 1}          # H[2] only
