@@ -1,10 +1,14 @@
 """The chirp verb: pins, vetoes and local rejects written by hand, and the history view."""
+import os
+import sys
 from datetime import datetime, timedelta
 
 import pytest
 
-from sigmondb import chirp_job, cli
-from tests.test_sigmondb_cli import QueryClient
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sigmondb import chirp_job, cli  # noqa: E402
+from test_sigmondb_cli import QueryClient  # noqa: E402
 
 T0 = datetime(2026, 11, 20, 12, 0, 0)
 
@@ -71,10 +75,10 @@ def test_by_required_and_listed(monkeypatch):
     assert e.value.code == 2
     rc, c = _run(monkeypatch, _tables(), "pin", "--chirp", "cand:1", "--by", "mallory",
                  "--why", "x")
-    assert rc == 2 and c.inserted == []
+    assert rc == 2 and c.inserted == [] and c.commands == []
     rc, c = _run(monkeypatch, _tables(), "reject-local", "--reporter", "R1", "--chirp",
                  "cand:1", "--by", "mallory", "--why", "x")
-    assert rc == 2 and c.inserted == []
+    assert rc == 2 and c.inserted == [] and c.commands == []
 
 
 @pytest.mark.parametrize("argv", [
@@ -90,7 +94,7 @@ def test_unknown_chirp_refused(monkeypatch, argv):
 def test_empty_reporter_refused(monkeypatch):
     rc, c = _run(monkeypatch, _tables(), "reject-local", "--reporter", " ", "--chirp",
                  "cand:1", "--by", "rob", "--why", "x")
-    assert rc == 2 and c.inserted == []
+    assert rc == 2 and c.inserted == [] and c.commands == []
 
 
 def test_unpin_returns_control_to_job(monkeypatch):
@@ -103,6 +107,7 @@ def test_unpin_returns_control_to_job(monkeypatch):
     assert (log["from_state"], log["to_state"], log["actor"], log["why"]) == (
         "rejected", "rejected", "rob", "unpin")
     assert (row["state"], row["pin"], row["pin_by"], row["pin_why"]) == ("rejected", "", "", "")
+    assert row["state_since"].replace(tzinfo=None) == T0
     rows = t["chirp_log"] + [log]
     assert chirp_job.current_states(rows)["cand:1"][0] == "rejected"
 
@@ -158,3 +163,29 @@ def test_show_hides_unnamed_position(monkeypatch, capsys):
     _run(monkeypatch, t, "show", "--chirp", "wwv")
     out = capsys.readouterr().out
     assert "41.4" in out and "-75.6" in out
+
+
+NOW = datetime(2026, 11, 21, 8, 0, 0)
+
+
+def _at(c):
+    return [r["at"].replace(tzinfo=None) for t, r in c.inserted if t.endswith("chirp_log")][0]
+
+
+def test_at_one_second_later_when_chirp_updated_this_second(monkeypatch):
+    t = {"chirp": [_chirp(updated_at=NOW)], "chirp_log": [_log(T0, "candidate")]}
+    _, c = _run(monkeypatch, t, "pin", "--chirp", "cand:1", "--by", "rob", "--why", "x")
+    assert _at(c) == NOW + timedelta(seconds=1)
+    assert c.inserted[1][1]["updated_at"].replace(tzinfo=None) == NOW + timedelta(seconds=1)
+
+
+def test_at_one_second_later_when_person_logged_this_second(monkeypatch):
+    t = {"chirp": [_chirp()], "chirp_log": [_log(NOW, "established", "candidate", "michael")]}
+    _, c = _run(monkeypatch, t, "veto", "--chirp", "cand:1", "--by", "rob", "--why", "x")
+    assert _at(c) == NOW + timedelta(seconds=1)
+
+
+def test_at_not_bumped_when_now_is_later(monkeypatch):
+    t = {"chirp": [_chirp()], "chirp_log": [_log(T0, "candidate", actor="rob")]}
+    _, c = _run(monkeypatch, t, "pin", "--chirp", "cand:1", "--by", "rob", "--why", "x")
+    assert _at(c) == NOW
