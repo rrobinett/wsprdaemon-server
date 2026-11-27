@@ -483,6 +483,32 @@ def cmd_solve(a):
     return 0
 
 
+def cmd_chirp_seed(a):
+    """Seed established chirp rows from solved or named transmitters.  --out writes JSON Lines
+    (chirp rows; the log rows go to FILE.log) and leaves the database alone.  Prints counts only, never a coordinate."""
+    from sigmondb import chirp, chirp_seed
+    client = connect(a.conf)
+    if not a.out:
+        ddl.ensure_schema(client)
+    existing = {r["chirp_id"] for r in _fetch(client, "chirp", ["chirp_id"])}
+    tx = _fetch(client, "transmitter", ddl.COLUMNS["transmitter"])
+    wf = _fetch(client, "waveform", ddl.COLUMNS["waveform"])
+    sols = _fetch(client, "solution", ["tx_id", "solve_id", "offset_ns", "offset_sigma_ns", "window_to"])
+    rows, logs, n = chirp_seed.seed_with_counts(
+        tx, wf, sols, _latest_attributions(client), existing, chirp_seed._now(),
+        chirp.load_rules())
+    if a.out:
+        write_rows(a.out, rows)
+        write_rows(str(a.out) + ".log", logs)
+    else:
+        insert_rows(client, "chirp_log", logs)
+        insert_rows(client, "chirp", rows)
+    print("chirp-seed: seeded %d, skipped-existing %d, skipped-no-waveform %d, "
+          "skipped-listed-only %d" % (n["seeded"], n["skipped_existing"],
+                                      n["skipped_no_waveform"], n["skipped_listed_only"]))
+    return 0
+
+
 def cmd_publish(a):
     """Build sigmondb_public from this host's sigmondb and replace it on every public host.
     Exit 1 when any host+table failed, 2 when the environment lacks credentials."""
@@ -646,6 +672,13 @@ def build_parser():
                    help="with --arrivals: attribution rows (JSON Lines) to name clusters from")
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_solve)
+    s = sub.add_parser("chirp-seed",
+                       help="seed established chirp rows from solved or named transmitters")
+    s.add_argument("--out", metavar="FILE",
+                   help="write the chirp rows to FILE and the log rows to FILE.log, as "
+                        "JSON Lines; leave the database alone")
+    s.add_argument("--conf", default=DEFAULT_CONF)
+    s.set_defaults(fn=cmd_chirp_seed)
     s = sub.add_parser("publish",
                        help="build sigmondb_public and replace each table whole on every "
                             "host in CH_PUB_HOSTS")
