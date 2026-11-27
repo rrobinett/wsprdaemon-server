@@ -10,11 +10,12 @@ Rules that shape the evidence (spec: tasks/chirp-registry/2026-11-13-chirp-scout
   chirp-recorder still hears never reads as silent because the scout missed it.
 - Silence counts only where a scout listened: a station is covered-silent for an hour when
   it dwelled over the chirp's centre (|centre - dwell centre| <= dwell span / 2) and
-  reported no matching sweep.
+  reported no matching sweep or arrival.
 - A sweep matching a reporter's active local reject never counts for that reporter, as
-  hearing or as silence.
+  hearing or as silence; a co-sited partner's own dwells still count.
 - Reporters at one site (one coherence group, or within independence.co_site_km) count once.
 """
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
@@ -40,7 +41,8 @@ AGG_SQL = {
          "clipped", "hour", "n", "snr_med", "n_dwells"),
         "/* agg:sweep_hourly */ SELECT reporter_id, round(centre_hz, -2) AS centre_hz, "
         "round(rate_hz_per_s, 0) AS rate_hz_per_s, round(period_s, 3) AS period_s, "
-        "median(span_hz) AS span_hz, median(duration_s) AS duration_s, "
+        "medianIf(span_hz, clipped = 0) AS span_hz, "
+        "medianIf(duration_s, clipped = 0) AS duration_s, "
         "min(clipped) AS clipped, toStartOfHour(time) AS hour, count() AS n, "
         "median(snr_db) AS snr_med, uniqExact(time) AS n_dwells "
         "FROM sigmondb.sweep FINAL WHERE " + _SINCE +
@@ -108,9 +110,14 @@ def chirp_signature(c):
                      c.get("span_hz"), c.get("duration_s"))
 
 
+def _known(x):
+    """None for a missing value: medianIf over no whole streaks gives NaN."""
+    return None if x is None or (isinstance(x, float) and math.isnan(x)) else x
+
+
 def _row_sig(r):
-    return Signature(r["centre_hz"], r["rate_hz_per_s"], r["period_s"], r.get("span_hz"),
-                     r.get("duration_s"))
+    return Signature(r["centre_hz"], r["rate_hz_per_s"], r["period_s"], _known(r.get("span_hz")),
+                     _known(r.get("duration_s")))
 
 
 def _sig_like(centre, rate, sig):
@@ -149,6 +156,33 @@ def _active_rejects(rejects):
     return out
 
 
+class _ByCentre:
+    """Row indices bucketed by centre, so a chirp tests only rows that can match it.
+
+    A narrow row matches only within match.centre_tol_hz of the chirp's centre, so it sits
+    in a bucket near the chirp's (two either side: float rounding at a bucket edge never
+    hides a match).  A row whose span exceeds match.wide_span_hz may match a far centre by
+    span overlap, so those rows sit in a list every chirp tests.  candidates() returns
+    indices in input order, so results match a scan of every row."""
+
+    def __init__(self, sigs, rules):
+        self.width = max(float(rules.match.centre_tol_hz), 1.0)
+        self.wide_hz = rules.match.wide_span_hz
+        self.buckets, self.wide = {}, []
+        for i, sg in enumerate(sigs):
+            if sg.span_hz is not None and sg.span_hz > self.wide_hz:
+                self.wide.append(i)
+            else:
+                self.buckets.setdefault(math.floor(sg.centre_hz / self.width), []).append(i)
+
+    def candidates(self, sig):
+        k = math.floor(sig.centre_hz / self.width)
+        out = list(self.wide)
+        for b in range(k - 2, k + 3):
+            out.extend(self.buckets.get(b, ()))
+        return sorted(out)
+
+
 def _steady_hours(rows, P, max_mad_us):
     """The longest span, in hours, of any cluster of (time, delay_ms) rows that holds within
     max_mad_us; None when no cluster does."""
@@ -163,10 +197,23 @@ def _steady_hours(rows, P, max_mad_us):
 
 
 def _named(chirp_row, sig, attributions, rules, now):
-    """The tx_id the latest naming attribution rows give this chirp's signature: the chirp's
-    own tx_id when among them, else the one name when only one, else None.  HFDL never."""
+    """The tx_id the latest attribution run per group_key gives this chirp's signature: the
+    chirp's own tx_id when among the names, else the one name when only one, else None.
+    The latest run is the greatest (run_at, run_id) among default-policy rows of that
+    group_key; only its rows that may name (attribution.row_names) count.  HFDL never."""
+    latest = {}
+    for a in attributions or ():
+        if a.get("mode_policy") == "default":
+            k = (a.get("run_at") or datetime.min, a.get("run_id") or "")
+            gk = a.get("group_key")
+            if gk not in latest or k > latest[gk]:
+                latest[gk] = k
     names = set()
     for a in attributions or ():
+        if a.get("mode_policy") != "default":
+            continue
+        if (a.get("run_at") or datetime.min, a.get("run_id") or "") != latest[a.get("group_key")]:
+            continue
         if not attribution.row_names(a, now) or not a.get("tx_id"):
             continue
         if str(a["tx_id"]).startswith("hfdl:") or str(a.get("group_key", "")).startswith("hfdl"):
@@ -213,6 +260,11 @@ def gather(chirps, aggregates, arrivals_t6, receivers, attributions, rules, now,
             t6_keys.append(_key_centre_rate(a["group_key"]))
         except (KeyError, ValueError, IndexError):
             t6_keys.append((a.get("centre_hz"), a.get("rate_hz_per_s")))
+    t6_ok = [i for i, (c_, r_) in enumerate(t6_keys) if c_ is not None and r_ is not None]
+    sweep_ix = _ByCentre(sweep_sigs, rules)
+    arr_ix = _ByCentre([Signature(a["centre_hz"], a["rate_hz_per_s"], 1.0) for a in arrs], rules)
+    cap_ix = _ByCentre([Signature(p["centre_hz"], p["rate_hz_per_s"], 1.0) for p in caps], rules)
+    t6_ix = _ByCentre([Signature(t6_keys[i][0], t6_keys[i][1], 1.0) for i in t6_ok], rules)
 
     sigs = {c["chirp_id"]: chirp_signature(c) for c in chirps}
     out = {}
@@ -221,22 +273,22 @@ def gather(chirps, aggregates, arrivals_t6, receivers, attributions, rules, now,
         ev = Evidence()
         ev.shared_signature = sorted(o for o, osig in sigs.items()
                                      if o != cid and matches(sig, osig, rules))
-        heard = {}                     # site -> set of hours
-        swept = {}                     # site -> set of hours with a counted matching sweep
-        blocked = {}                   # site -> hours with a sweep on that reporter's reject
+        heard = {}                     # site -> set of hours (counted sweeps and arrivals)
+        blocked = set()                # (reporter, hour) with a sweep on that reporter's reject
         whole = {}                     # site -> whole matching sweep rows
-        for s, sg, rj in zip(sweeps, sweep_sigs, rejected):
+        for i in sweep_ix.candidates(sig):
+            s, sg, rj = sweeps[i], sweep_sigs[i], rejected[i]
             if not matches(sig, sg, rules):
                 continue
             st = site.get(s["reporter_id"], s["reporter_id"])
             if rj:
-                blocked.setdefault(st, set()).add(s["hour"])
+                blocked.add((s["reporter_id"], s["hour"]))
                 continue
             heard.setdefault(st, set()).add(s["hour"])
-            swept.setdefault(st, set()).add(s["hour"])
             if not s.get("clipped"):
                 whole.setdefault(st, []).append(s)
-        for a in arrs:
+        for i in arr_ix.candidates(sig):
+            a = arrs[i]
             if matches(sig, _sig_like(a["centre_hz"], a["rate_hz_per_s"], sig), rules):
                 st = site.get(a["reporter_id"], a["reporter_id"])
                 heard.setdefault(st, set()).add(a["hour"])
@@ -253,12 +305,13 @@ def gather(chirps, aggregates, arrivals_t6, receivers, attributions, rules, now,
             if abs(sig.centre_hz - d["centre_hz"]) > d["span_hz"] / 2:
                 continue
             st = site.get(d["reporter_id"], d["reporter_id"])
-            if d["hour"] in swept.get(st, ()) or d["hour"] in blocked.get(st, ()):
+            if d["hour"] in heard.get(st, ()) or (d["reporter_id"], d["hour"]) in blocked:
                 continue
             silent[st] = silent.get(st, 0) + int(d.get("n") or 0)
         ev.covered_silent = dict(sorted(silent.items()))
 
-        for p in caps:
+        for i in cap_ix.candidates(sig):
+            p = caps[i]
             if matches(sig, _sig_like(p["centre_hz"], p["rate_hz_per_s"], sig), rules):
                 st = site.get(p["reporter_id"], p["reporter_id"])
                 ev.probe_stations.add(st)
@@ -270,9 +323,9 @@ def gather(chirps, aggregates, arrivals_t6, receivers, attributions, rules, now,
 
         P = sig.period_s * 1e3
         by_reporter = {}
-        for a, (centre, rate) in zip(t6, t6_keys):
-            if centre is None or rate is None:
-                continue
+        for j in t6_ix.candidates(sig):
+            a = t6[t6_ok[j]]
+            centre, rate = t6_keys[t6_ok[j]]
             if matches(sig, _sig_like(centre, rate, sig), rules):
                 by_reporter.setdefault(a["reporter_id"], []).append((a["time"], a["delay_ns"] / 1e6))
         for rid, rows in sorted(by_reporter.items()):

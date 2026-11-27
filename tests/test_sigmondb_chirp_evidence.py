@@ -204,3 +204,76 @@ def test_two_names_on_one_signature():
                    NOW)
     assert ev["A"].named_by_attribution == "SITE-B"     # its own name stands among two
     assert ev["X"].named_by_attribution is None         # two names, none its own: no name
+
+
+def test_arrival_hour_is_not_silence():
+    arr = [dict(reporter_id="R1", centre_hz=CENTRE, rate_hz_per_s=RATE, hour=H[1], n=30,
+                n_t6=0)]
+    ev = ce.gather([a_chirp()], aggs(arrivals=arr, dwells=[dwell("R1", H[1]), dwell("R1", H[2])]),
+                   [], [rx("R1", 10.0, 20.0)], [], RULES, NOW)["C1"]
+    assert ev.hearers == {"R1": [H[1]]}
+    assert ev.covered_silent == {"R1": 4}        # H[2] only: in H[1] chirp-recorder heard it
+
+
+def test_reject_blocks_its_reporter_only():
+    receivers = [rx("KFS-OMNI", 10.0, 20.0, coherence="KFS"),
+                 rx("KFS-MAIN", 10.5, 20.5, coherence="KFS")]
+    rejects = [dict(reporter_id="KFS-MAIN", centre_hz=CENTRE, rate_hz_per_s=RATE,
+                    period_s=PERIOD, span_hz=None, chirp_id="", active=1)]
+    ev = ce.gather([a_chirp()], aggs(sweeps=[sweep("KFS-MAIN", H[1])],
+                                     dwells=[dwell("KFS-MAIN", H[1], n=3),
+                                             dwell("KFS-OMNI", H[1], n=4)]),
+                   [], receivers, [], RULES, NOW, rejects=rejects)["C1"]
+    assert ev.hearers == {}
+    assert ev.covered_silent == {"KFS-OMNI": 4}  # the partner's own silent dwell counts
+
+
+def test_named_from_latest_run_per_group():
+    old = dict(run_at=NOW - timedelta(hours=2), run_id="r1", mode_policy="default",
+               status="named", p_null=0.0, tx_id="SITE-A", group_key=GK)
+    new = dict(old, run_at=NOW - timedelta(hours=1), run_id="r2", tx_id="SITE-B")
+    ev = ce.gather([a_chirp("X")], aggs(), [], [], [old, new], RULES, NOW)
+    assert ev["X"].named_by_attribution == "SITE-B"
+    tie = dict(new, run_id="r3", tx_id="SITE-C")          # same run_at: the larger run_id wins
+    ev = ce.gather([a_chirp("X")], aggs(), [], [], [old, new, tie], RULES, NOW)
+    assert ev["X"].named_by_attribution == "SITE-C"
+
+
+def test_sweep_span_from_whole_streaks_only():
+    sql = ce.AGG_SQL["sweep_hourly"][1]
+    assert "medianIf(span_hz, clipped = 0) AS span_hz" in sql
+    assert "medianIf(duration_s, clipped = 0) AS duration_s" in sql
+
+
+def test_wide_sweep_matches_far_centre():
+    wide = dict(a_chirp("W", centre=16e6, rate=100_000.0), span_hz=28e6)
+    sw = dict(sweep("R1", H[1], centre=15e6, rate=100_000.0), span_hz=26e6)   # 1 MHz off
+    ev = ce.gather([wide], aggs(sweeps=[sw]), [], [rx("R1", 10.0, 20.0)], [], RULES, NOW)
+    assert ev["W"].hearers == {"R1": [H[1]]}
+
+
+def test_centre_buckets_change_nothing(monkeypatch):
+    rng = random.Random(11)
+    tol = RULES.match.centre_tol_hz
+    chirps = [a_chirp("C%d" % k, centre=CENTRE + k * tol * 0.7) for k in range(12)]
+    chirps.append(dict(a_chirp("W", centre=16e6, rate=100_000.0), span_hz=28e6))
+    hrs = H[:6]
+    sw = [dict(sweep("R%d" % rng.randrange(5), rng.choice(hrs),
+                     centre=CENTRE + rng.uniform(-2, 10) * tol),
+               clipped=rng.randrange(2)) for _ in range(150)]
+    sw += [dict(sweep("R1", H[1], centre=15e6, rate=100_000.0), span_hz=26e6)]
+    arr = [dict(reporter_id="R%d" % rng.randrange(5), centre_hz=CENTRE + rng.uniform(-2, 10) * tol,
+                rate_hz_per_s=RATE, hour=rng.choice(hrs), n=3, n_t6=0) for _ in range(80)]
+    caps = [dict(reporter_id="R%d" % rng.randrange(5), centre_hz=CENTRE + rng.uniform(-2, 10) * tol,
+                 rate_hz_per_s=RATE, first_t=H[3], last_t=H[1], n=2, n_found=rng.randrange(2))
+            for _ in range(40)]
+    dw = [dwell("R%d" % k, h) for k in range(5) for h in hrs]
+    receivers = [rx("R%d" % k, 10.0 * k, 20.0) for k in range(5)]
+    args = ([*chirps], aggs(sweeps=sw, arrivals=arr, captures=caps, dwells=dw), [], receivers,
+            [], RULES, NOW)
+    fast = ce.gather(*args)
+    monkeypatch.setattr(ce._ByCentre, "candidates", lambda self, sig: list(range(self.n)))
+    monkeypatch.setattr(ce._ByCentre, "__init__",
+                        lambda self, sigs, rules: setattr(self, "n", len(sigs)))
+    assert ce.gather(*args) == fast
+    assert any(ev.hearers for ev in fast.values())
