@@ -228,6 +228,7 @@ def test_sweep_matching_rejected_founds_nothing():
     assert res.chirp_rows[0]["reporter_ids"] == ["S1"]
     assert res.heard_while_rejected == 1
     assert any("heard_while_rejected 1" in ln for ln in res.lines)
+    assert "chirp-state: heard_while_rejected X" in res.lines      # ids only
 
 
 def test_established_discovered_writes_identity(monkeypatch):
@@ -245,7 +246,7 @@ def test_established_discovered_writes_identity(monkeypatch):
     assert (w["tx_id"], w["source"], w["measured_by"]) == (cid, "measured", "S1,S2,S3")
     row = res.chirp_rows[0]
     assert row["tx_id"] == cid and row["state"] == "established"
-    assert (row["lat"], row["lon"], row["pos_source"]) == (39.0, -91.0, "located")
+    assert (row["lat"], row["lon"], row["pos_source"]) == (39.0, -91.0, "triangulated")
     assert seen == [(["S1", "S2", "S3"], 1000.0)]
 
 
@@ -424,7 +425,7 @@ def test_crash_after_log_heals_identity(monkeypatch):
     assert [t["tx_id"] for t in second.transmitter_rows] == [CID]
     assert [w["tx_id"] for w in second.waveform_rows] == [CID]
     (row,) = second.chirp_rows
-    assert (row["state"], row["tx_id"], row["pos_source"]) == ("established", CID, "located")
+    assert (row["state"], row["tx_id"], row["pos_source"]) == ("established", CID, "triangulated")
     apply(tables, second)
     third = run(JobClient(tables, aggs))
     assert third.rows() == {t: [] for t in third.rows()}
@@ -558,7 +559,7 @@ def test_locate_gets_only_stations_with_a_usable_cluster(monkeypatch):
 
 def test_nearest_prior_names_and_kinds_a_placed_chirp():
     tables = {"chirp": [chirp_row("C1", first=NOW - timedelta(hours=3), lat=37.1, lon=-122.9,
-                                  pos_source="located")],
+                                  pos_source="triangulated")],
               "chirp_log": [log_row("C1", "seen", NOW - timedelta(hours=3))],
               "receiver": list(RX)}
     near_t, near_w = prior_tx("hfrnet:NEAR", lat=37.0, lon=-123.0, kind="codar")
@@ -637,3 +638,86 @@ def test_vetoed_chirp_never_turns_a_siblings_dwell_into_silence():
     res = run(JobClient(tables, aggs))
     assert res.log_rows == []
     assert res.states == {"established": 1, "rejected": 1}
+
+
+def solution(tx_id, window_to, offset_ns, sigma_ns=40.0, solve_id="s1"):
+    return dict(tx_id=tx_id, solve_id=solve_id, window_to=window_to, offset_ns=offset_ns,
+                offset_sigma_ns=sigma_ns)
+
+
+def test_offsets_follow_the_latest_recent_solution():
+    """Important 2: each run gives a chirp with a tx_id its transmitter's latest recent
+    solution offset and clears a stale one; a rerun on the same solutions writes nothing."""
+    from sigmondb.publish import PUBLISH_MAX_AGE_H
+    est = NOW - timedelta(days=5)
+    tables = {"chirp": [chirp_row("SITE-A", state="established", tx_id="SITE-A",
+                                  offset_ns=111, offset_sigma_ns=9.0),
+                        chirp_row("SITE-B", state="established", tx_id="SITE-B",
+                                  centre=5_000_000.0, offset_ns=222, offset_sigma_ns=9.0),
+                        chirp_row("C3", centre=7_000_000.0, state="candidate",
+                                  state_since=NOW - timedelta(hours=2))],
+              "chirp_log": [log_row("SITE-A", "established", est),
+                            log_row("SITE-B", "established", est),
+                            log_row("C3", "candidate", NOW - timedelta(hours=2))],
+              "receiver": list(RX),
+              "solution": [solution("SITE-A", NOW - timedelta(hours=2), 500),
+                           solution("SITE-A", NOW - timedelta(hours=1), 600, 30.0, "s2"),
+                           solution("SITE-B", NOW - timedelta(hours=PUBLISH_MAX_AGE_H + 1), 7),
+                           solution("C3", NOW - timedelta(hours=1), 9)]}
+    c = JobClient(tables, {})
+    res = run(c)
+    assert res.log_rows == []
+    by = {r["chirp_id"]: (r["offset_ns"], r["offset_sigma_ns"]) for r in res.chirp_rows}
+    assert by == {"SITE-A": (600, 30.0), "SITE-B": (None, None)}     # C3 has no tx_id
+    (q,) = [k for k in c.calls if "FROM sigmondb.solution" in k["sql"]]
+    assert "offset_ns IS NOT NULL" in q["sql"]
+    assert chirp_job.solution_not_set_aside("codar") in q["sql"]
+    assert q["parameters"] == {"max_age_h": PUBLISH_MAX_AGE_H}
+    apply(tables, res)
+    assert run(JobClient(tables, {})).chirp_rows == []
+
+
+def test_attribution_name_takes_the_listed_position(monkeypatch):
+    """Minor 9: a located chirp that attribution names takes the named site's listed
+    position, pos_source 'listed', and gets no discovered identity."""
+    located(monkeypatch)
+    tables, aggs = probing_scene()
+    site = {c: None for c in ddl.COLUMNS["transmitter"]}
+    site.update(tx_id="SITE-A", kind="codar", status="established", lat=37.25, lon=-122.75,
+                pos_sigma_m=30.0, pos_source="listed", valid_from=datetime(2026, 1, 1),
+                version=1, source="seed")
+    tables["transmitter"] = [site]
+    tables["attribution"] = [dict(run_at=NOW - timedelta(hours=1), run_id="r1",
+                                  mode_policy="default", status="named", p_null=0.0,
+                                  tx_id="SITE-A", group_key=GK)]
+    res = run(JobClient(tables, aggs))
+    (row,) = res.chirp_rows
+    assert (row["state"], row["tx_id"]) == ("established", "SITE-A")
+    assert (row["lat"], row["lon"], row["pos_sigma_m"], row["pos_source"]) == (
+        37.25, -122.75, 30.0, "listed")
+    assert res.transmitter_rows == [] and res.waveform_rows == []
+
+
+def test_one_chirps_fault_skips_that_chirp_alone(monkeypatch):
+    """Minor 10: a fault in one chirp's turn logs one line, counts an error, drops what that
+    chirp's turn added (its move too) and leaves the other chirps alone."""
+    real = chirp_job._reconcile
+
+    def flaky(c, *a, **kw):
+        if c["chirp_id"] == "A":
+            raise RuntimeError("boom at 40.02 -90.04")
+        return real(c, *a, **kw)
+
+    monkeypatch.setattr(chirp_job, "_reconcile", flaky)
+    tables = {"chirp": [chirp_row("A", centre=5_000_000.0), chirp_row("B", centre=7_000_000.0)],
+              "chirp_log": [log_row("A", "seen", NOW - timedelta(days=3)),
+                            log_row("B", "seen", NOW - timedelta(days=3))],
+              "receiver": list(RX)}
+    sweeps = [sweep("S1", H(k), centre=f) for f in (5_000_000.0, 7_000_000.0)
+              for k in (1, 3, 5, 7, 9, 11)]
+    res = run(JobClient(tables, {"sweep_hourly": sweeps}))
+    assert [(r["chirp_id"], r["to_state"]) for r in res.log_rows] == [("B", "candidate")]
+    assert [r["chirp_id"] for r in res.chirp_rows] == ["B"]
+    assert res.errors == 1 and res.moves == {"seen->candidate": 1}
+    assert "chirp-state: A: RuntimeError; skipped" in res.lines
+    assert not any("boom" in ln for ln in res.lines)

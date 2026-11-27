@@ -31,11 +31,19 @@ Rules the job keeps (plan Task 9 and the controller's rulings of 2026-11-27):
   kind.  They never change a state.
 - A chirp row goes out only when its content changed (updated_at aside), so a rerun on the
   same evidence writes nothing.
+- A chirp with a tx_id carries the offset of that transmitter's latest solution that is
+  clean of set-aside windows and no older than publish.PUBLISH_MAX_AGE_H (the limit
+  transmitter_offsets uses, so the two tables agree); with none that recent, no offset.
+- A chirp attribution names takes the named site's listed position (pos_source "listed");
+  a position the job locates itself carries pos_source "triangulated".
+- A fault in one chirp's locate, move or reconcile skips that chirp alone: the run logs one
+  line (chirp id and exception type), counts it in errors, drops that chirp's rows from this
+  run and goes on.
 - Output carries counts and reporter ids, never a coordinate.
 """
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sigmondb import attribution, cli, ddl
 from sigmondb import chirp_evidence as ce
@@ -45,9 +53,10 @@ from sigmondb.chirp_lifecycle import STATES, next_state
 from sigmondb.chirp_locate import locate
 from sigmondb.half_sweep import to_sweep_start
 from sigmondb.load import insert_rows
-from sigmondb.publish import latlon_to_grid6
+from sigmondb.publish import PUBLISH_MAX_AGE_H, latlon_to_grid6
 from sigmondb.receivers import grid_to_latlon
 from sigmondb.rows import write_rows
+from sigmondb.set_aside import solution_not_set_aside
 
 ACTOR = "chirp-state"
 PRIOR_SOURCES = ("hfrnet", "giro")
@@ -69,6 +78,7 @@ class JobResult:
     relocated: int = 0               # recovery re-locates of chirps that need an identity
     identity_waiting_position: int = 0
     heard_while_rejected: int = 0
+    heard_while_rejected_ids: list = field(default_factory=list)
     errors: int = 0
 
     def rows(self):
@@ -138,6 +148,15 @@ def read_inputs(client, rules):
     wf = cli._latest([dict(w, _k=(w["tx_id"], w["centre_hz"])) for w in wf], "_k")
 
     rejects = fetch("chirp_reject_local")
+    sols = fetch("solution", ["tx_id", "solve_id", "window_to", "offset_ns", "offset_sigma_ns"],
+                 "WHERE offset_ns IS NOT NULL AND tx_id != '' AND "
+                 "window_to > now() - INTERVAL {max_age_h:UInt32} HOUR AND "
+                 + solution_not_set_aside("codar"), {"max_age_h": PUBLISH_MAX_AGE_H})
+    sites = fetch("transmitter", ["tx_id", "kind", "lat", "lon", "pos_sigma_m", "valid_from",
+                                  "version"],
+                  "WHERE lat IS NOT NULL AND lon IS NOT NULL AND kind != 'hfdl'")
+    sites = [t for t in sites if t.get("lat") is not None and t.get("lon") is not None
+             and t.get("kind") != "hfdl" and not str(t["tx_id"]).startswith("hfdl:")]
     discovered = fetch("transmitter", ["tx_id", "source"], "WHERE source = 'discovered'")
     measured = fetch("waveform", ["tx_id", "source"], "WHERE source = 'measured'")
     return {
@@ -153,7 +172,25 @@ def read_inputs(client, rules):
         "attributions": ([_naive_row(r) for r in cli._latest_attributions(client)]
                          if "attribution" in have else []),
         "priors": _prior_sites(tx, wf),
+        "solutions": sols,
+        "sites": {t["tx_id"]: t for t in cli._latest(sites, "tx_id")},
     }
+
+
+def latest_offsets(solutions, now):
+    """{tx_id: the latest solution (window_to, then solve_id) with an offset and a window_to
+    within publish.PUBLISH_MAX_AGE_H of now}."""
+    oldest = now - timedelta(hours=PUBLISH_MAX_AGE_H)
+    best = {}
+    for s in solutions or ():
+        if not s.get("tx_id") or s.get("offset_ns") is None or s.get("window_to") is None:
+            continue
+        if _naive(s["window_to"]) < oldest:
+            continue
+        k = (_naive(s["window_to"]), s.get("solve_id") or "")
+        if s["tx_id"] not in best or k > best[s["tx_id"]][0]:
+            best[s["tx_id"]] = (k, s)
+    return {tx: s for tx, (_k, s) in best.items()}
 
 
 def t6_evidence(arrivals, receivers):
@@ -439,6 +476,7 @@ def run(client, rules, now, out=print):
     site_of = ce.independent(sorted(reps), rxpos, coherence, rules)
     station_pos = {rid: grid_to_latlon(latlon_to_grid6(lat, lon))
                    for rid, (lat, lon, _src) in rxpos.items()}
+    offsets = latest_offsets(inp["solutions"], now)
 
     for c in everyone:
         cid, ev = c["chirp_id"], evs[c["chirp_id"]]
@@ -451,25 +489,37 @@ def run(client, rules, now, out=print):
                 else:
                     res.located += 1
                 c.update(lat=ev.position["lat"], lon=ev.position["lon"],
-                         pos_sigma_m=ev.position["pos_sigma_m"], pos_source="located")
+                         pos_sigma_m=ev.position["pos_sigma_m"], pos_source="triangulated")
 
-        if c["state"] == "probing" and cid not in new_ids:
-            place()
+        if cid not in new_ids and c["state"] not in STATES:
+            out("chirp-state: %s is in unknown state %r; skipped" % (cid, c["state"]))
+            res.errors += 1
+            c["_skip"] = True
+            continue
 
-        if cid not in new_ids:
-            try:
+        mark, last = _mark(res), latest.get(cid)
+        try:
+            if c["state"] == "probing" and cid not in new_ids:
+                place()
+            if cid not in new_ids:
                 mv = next_state(c, ev, rules, now, station_pos=station_pos)
-            except ValueError:
-                out("chirp-state: %s is in unknown state %r; skipped" % (cid, c["state"]))
-                res.errors += 1
-                c["_skip"] = True
-                continue
-            if c["state"] == "rejected" and ev.last_heard and ev.last_heard > c["state_since"]:
-                res.heard_while_rejected += 1
-            if mv is not None:
-                latest[cid] = _apply_move(c, ev, mv, now, rules, res)
+                if c["state"] == "rejected" and ev.last_heard and ev.last_heard > c["state_since"]:
+                    res.heard_while_rejected += 1
+                    res.heard_while_rejected_ids.append(cid)
+                if mv is not None:
+                    latest[cid] = _apply_move(c, ev, mv, now, rules, res)
+            _reconcile(c, ev, latest.get(cid), inp, now, res, place)
+        except Exception as e:      # one chirp's fault never stops the others
+            _rollback(res, mark)
+            latest[cid] = last
+            out("chirp-state: %s: %s; skipped" % (cid, type(e).__name__))
+            res.errors += 1
+            c["_skip"] = True
+            continue
 
-        _reconcile(c, ev, latest.get(cid), inp, now, res, place)
+        s = offsets.get(c.get("tx_id")) if c.get("tx_id") else None
+        c["offset_ns"] = s["offset_ns"] if s else None
+        c["offset_sigma_ns"] = s.get("offset_sigma_ns") if s else None
 
         c.update(reporter_ids=sorted(ev.hearers), n_stations=len(ev.hearers),
                  heard_hours=ev.heard_hours_bits, rules_version=rules.rules_version)
@@ -495,9 +545,31 @@ def run(client, rules, now, out=print):
         "identity_waiting_position %d, heard_while_rejected %d, errors %d"
         % (res.founded, res.rebuilt, res.located, res.relocated, res.identity_waiting_position,
            res.heard_while_rejected, res.errors))
+    if res.heard_while_rejected_ids:
+        out("chirp-state: heard_while_rejected " + ",".join(res.heard_while_rejected_ids))
     out("chirp-state: rows %s" % " ".join(
         "%s=%d" % (t, len(rows)) for t, rows in res.rows().items()))
     return res
+
+
+_ROW_LISTS = ("log_rows", "transmitter_rows", "waveform_rows", "reject_rows",
+              "heard_while_rejected_ids")
+_COUNTS = ("located", "relocated", "identity_waiting_position", "heard_while_rejected")
+
+
+def _mark(res):
+    """What a chirp's turn may add to res, so _rollback can take it back."""
+    return ({k: len(getattr(res, k)) for k in _ROW_LISTS},
+            {k: getattr(res, k) for k in _COUNTS}, dict(res.moves))
+
+
+def _rollback(res, mark):
+    lens, counts, moves = mark
+    for k, n in lens.items():
+        del getattr(res, k)[n:]
+    for k, v in counts.items():
+        setattr(res, k, v)
+    res.moves = moves
 
 
 def _apply_move(c, ev, mv, now, rules, res):
@@ -541,6 +613,10 @@ def _reconcile(c, ev, last, inp, now, res, place):
             inp["measured"].add(cid)
     elif named and not named.startswith("cand:"):
         c["tx_id"] = named              # attribution tied it to a listed site
+        site = inp["sites"].get(named)
+        if site is not None:            # the site's listed position, not the triangulated one
+            c.update(lat=site["lat"], lon=site["lon"], pos_sigma_m=site.get("pos_sigma_m"),
+                     pos_source="listed")
     elif c.get("prior_ids"):
         pass    # R23: a listed site matches; attribution or a person names it, never the job
     else:
