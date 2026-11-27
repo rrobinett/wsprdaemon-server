@@ -156,16 +156,21 @@ def _utc_naive(t):
     return t
 
 
+def _query(client, sql, params=None):
+    """client.query in UTC.  A clickhouse-connect without query_tz gets the plain call; the
+    callers convert every time to naive UTC either way."""
+    try:
+        return client.query(sql, parameters=params, query_tz="UTC")
+    except TypeError:
+        return client.query(sql, parameters=params)
+
+
 def _fetch(client, table, cols, where="", params=None):
     """SELECT cols FROM sigmondb.<table> FINAL <where>, as dicts, every time naive UTC.
     FINAL so a re-ingested row counts once."""
     cols = list(cols)
     sql = "SELECT %s FROM %s.%s FINAL %s" % (", ".join(cols), ddl.DATABASE, table, where)
-    try:
-        res = client.query(sql, parameters=params, query_tz="UTC")
-    except TypeError:   # clickhouse-connect without query_tz: the conversion below still holds
-        res = client.query(sql, parameters=params)
-    out = [dict(zip(cols, r)) for r in res.result_rows]
+    out = [dict(zip(cols, r)) for r in _query(client, sql, params).result_rows]
     for r in out:
         for c in ("time", "valid_from", "window_from", "window_to", "run_at",
                   "from_time", "to_time", "set_at", "at", "state_since", "updated_at",
@@ -571,11 +576,7 @@ def _fmt_window(r):
 
 
 def _count(client, sql, params):
-    try:
-        res = client.query(sql, parameters=params, query_tz="UTC")
-    except TypeError:
-        res = client.query(sql, parameters=params)
-    return int(res.result_rows[0][0])
+    return int(_query(client, sql, params).result_rows[0][0])
 
 
 def cmd_set_aside(a):

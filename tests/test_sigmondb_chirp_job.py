@@ -104,9 +104,9 @@ def prior_tx(tx_id="hfrnet:TSTA", centre=CENTRE, lat=37.0, lon=-123.0, kind="cod
     return t, w
 
 
-def run(client, out=None):
+def run(client, out=None, now=NOW):
     lines = []
-    res = chirp_job.run(client, RULES, NOW, out=(out or lines.append))
+    res = chirp_job.run(client, RULES, now, out=(out or lines.append))
     res.lines = lines
     return res
 
@@ -401,3 +401,172 @@ def test_unit_and_publish_chain():
     pub = _unit("sigmondb-publish.service")["Unit"]
     assert "sigmondb-chirp-state.service" in pub["Wants"].split()
     assert "sigmondb-chirp-state.service" in pub["After"].split()
+
+
+# --- fix round 1: reconcile from state, ties, R23 ---------------------------------------------
+
+CID = "cand:20261101-abcdef"
+
+
+def log_only(tables, res):
+    """A run that crashed right after its chirp_log insert."""
+    tables["chirp_log"] = list(tables.get("chirp_log", [])) + list(res.log_rows)
+
+
+def test_crash_after_log_heals_identity(monkeypatch):
+    located(monkeypatch)
+    tables, aggs = probing_scene()
+    first = run(JobClient(tables, aggs))
+    assert first.transmitter_rows and first.waveform_rows
+    log_only(tables, first)
+    second = run(JobClient(tables, aggs))
+    assert second.log_rows == []
+    assert [t["tx_id"] for t in second.transmitter_rows] == [CID]
+    assert [w["tx_id"] for w in second.waveform_rows] == [CID]
+    (row,) = second.chirp_rows
+    assert (row["state"], row["tx_id"], row["pos_source"]) == ("established", CID, "located")
+    apply(tables, second)
+    third = run(JobClient(tables, aggs))
+    assert third.rows() == {t: [] for t in third.rows()}
+
+
+def test_crash_after_transmitter_points_the_chirp_at_it(monkeypatch):
+    located(monkeypatch)
+    tables, aggs = probing_scene()
+    first = run(JobClient(tables, aggs))
+    log_only(tables, first)
+    tables["transmitter"] = list(first.transmitter_rows)      # the waveform never landed
+    second = run(JobClient(tables, aggs))
+    assert second.log_rows == [] and second.transmitter_rows == []
+    assert [w["tx_id"] for w in second.waveform_rows] == [CID]
+    assert second.chirp_rows[0]["tx_id"] == CID
+    tables["waveform"] = list(first.waveform_rows)            # both landed, the chirp row not
+    third = run(JobClient(tables, aggs))
+    assert third.transmitter_rows == [] and third.waveform_rows == []
+    assert third.chirp_rows[0]["tx_id"] == CID
+
+
+def local_scene():
+    """A candidate only S1 hears, while S2 and S3, a few hundred km off, dwell over it six
+    times each and hear nothing: local_only, a reject at S1."""
+    tables = {"chirp": [chirp_row("L", state="candidate")],
+              "chirp_log": [log_row("L", "candidate", NOW - timedelta(days=2), "seen")],
+              "receiver": list(RX)}
+    dw = [dict(reporter_id=st, centre_hz=CENTRE, span_hz=200_000.0, hour=H(k), n=1)
+          for st in ("S2", "S3") for k in range(1, 7)]
+    return tables, {"sweep_hourly": [sweep("S1", H(k)) for k in (1, 2)], "dwell_hourly": dw}
+
+
+def test_crash_after_log_heals_the_local_reject():
+    tables, aggs = local_scene()
+    first = run(JobClient(tables, aggs))
+    assert [(r["to_state"], r["why"]) for r in first.log_rows] == [("dropped", "local_only")]
+    assert [(r["reporter_id"], r["chirp_id"]) for r in first.reject_rows] == [("S1", "L")]
+    log_only(tables, first)
+    second = run(JobClient(tables, aggs))
+    assert second.log_rows == []
+    assert [(r["reporter_id"], r["chirp_id"], r["set_by"]) for r in second.reject_rows] == [
+        ("S1", "L", "chirp-state")]
+    assert second.chirp_rows[0]["state"] == "dropped"
+
+
+def test_a_withdrawn_local_reject_stays_withdrawn():
+    tables, aggs = local_scene()
+    first = run(JobClient(tables, aggs))
+    log_only(tables, first)
+    tables["chirp_reject_local"] = [dict(first.reject_rows[0], active=0, set_by="michael")]
+    assert run(JobClient(tables, aggs)).reject_rows == []
+
+
+def test_log_only_chirp_rebuilt_under_its_logged_id():
+    sweeps = [sweep("S2", H(1), centre=7_000_000.0)]
+    tables = {"receiver": list(RX)}
+    first = run(JobClient(tables, {"sweep_hourly": sweeps}))
+    (cid,) = [r["chirp_id"] for r in first.log_rows]
+    log_only(tables, first)
+    # A day later new_chirp_id would hash the cluster to another day's id.
+    second = run(JobClient(tables, {"sweep_hourly": sweeps}), now=NOW + timedelta(days=1))
+    assert second.log_rows == [] and second.founded == 0 and second.rebuilt == 1
+    (row,) = second.chirp_rows
+    built = first.chirp_rows[0]
+    assert row["chirp_id"] == cid and row["state"] == "seen" and row["state_since"] == NOW
+    for k in ("group_key", "centre_hz", "rate_hz_per_s", "period_s", "span_hz", "duration_s",
+              "first_heard"):
+        assert row[k] == built[k], k
+
+
+def test_prior_blocks_discovered_identity(monkeypatch):
+    """R23: established by location, but a listed site matches: no discovered identity."""
+    located(monkeypatch)
+    tables, aggs = probing_scene()
+    t, w = prior_tx()
+    tables["transmitter"], tables["waveform"] = [t], [w]
+    first = run(JobClient(tables, aggs))
+    assert [r["to_state"] for r in first.log_rows] == ["established"]
+    assert first.transmitter_rows == [] and first.waveform_rows == []
+    assert first.chirp_rows[0]["tx_id"] == "" and first.chirp_rows[0]["prior_ids"] == [
+        "hfrnet:TSTA"]
+    apply(tables, first)
+    second = run(JobClient(tables, aggs))
+    assert second.rows() == {k: [] for k in second.rows()}
+
+
+def _tie_rows():
+    at = NOW - timedelta(hours=1)
+    job = dict(log_row("C1", "established", at, "probing"), actor="chirp-state")
+    veto = dict(log_row("C1", "rejected", at, "probing"), actor="michael")
+    seed = dict(log_row("C2", "established", at), actor="seed")
+    job2 = dict(log_row("C2", "dormant", at, "established"), actor="chirp-state")
+    # The job rejects C3 in the same second a person pins it: the pin sorts first by to_state,
+    # so only the person rank can make it win.
+    reject = dict(log_row("C3", "rejected", at, "probing"), actor="chirp-state")
+    pin = dict(log_row("C3", "established", at, "probing"), actor="rob")
+    return [job, veto, seed, job2, reject, pin]
+
+
+def test_tie_on_at_never_follows_row_order():
+    rows = _tie_rows()
+    for order in (rows, rows[::-1], [rows[1], rows[0], rows[3], rows[2], rows[5], rows[4]]):
+        st = chirp_job.current_states(order, RULES.people.allowed)
+        assert st["C1"] == ("rejected", NOW - timedelta(hours=1))     # the person's veto wins
+        assert st["C2"][0] == "established"                             # then to_state
+        assert st["C3"][0] == "established"                             # the person's pin wins
+
+
+def test_log_read_in_order():
+    c = JobClient({"receiver": list(RX)})
+    run(c)
+    sql = next(k["sql"] for k in c.calls if "FROM sigmondb.chirp_log" in k["sql"])
+    assert sql.rstrip().endswith("ORDER BY chirp_id, at")
+
+
+def test_locate_gets_only_stations_with_a_usable_cluster(monkeypatch):
+    seen = located(monkeypatch)
+    real = chirp_job.attribution.analyse_group
+
+    def flagged(*a, **kw):
+        g = real(*a, **kw)
+        for cl in g["stations"].get("S3", []):
+            cl["twin"] = True                  # S3's only cluster: set aside
+        return g
+
+    monkeypatch.setattr(chirp_job.attribution, "analyse_group", flagged)
+    tables, aggs = probing_scene()
+    run(JobClient(tables, aggs))
+    assert seen == [(["S1", "S2"], 1000.0)]
+
+
+def test_nearest_prior_names_and_kinds_a_placed_chirp():
+    tables = {"chirp": [chirp_row("C1", first=NOW - timedelta(hours=3), lat=37.1, lon=-122.9,
+                                  pos_source="located")],
+              "chirp_log": [log_row("C1", "seen", NOW - timedelta(hours=3))],
+              "receiver": list(RX)}
+    near_t, near_w = prior_tx("hfrnet:NEAR", lat=37.0, lon=-123.0, kind="codar")
+    far_t, far_w = prior_tx("giro:AAFAR", lat=10.0, lon=-60.0, kind="ionosonde")
+    far_t["source"] = far_w["source"] = "giro"
+    tables["transmitter"], tables["waveform"] = [far_t, near_t], [far_w, near_w]
+    res = run(JobClient(tables, {"sweep_hourly": [sweep("S1", H(1))]}))
+    (row,) = res.chirp_rows
+    assert row["prior_ids"] == ["giro:AAFAR", "hfrnet:NEAR"]
+    assert (row["suggested_name"], row["kind"], row["state"]) == ("hfrnet:NEAR", "codar", "seen")
+    assert res.log_rows == []

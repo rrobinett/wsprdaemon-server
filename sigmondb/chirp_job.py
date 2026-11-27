@@ -3,8 +3,20 @@
 It reads the fleet's evidence, founds new `seen` chirps from sweeps no chirp explains, notes
 online-list priors, gathers evidence, locates probing chirps, and asks chirp_lifecycle for each
 chirp's next state.  run() reads and decides; write() inserts the log first, then local rejects,
-then identity rows, then the chirp rows.  A crash between the log and the chirp rows leaves a
-state the next run rebuilds from the log, with no second log row.
+then identity rows, then the chirp rows.
+
+The log holds the truth, and every other row the job writes follows from it.  So each run
+reconciles from state as well as from this run's moves, and a crash anywhere after the log
+insert heals on the next run with no second log row:
+- a chirp whose log holds a founding row and no chirp row is rebuilt under its logged id,
+  from the signature the founding row carries (never re-hashed, which could give another
+  day's id);
+- an established or dormant chirp with no tx_id gets its identity: the tx_id attribution
+  names, or the discovered transmitter it already has, or else new discovered transmitter and
+  measured waveform rows, unless a listed site matches it (prior_ids not empty: ruling R23,
+  it waits for attribution or a person);
+- a chirp whose latest log row carries a local_reject gets that reject row unless one exists
+  for the (reporter, chirp) pair, active or withdrawn (a person's withdrawal stands).
 
 Rules the job keeps (plan Task 9 and the controller's rulings of 2026-11-27):
 - State comes from the latest chirp_log row per chirp (current_states), never from chirp.state.
@@ -49,6 +61,7 @@ class JobResult:
     states: dict = field(default_factory=dict)        # state -> chirps in it after the run
     moves: dict = field(default_factory=dict)         # "from->to" -> count
     founded: int = 0
+    rebuilt: int = 0
     located: int = 0
     heard_while_rejected: int = 0
     errors: int = 0
@@ -73,18 +86,11 @@ def _naive_row(r):
     return {k: _naive(v) for k, v in r.items()}
 
 
-def _query(client, sql, params):
-    try:
-        return client.query(sql, parameters=params, query_tz="UTC")
-    except TypeError:   # clickhouse-connect without query_tz
-        return client.query(sql, parameters=params)
-
-
 def _tables(client):
     """The table names sigmondb holds.  A fresh host lacks the chirp tables; the job reads
     each absent table as empty and never creates one."""
-    res = _query(client, "SELECT name FROM system.tables WHERE database = {db:String}",
-                 {"db": ddl.DATABASE})
+    res = cli._query(client, "SELECT name FROM system.tables WHERE database = {db:String}",
+                     {"db": ddl.DATABASE})
     return {r[0] for r in res.result_rows}
 
 
@@ -109,7 +115,7 @@ def read_inputs(client, rules):
             aggs[name] = []
             continue
         aggs[name] = [_naive_row(dict(zip(cols, r)))
-                      for r in _query(client, sql, params).result_rows]
+                      for r in cli._query(client, sql, params).result_rows]
 
     receivers = fetch("receiver")
     t6 = fetch("arrival", cli._ATTR_ARRIVAL_COLS, cli._ATTR_WHERE, params)
@@ -129,10 +135,16 @@ def read_inputs(client, rules):
           if w["tx_id"] in ids]
     wf = cli._latest([dict(w, _k=(w["tx_id"], w["centre_hz"])) for w in wf], "_k")
 
+    rejects = fetch("chirp_reject_local")
+    discovered = fetch("transmitter", ["tx_id", "source"], "WHERE source = 'discovered'")
+    measured = fetch("waveform", ["tx_id", "source"], "WHERE source = 'measured'")
     return {
         "chirp": fetch("chirp"),
-        "log": fetch("chirp_log"),
-        "rejects": [r for r in fetch("chirp_reject_local") if r.get("active", 1)],
+        "log": fetch("chirp_log", where="ORDER BY chirp_id, at"),
+        "rejects": [r for r in rejects if r.get("active", 1)],
+        "reject_keys": {(r["reporter_id"], r["chirp_id"]) for r in rejects},
+        "discovered": {t["tx_id"] for t in discovered if t.get("source") == "discovered"},
+        "measured": {w["tx_id"] for w in measured if w.get("source") == "measured"},
         "aggs": aggs,
         "t6": t6,
         "receivers": receivers,
@@ -142,16 +154,32 @@ def read_inputs(client, rules):
     }
 
 
-def current_states(log_rows):
-    """{chirp_id: (to_state, at)} from the latest log row per chirp.  Rows at one instant keep
-    the later one in input order."""
+def latest_log_rows(log_rows, people=None):
+    """{chirp_id: its latest log row}.  Latest by at; rows at one instant rank a person's row
+    (actor in people, default rules.people.allowed) above the job's and the seed's, then by
+    ingested_at when the row carries it, then by to_state, so the answer never depends on the
+    order the database returns rows in."""
+    if people is None:
+        from sigmondb.chirp import load_rules
+        people = load_rules().people.allowed
+    people = set(people)
+
+    def rank(r):
+        ing = _naive(r.get("ingested_at")) or datetime.min
+        return (_naive(r["at"]), r.get("actor") in people, ing, r.get("to_state") or "")
+
     out = {}
     for r in log_rows:
-        at = _naive(r["at"])
         cur = out.get(r["chirp_id"])
-        if cur is None or at >= cur[1]:
-            out[r["chirp_id"]] = (r["to_state"], at)
+        if cur is None or rank(r) > rank(cur):
+            out[r["chirp_id"]] = r
     return out
+
+
+def current_states(log_rows, people=None):
+    """{chirp_id: (to_state, at)} from the latest log row per chirp (latest_log_rows)."""
+    return {cid: (r["to_state"], _naive(r["at"]))
+            for cid, r in latest_log_rows(log_rows, people).items()}
 
 
 # --- priors -----------------------------------------------------------------------------------
@@ -252,6 +280,39 @@ def _founded_row(cid, cluster, now, rules):
     return r
 
 
+_SIG_FIELDS = ("centre_hz", "rate_hz_per_s", "period_s", "span_hz", "duration_s")
+
+
+def _founding_evidence(row, cluster, reps):
+    """The founding log row's evidence: counts, and the signature and hours the chirp row
+    holds, so a crash before the chirp row is written can rebuild it exactly."""
+    ev = {"n_rows": str(len(cluster)), "hours": str(len({s["hour"] for s in cluster})),
+          "reporters": ",".join(reps), "group_key": row["group_key"],
+          "first_heard": row["first_heard"].isoformat(sep=" "),
+          "last_heard": row["last_heard"].isoformat(sep=" ")}
+    ev.update((k, "" if row[k] is None else repr(float(row[k]))) for k in _SIG_FIELDS)
+    return ev
+
+
+def _rebuilt_row(cid, founding, now, rules):
+    """The chirp row a founding log row describes, or None when it carries no signature."""
+    ev = founding.get("evidence") or {}
+    if not all(ev.get(k) for k in ("centre_hz", "rate_hz_per_s", "period_s", "first_heard")):
+        return None
+    r = {k: None for k in ddl.COLUMNS["chirp"]}
+    r.update({k: float(ev[k]) if ev.get(k) else None for k in _SIG_FIELDS})
+    r.update(chirp_id=cid, group_key=ev.get("group_key") or group_key(
+                 r["centre_hz"], r["rate_hz_per_s"], r["period_s"], r["duration_s"]),
+             kind="unknown", pos_source="",
+             first_heard=datetime.fromisoformat(ev["first_heard"]),
+             last_heard=(datetime.fromisoformat(ev["last_heard"]) if ev.get("last_heard")
+                         else None),
+             reporter_ids=[], n_stations=0, heard_hours=0, tx_id="", prior_ids=[],
+             suggested_name="", pin="", pin_by="", pin_why="",
+             rules_version=rules.rules_version, updated_at=now)
+    return r
+
+
 def _log(now, cid, from_state, to_state, why, evidence, reporters, rules):
     return dict(at=now, chirp_id=cid, from_state=from_state, to_state=to_state, actor=ACTOR,
                 why=why, evidence=dict(evidence), reporter_ids=sorted(reporters),
@@ -264,7 +325,8 @@ def run(client, rules, now, out=print):
     now = _naive(now).replace(microsecond=0)
     inp = read_inputs(client, rules)
     res = JobResult()
-    states = current_states(inp["log"])
+    latest = latest_log_rows(inp["log"], rules.people.allowed)
+    states = {cid: (r["to_state"], _naive(r["at"])) for cid, r in latest.items()}
     stored = {c["chirp_id"]: c for c in inp["chirp"]}
 
     # 2. State per chirp from the log.
@@ -276,6 +338,20 @@ def run(client, rules, now, out=print):
             continue
         st, since = states[cid]
         live.append(dict(stored[cid], state=st, state_since=since))
+    founding = {}
+    for r in inp["log"]:
+        if r.get("why") == "founded" and not r.get("from_state") and r["chirp_id"] not in stored:
+            founding.setdefault(r["chirp_id"], r)
+    for cid in sorted(set(states) - set(stored)):
+        row = _rebuilt_row(cid, founding.get(cid, {}), now, rules)
+        if row is None:
+            out("chirp-state: %s has log rows but no chirp row and no founding signature; "
+                "skipped" % cid)
+            res.errors += 1
+            continue
+        st, since = states[cid]
+        live.append(dict(row, state=st, state_since=since))
+        res.rebuilt += 1
 
     # 3. Match each sweep row to the chirps; found new chirps from the rest.
     aggs = inp["aggs"]
@@ -292,8 +368,7 @@ def run(client, rules, now, out=print):
             unmatched.append(s)
 
     cap = rules.seen.max_new_per_reporter_per_run
-    taken = set(stored)
-    log_only = set(states) - set(stored)
+    taken = set(stored) | set(states)
     used, founded = {}, []
     for cl in founding_clusters(unmatched, rules):
         reps = sorted({s["reporter_id"] for s in cl})
@@ -310,16 +385,9 @@ def run(client, rules, now, out=print):
             cid = "%s-%d" % (base, k)
         taken.add(cid)
         row = _founded_row(cid, cl, now, rules)
-        if cid in log_only:
-            # A crash left the founding log row without its chirp row: rebuild the row only.
-            row["state"], row["state_since"] = states[cid]
-        else:
-            res.log_rows.append(_log(now, cid, "", "seen", "founded",
-                                     {"n_rows": str(len(cl)),
-                                      "hours": str(len({s["hour"] for s in cl})),
-                                      "reporters": ",".join(reps),
-                                      "group_key": row["group_key"]}, reps, rules))
-            res.founded += 1
+        res.log_rows.append(_log(now, cid, "", "seen", "founded",
+                                 _founding_evidence(row, cl, reps), reps, rules))
+        res.founded += 1
         founded.append(row)
     if res.skipped_new:
         out("chirp-state: skipped_new " + " ".join(
@@ -344,22 +412,28 @@ def run(client, rules, now, out=print):
     if rejected:
         evs.update(ce.gather(rejected, aggs, *common, rejects=inp["rejects"]))
 
+    # locate runs only for probing chirps, which the first gather covers.  Its site map comes
+    # from these reporters (gather's own rule), so evidence and locate name each station alike.
     rxpos, coherence = ce._receivers(inp["receivers"])
-    reps = {r["reporter_id"] for rows in aggs.values() for r in rows}
-    reps |= {a["reporter_id"] for a in inp["t6"]}
+    reps = {r["reporter_id"] for name, rows in aggs.items() if name != "sweep_hourly"
+            for r in rows}
+    reps |= {s["reporter_id"] for s in kept} | {a["reporter_id"] for a in inp["t6"]}
     site_of = ce.independent(sorted(reps), rxpos, coherence, rules)
     station_pos = {rid: grid_to_latlon(latlon_to_grid6(lat, lon))
                    for rid, (lat, lon, _src) in rxpos.items()}
 
     for c in everyone:
         cid, ev = c["chirp_id"], evs[c["chirp_id"]]
-        if c["state"] == "probing" and cid not in new_ids:
+        def place(c=c, ev=ev):
             st_clusters, P = _station_clusters(c, inp["t6"], rxpos, coherence, site_of, rules)
             ev.position = locate(st_clusters, rxpos, P, rules)
             if ev.position.get("status") == "located":
                 res.located += 1
                 c.update(lat=ev.position["lat"], lon=ev.position["lon"],
                          pos_sigma_m=ev.position["pos_sigma_m"], pos_source="located")
+
+        if c["state"] == "probing" and cid not in new_ids:
+            place()
 
         if cid not in new_ids:
             try:
@@ -372,7 +446,9 @@ def run(client, rules, now, out=print):
             if c["state"] == "rejected" and ev.last_heard and ev.last_heard > c["state_since"]:
                 res.heard_while_rejected += 1
             if mv is not None:
-                _apply_move(c, ev, mv, now, rules, res)
+                latest[cid] = _apply_move(c, ev, mv, now, rules, res)
+
+        _reconcile(c, ev, latest.get(cid), inp, now, res, place)
 
         c.update(reporter_ids=sorted(ev.hearers), n_stations=len(ev.hearers),
                  heard_hours=ev.heard_hours_bits, rules_version=rules.rules_version)
@@ -394,36 +470,64 @@ def run(client, rules, now, out=print):
         "%s=%d" % (s, res.states[s]) for s in STATES if res.states.get(s)) or "none"))
     out("chirp-state: moves %s" % (" ".join(
         "%s=%d" % kv for kv in sorted(res.moves.items())) or "none"))
-    out("chirp-state: founded %d, located %d, heard_while_rejected %d, errors %d"
-        % (res.founded, res.located, res.heard_while_rejected, res.errors))
+    out("chirp-state: founded %d, rebuilt %d, located %d, heard_while_rejected %d, errors %d"
+        % (res.founded, res.rebuilt, res.located, res.heard_while_rejected, res.errors))
     out("chirp-state: rows %s" % " ".join(
         "%s=%d" % (t, len(rows)) for t, rows in res.rows().items()))
     return res
 
 
 def _apply_move(c, ev, mv, now, rules, res):
-    """Log the move, then the local reject and identity rows it implies."""
+    """Log the move and take its state.  The rows it implies come from _reconcile.  Returns
+    the log row."""
     cid, frm = c["chirp_id"], c["state"]
-    res.log_rows.append(_log(now, cid, frm, mv.to_state, mv.why, mv.evidence, ev.hearers, rules))
+    row = _log(now, cid, frm, mv.to_state, mv.why, mv.evidence, ev.hearers, rules)
+    res.log_rows.append(row)
     key = "%s->%s" % (frm, mv.to_state)
     res.moves[key] = res.moves.get(key, 0) + 1
     c["state"], c["state_since"] = mv.to_state, now
-    if mv.local_reject:
+    return row
+
+
+IDENTITY_STATES = ("established", "dormant")
+
+
+def _reconcile(c, ev, last, inp, now, res, place):
+    """The rows the chirp's logged state implies and the database lacks: a local reject, and
+    an identity.  Idempotent, so a move logged by a run that crashed before writing them gets
+    them on the next run."""
+    cid, last = c["chirp_id"], last or {}
+    lr = (last.get("evidence") or {}).get("local_reject")
+    if lr and last.get("to_state") == "dropped" and (lr, cid) not in inp["reject_keys"]:
         res.reject_rows.append(dict(
-            reporter_id=mv.local_reject, centre_hz=c["centre_hz"],
-            rate_hz_per_s=c["rate_hz_per_s"],
+            reporter_id=lr, centre_hz=c["centre_hz"], rate_hz_per_s=c["rate_hz_per_s"],
             period_s=c["period_s"] if c.get("period_s") is not None else 1.0,
             span_hz=c.get("span_hz"), chirp_id=cid,
-            reason="%s; neighbours %s" % (mv.why, mv.evidence.get("neighbours", "")),
+            reason="%s; neighbours %s" % (last.get("why") or "local_only",
+                                          last["evidence"].get("neighbours", "")),
             set_by=ACTOR, set_at=now, active=1))
-    if mv.to_state == "established" and not c.get("tx_id"):
-        named = ev.named_by_attribution
-        if named and not named.startswith("cand:"):
-            c["tx_id"] = named          # attribution tied it to a listed site
-        else:
-            c["tx_id"] = cid
-            res.transmitter_rows.append(_transmitter(c, now))
+        inp["reject_keys"].add((lr, cid))
+
+    if c["state"] not in IDENTITY_STATES or c.get("tx_id"):
+        return
+    named = ev.named_by_attribution
+    if cid in inp["discovered"]:
+        c["tx_id"] = cid                # its identity exists; the chirp row never pointed to it
+        if cid not in inp["measured"]:
             res.waveform_rows.append(_waveform(c, ev, now))
+            inp["measured"].add(cid)
+    elif named and not named.startswith("cand:"):
+        c["tx_id"] = named              # attribution tied it to a listed site
+    elif c.get("prior_ids"):
+        pass    # R23: a listed site matches; attribution or a person names it, never the job
+    else:
+        if c.get("lat") is None and c["state"] == "established":
+            place()                     # a recovery run: the moving run's position was lost
+        c["tx_id"] = cid
+        res.transmitter_rows.append(_transmitter(c, now))
+        res.waveform_rows.append(_waveform(c, ev, now))
+        inp["discovered"].add(cid)
+        inp["measured"].add(cid)
 
 
 def _transmitter(c, now):
