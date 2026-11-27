@@ -24,8 +24,9 @@ GK = chirp.group_key(CENTRE, RATE, 1.0)
 
 @pytest.fixture(autouse=True)
 def _lock_in_tmp(monkeypatch, tmp_path):
-    """A writing chirp-state run takes cli.CHIRP_STATE_LOCK; tests keep it in tmp_path."""
-    monkeypatch.setattr(cli, "CHIRP_STATE_LOCK", str(tmp_path / "chirp-state.lock"))
+    """A writing chirp-state run takes its lock under $XDG_STATE_HOME; tests keep it in
+    tmp_path."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
 
 
 def H(k):

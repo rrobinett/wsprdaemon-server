@@ -240,26 +240,76 @@ def test_show_on_a_host_without_the_tables(monkeypatch, capsys):
     assert err.strip() == "chirp show: unknown chirp cand:1"
 
 
-def test_chirp_state_refuses_while_another_run_holds_the_lock(monkeypatch, tmp_path, capsys):
-    """Important 3: a second writing run prints one line, writes nothing and exits 1; a dry
-    run never takes the lock."""
-    import fcntl
-    lock = tmp_path / "chirp-state.lock"
-    monkeypatch.setattr(cli, "CHIRP_STATE_LOCK", str(lock))
+def _state_run(monkeypatch, tmp_path):
+    """(run(*extra) -> exit code, client): chirp-state against a fake database, its lock under
+    tmp_path/state (XDG_STATE_HOME)."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     conf = tmp_path / "c.conf"
     conf.write_text('CLICKHOUSE_HOST="h"\nCLICKHOUSE_PORT="1"\nCLICKHOUSE_ROOT_ADMIN_USER="u"\n'
                     'CLICKHOUSE_ROOT_ADMIN_PASSWORD="p"\n')
     client = JobClient({})
     monkeypatch.setattr(cli, "connect", lambda c: client)
     monkeypatch.setattr(cli, "_now_s", lambda: T0)
-    with open(lock, "a") as held:
-        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        assert cli.main(["chirp-state", "--conf", str(conf)]) == 1
-        err = capsys.readouterr().err
-        assert err.count("\n") == 1 and "another run holds" in err
-        assert client.calls == [] and client.commands == [] and client.inserted == []
-        assert cli.main(["chirp-state", "--dry-run", "--out", str(tmp_path / "o"),
-                         "--conf", str(conf)]) == 0
+    return (lambda *extra: cli.main(["chirp-state", "--conf", str(conf), *extra])), client
+
+
+def _refused(capsys, client, rc, *words):
+    err = capsys.readouterr().err
+    assert rc == 1 and err.count("\n") == 1 and "nothing written" in err, err
+    assert all(w in err for w in words), err
+    assert client.calls == [] and client.commands == [] and client.inserted == []
+
+
+def test_chirp_state_refuses_while_another_run_holds_the_lock(monkeypatch, tmp_path, capsys):
+    """Important 3: a second writing run prints one line, writes nothing and exits 1; a dry
+    run never takes the lock.  The lock directory is made 0700."""
+    import fcntl
+    run, client = _state_run(monkeypatch, tmp_path)
+    assert cli.chirp_state_lock_dir() == str(tmp_path / "state" / "sigmondb")
+    held = cli._try_lock(cli.chirp_state_lock_dir())
+    assert os.stat(cli.chirp_state_lock_dir()).st_mode & 0o777 == 0o700
+    path = os.path.join(cli.chirp_state_lock_dir(), cli.CHIRP_STATE_LOCK_NAME)
+    assert os.stat(path).st_mode & 0o777 == 0o600
+    _refused(capsys, client, run(), "another run holds")
+    assert run("--dry-run", "--out", str(tmp_path / "o")) == 0
     capsys.readouterr()
-    assert cli.main(["chirp-state", "--conf", str(conf)]) == 0     # released: it runs
+    fcntl.flock(held, fcntl.LOCK_UN)
+    os.close(held)
+    assert run() == 0                    # released: it runs
     assert client.commands
+
+
+def test_chirp_state_refuses_a_symlinked_lock(monkeypatch, tmp_path, capsys):
+    run, client = _state_run(monkeypatch, tmp_path)
+    d = cli.chirp_state_lock_dir()
+    os.makedirs(d, mode=0o700)
+    target = tmp_path / "elsewhere"
+    os.symlink(target, os.path.join(d, cli.CHIRP_STATE_LOCK_NAME))
+    _refused(capsys, client, run(), "symlink")
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o707, 0o777])
+def test_chirp_state_refuses_an_open_lock_directory(monkeypatch, tmp_path, capsys, mode):
+    run, client = _state_run(monkeypatch, tmp_path)
+    d = cli.chirp_state_lock_dir()
+    os.makedirs(d)
+    os.chmod(d, mode)
+    _refused(capsys, client, run(), "not group- or world-writable")
+
+
+def test_chirp_state_refuses_a_lock_directory_owned_by_another_user(monkeypatch, tmp_path,
+                                                                     capsys):
+    run, client = _state_run(monkeypatch, tmp_path)
+    os.makedirs(cli.chirp_state_lock_dir(), mode=0o700)
+    monkeypatch.setattr(os, "getuid", lambda: os.stat(tmp_path).st_uid + 1)
+    _refused(capsys, client, run(), "owned by uid")
+
+
+def test_chirp_state_refuses_a_symlinked_lock_directory(monkeypatch, tmp_path, capsys):
+    run, client = _state_run(monkeypatch, tmp_path)
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    os.makedirs(tmp_path / "state")
+    os.symlink(real, cli.chirp_state_lock_dir())
+    _refused(capsys, client, run(), "must be a directory")

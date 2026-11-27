@@ -519,38 +519,80 @@ def cmd_chirp_seed(a):
     return 0
 
 
-# Two runs that write at once would each log the same moves.  /run/lock is world-writable
-# (mode 1777) on the Debian hosts, so the wsprdaemon user the unit runs as can take it; no
-# other sigmondb verb holds a lock.
-CHIRP_STATE_LOCK = "/run/lock/sigmondb-chirp-state.lock"
+# Two runs that write at once would each log the same moves, so a writing run holds a lock.
+# It lives in a directory only the running user can write: $XDG_STATE_HOME/sigmondb, else
+# ~/.local/state/sigmondb, for the unit (User=wsprdaemon) and for a person running the verb
+# by hand as wsprdaemon alike.  A world-writable directory such as /run/lock would let another
+# local user pre-create the file or plant a symlink there.
+CHIRP_STATE_LOCK_NAME = "chirp-state.lock"
 
 
-def _try_lock(path):
-    """An open file holding an exclusive non-blocking flock on path, or None when another
-    process holds it.  The lock lasts until the file closes (or the process exits)."""
+class LockRefused(Exception):
+    """The lock could not be taken safely, or another run holds it."""
+
+
+def chirp_state_lock_dir():
+    import os
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"),
+                                                            ".local", "state")
+    return os.path.join(base, "sigmondb")
+
+
+def _try_lock(directory):
+    """An open file descriptor holding an exclusive non-blocking flock on
+    <directory>/chirp-state.lock; the lock lasts until it closes (or the process exits).
+    Creates directory with mode 0700 when missing.  Raises LockRefused when the directory is
+    not a real directory owned by this user and closed to group and others, when the lock
+    file is a symlink or another user's, on any OSError, or when another run holds it."""
+    import errno
     import fcntl
-    fh = open(path, "a")
+    import os
+    import stat
+    uid = os.getuid()
     try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        fh.close()
-        return None
-    return fh
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        st = os.lstat(directory)
+    except OSError as e:
+        raise LockRefused("cannot make lock directory %s: %s" % (directory, e))
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o022:
+        raise LockRefused("lock directory %s must be a directory owned by uid %d and not "
+                          "group- or world-writable" % (directory, uid))
+    path = os.path.join(directory, CHIRP_STATE_LOCK_NAME)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e:
+        why = "it is a symlink" if e.errno == errno.ELOOP else str(e)
+        raise LockRefused("cannot open lock %s: %s" % (path, why))
+    try:
+        if os.fstat(fd).st_uid != uid:
+            raise LockRefused("lock %s is not owned by uid %d" % (path, uid))
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise LockRefused("another run holds %s" % path)
+        except OSError as e:
+            raise LockRefused("cannot lock %s: %s" % (path, e))
+    except LockRefused:
+        os.close(fd)
+        raise
+    return fd
 
 
 def cmd_chirp_state(a):
     """Move every chirp on the fleet's evidence (chirp_job).  The log rows go in first, the
     chirp rows last.  --dry-run writes every row set as JSON Lines into --out and leaves the
     database alone, even on a host whose chirp tables do not exist yet.  A run that writes
-    holds CHIRP_STATE_LOCK; while another holds it, the run prints one line, writes nothing
-    and exits 1.  Prints counts only, never a coordinate."""
+    holds the lock in chirp_state_lock_dir() (_try_lock); while another run holds it, or when
+    it cannot be taken safely, the run prints one line, writes nothing and exits 1.  Prints
+    counts only, never a coordinate."""
+    import os
     from sigmondb import chirp, chirp_job
     lock = None
     if not a.dry_run:
-        lock = _try_lock(CHIRP_STATE_LOCK)
-        if lock is None:
-            print("chirp-state: another run holds %s; nothing written" % CHIRP_STATE_LOCK,
-                  file=sys.stderr)
+        try:
+            lock = _try_lock(chirp_state_lock_dir())
+        except LockRefused as e:
+            print("chirp-state: %s; nothing written" % e, file=sys.stderr)
             return 1
     try:
         client = connect(a.conf)
@@ -564,7 +606,7 @@ def cmd_chirp_state(a):
         return 0
     finally:
         if lock is not None:
-            lock.close()
+            os.close(lock)
 
 
 def cmd_publish(a):
