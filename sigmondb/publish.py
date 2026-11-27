@@ -203,7 +203,8 @@ AGG_QUERIES = {
 
 # The channel menu's aggregates, read in the same loop with chirp_evidence.agg_params(rules)
 # as their {hours:UInt32}: the sweep and capture aggregates the chirp-state job reads, and the
-# T6 arrivals it reads (cli._ATTR_WHERE), HFDL kept out.  Built by chirp_agg_queries(), which
+# T6 arrivals it reads (cli._ATTR_WHERE), HFDL kept out.  The T6 arrivals take only
+# menu.t6_recent_days, the window the menu reads them over.  Built by chirp_agg_queries(), which
 # imports the chirp modules only when called: a fault there can cost the chirp tables, never
 # the core ones.
 CHIRP_AGG_NAMES = ("sweep_hourly", "capture_recent", "t6_arrival")
@@ -674,7 +675,7 @@ def read_source(client, out=print):
     as "agg:<name>".  A failed aggregate, or a failed read of an OPTIONAL_SOURCES table, is
     logged and left out; the chirp aggregates take chirp_evidence.agg_params(rules)."""
     log, out = out, {}
-    hours = {}
+    rules = []
 
     def run(sql, params=None):
         kw = {} if params is None else {"parameters": params}
@@ -683,14 +684,18 @@ def read_source(client, out=print):
         except TypeError:   # clickhouse-connect without query_tz; _unix() treats naive as UTC
             return client.query(sql, **kw)
 
-    def params_for(sql):
+    def params_for(name, sql):
+        """The chirp aggregates' {hours:UInt32}: agg_params(rules), except the T6 arrivals,
+        which the menu reads only over menu.t6_recent_days (chirp_menu.fleet_hearing)."""
         if "{hours:UInt32}" not in sql:
             return None
-        if not hours:
+        from sigmondb.chirp_evidence import agg_params
+        if not rules:
             from sigmondb.chirp import load_rules
-            from sigmondb.chirp_evidence import agg_params
-            hours.update(agg_params(load_rules()))
-        return hours
+            rules.append(load_rules())
+        if name == "t6_arrival":
+            return {"hours": int(math.ceil(rules[0].menu.t6_recent_days * 24))}
+        return agg_params(rules[0])
 
     for table, cols in SOURCE_COLUMNS.items():
         sql = "SELECT %s FROM sigmondb.%s FINAL %s" % (
@@ -710,7 +715,7 @@ def read_source(client, out=print):
         chirp_aggs = []
     for name, (cols, sql) in list(AGG_QUERIES.items()) + chirp_aggs:
         try:
-            out_rows = [dict(zip(cols, r)) for r in run(sql, params_for(sql)).result_rows]
+            out_rows = [dict(zip(cols, r)) for r in run(sql, params_for(name, sql)).result_rows]
         except Exception as e:   # the map must not stop the core tables
             log("agg:%s: read FAILED, table(s) not published this run: %s: %s" % (
                 name, type(e).__name__, e))

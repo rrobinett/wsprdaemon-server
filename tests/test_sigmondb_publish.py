@@ -1059,3 +1059,14 @@ def test_publish_imports_without_the_chirp_modules_or_cli():
                          text=True, timeout=60)
     assert res.returncode == 0, res.stderr
     assert "transmitter_offsets" in res.stdout
+
+
+def test_t6_arrivals_read_only_the_menus_recent_window():
+    """Minor 13: the menu reads T6 arrivals only over menu.t6_recent_days, so the hourly
+    publish asks for that window, not the 21-day aggregate one."""
+    src = _chirp_src()
+    publish.read_source(src, out=lambda s: None)
+    rules = chirp_rules.load_rules()
+    (i,) = [i for i, s in enumerate(src.sql) if s.startswith("/* agg:t6_arrival */")]
+    assert src.params[i] == {"hours": int(rules.menu.t6_recent_days * 24)} == {"hours": 168}
+    assert src.params[i] != __import__("sigmondb.chirp_evidence", fromlist=["x"]).agg_params(rules)
