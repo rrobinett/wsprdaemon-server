@@ -1,5 +1,7 @@
 """Chirp rules file and signature matching.  No ClickHouse."""
+import dataclasses
 import os
+import random
 import sys
 
 import pytest
@@ -22,7 +24,7 @@ def test_rules_load_starting_values():
     assert r.menu.state_weight["probing"] == 0.8
     with pytest.raises(TypeError):
         r.menu.cost["codar"] = 2.0
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         r.match.centre_tol_hz = 1
 
 
@@ -107,3 +109,24 @@ def test_cluster_sweeps_single_linkage_and_order():
     # deterministic regardless of input order
     assert cluster_sweeps(list(reversed(s)), r) == out
     assert cluster_sweeps([], r) == []
+
+
+def test_cluster_sweeps_ties_are_order_independent():
+    r = load_rules()
+    s = [sweep(4.5e6, id="a", reporter_id="R2", span_hz=None),
+         sweep(4.5e6, id="b", reporter_id="R1", span_hz=None),
+         sweep(4.5e6, id="c", reporter_id="R1", span_hz=50e3),
+         sweep(4.5e6, id="d", reporter_id="R3", span_hz=50e3, time="2026-11-01")]
+    out = cluster_sweeps(s, r)
+    assert len(out) == 1 and len(out[0]) == 4
+    assert cluster_sweeps(list(reversed(s)), r) == out
+    rng = random.Random(7)
+    for _ in range(5):
+        sh = s[:]
+        rng.shuffle(sh)
+        assert cluster_sweeps(sh, r) == out
+
+
+def test_cluster_sweeps_missing_key_names_it():
+    with pytest.raises(ValueError, match="rate_hz_per_s"):
+        cluster_sweeps([{"centre_hz": 1.0, "period_s": 1.0}], load_rules())

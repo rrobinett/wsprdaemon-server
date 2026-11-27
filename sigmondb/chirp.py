@@ -5,6 +5,7 @@ frozen dataclasses and decides whether two sweeps belong to one transmitter.
 """
 import dataclasses
 import hashlib
+import json
 import tomllib
 import types
 from dataclasses import dataclass
@@ -235,16 +236,32 @@ def matches(a: Signature, b: Signature, rules: Rules) -> bool:
     return abs(a.centre_hz - b.centre_hz) <= m.centre_tol_hz
 
 
+def _need(sweep: dict, key: str):
+    if key not in sweep:
+        raise ValueError(f"sweep is missing key {key!r}")
+    return sweep[key]
+
+
 def _sig(sweep: dict) -> Signature:
-    return Signature(sweep["centre_hz"], sweep["rate_hz_per_s"], sweep["period_s"],
-                     sweep.get("span_hz"), sweep.get("duration_s"))
+    return Signature(_need(sweep, "centre_hz"), _need(sweep, "rate_hz_per_s"),
+                     _need(sweep, "period_s"), sweep.get("span_hz"), sweep.get("duration_s"))
+
+
+def _order_key(sweep: dict):
+    """A total order: the three matching keys, then every tie-break, ending
+    in a canonical dump of the dict, so input order never shows in the output."""
+    span, dur = sweep.get("span_hz"), sweep.get("duration_s")
+    return (_need(sweep, "centre_hz"), _need(sweep, "rate_hz_per_s"), _need(sweep, "period_s"),
+            -1 if span is None else span, -1 if dur is None else dur,
+            sweep.get("reporter_id") or "", str(sweep.get("time") or ""),
+            json.dumps(sweep, sort_keys=True, default=str))
 
 
 def cluster_sweeps(sweeps: list, rules: Rules) -> list:
     """Single-linkage clusters of sweep dicts under ``matches``.  Input is
-    sorted by (centre_hz, rate_hz_per_s, period_s); clusters come out ordered
+    sorted by (centre_hz, rate_hz_per_s, period_s) and then a total tie-break (see _order_key); clusters come out ordered
     by their first member, members in that sorted order."""
-    ordered = sorted(sweeps, key=lambda s: (s["centre_hz"], s["rate_hz_per_s"], s["period_s"]))
+    ordered = sorted(sweeps, key=_order_key)
     sigs = [_sig(s) for s in ordered]
     parent = list(range(len(ordered)))
 
