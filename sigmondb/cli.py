@@ -784,7 +784,7 @@ def _fmt_menu_row(r, rank):
 def cmd_menu(a):
     """Print a grid square's two rankings for one UTC hour, for review.  Reads the database
     as chirp-state does (chirp_job.read_inputs); state comes from the log.  T6 stations: the
-    reporters with T6 arrivals in the last chirp_menu.T6_RECENT_DAYS days.  Writes nothing and
+    reporters with T6 arrivals in the last menu.t6_recent_days days.  Writes nothing and
     prints no station coordinate."""
     from sigmondb import chirp, chirp_job, chirp_menu
     from sigmondb.receivers import grid_to_latlon
@@ -797,7 +797,7 @@ def cmd_menu(a):
                      "chirp_id"):
         st = states.get(c["chirp_id"])
         chirps.append(dict(c, state=st[0] if st else c["state"]))
-    recent = now - timedelta(days=chirp_menu.T6_RECENT_DAYS)
+    recent = now - timedelta(days=rules.menu.t6_recent_days)
     t6 = [r for r in inp["t6"] if r["time"] >= recent]
     rx = _latest(inp["receivers"], "reporter_id")
     positions = {r["reporter_id"]: (r["lat"], r["lon"]) for r in rx
@@ -813,6 +813,9 @@ def cmd_menu(a):
                                    rules)
     print("menu %s %02dZ%s  rules %s" % (a.grid, a.hour, "  (T6 station)" if a.t6 else "",
                                          rules.rules_version))
+    if hearing.unparsed_t6:
+        print("menu: %d T6 arrival(s) with a group_key that did not parse count for no chirp"
+              % hearing.unparsed_t6)
     for name, rank in (("timing", "rank_timing"), ("exploration", "rank_explore")):
         placed = sorted((r for r in rows if r[rank]), key=lambda r: r[rank])
         print("%s (%d):" % (name, len(placed)))

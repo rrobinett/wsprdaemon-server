@@ -200,17 +200,18 @@ def test_station_without_position_gets_no_menu():
 
 
 def test_ties_break_by_key():
-    # Same position, same evidence (none), same cost: only the key tells them apart.
+    # Same position, same evidence (none), same cost: only the key tells them apart.  The
+    # chirps come in reverse key order, so input order cannot pass for key order.
     p = dest(BASE, 0, 60)
-    chirps = [crow("codar:Z", "established", p, 4_900_000.0),
-              crow("codar:Y", "established", p, 4_600_000.0),
-              crow("cand:20261121-111111", "candidate", grid_to_latlon("EN55"), 5_300_000.0),
-              crow("cand:20261121-222222", "candidate", grid_to_latlon("EN55"), 5_200_000.0)]
+    est = [crow("codar:Y", "established", p, 4_600_000.0),
+           crow("codar:Z", "established", p, 4_900_000.0)]
+    cand = [crow("cand:20261121-111111", "candidate", grid_to_latlon("EN55"), 5_200_000.0),
+            crow("cand:20261121-222222", "candidate", grid_to_latlon("EN55"), 5_300_000.0)]
+    chirps = sorted(est + cand, key=lambda c: c["group_key"], reverse=True)
     rows = menu(station(BASE), 3, chirps)
-    ky, kz = chirps[1]["group_key"], chirps[0]["group_key"]
-    assert timing_order(rows) == sorted([ky, kz])
-    k1, k2 = chirps[2]["group_key"], chirps[3]["group_key"]
-    assert explore_order(rows)[:2] == sorted([k1, k2])
+    assert timing_order(rows) == sorted(c["group_key"] for c in est)
+    assert explore_order(rows)[:2] == sorted(c["group_key"] for c in cand)
+    assert explore_order(rows)[2:] == sorted(c["group_key"] for c in est)
 
 
 def test_rows_carry_the_contract_fields():
@@ -265,6 +266,18 @@ def test_menu_verb_prints_both_rankings(monkeypatch, capsys):
     for coord in ("%.2f" % lat, "%.2f" % lon, "%.3f" % lat, "%.3f" % lon):
         assert coord not in out
     assert client.inserted == [] and client.commands == []
+    assert "did not parse" not in out
+
+
+def test_menu_verb_reports_unparsed_t6(monkeypatch, capsys):
+    from test_sigmondb_chirp_job import JobClient
+    arr = dict(time=NOW - timedelta(days=1), reporter_id="T6N", group_key="junk", delay_ns=1,
+               level_db=0.0, detector_version="1", engineering={})
+    client = JobClient({"arrival": [arr]})
+    monkeypatch.setattr(cli, "connect", lambda conf: client)
+    monkeypatch.setattr(cli, "_now_s", lambda: NOW)
+    assert cli.main(["menu", "--grid", latlon_to_grid6(*BASE), "--hour", "3"]) == 0
+    assert "menu: 1 T6 arrival(s) with a group_key that did not parse" in capsys.readouterr().out
 
 
 def test_menu_verb_refuses_bad_grid_or_hour(capsys):
@@ -306,3 +319,44 @@ def test_t6_in_reach_doubles_timing_value():
     v_far = menu(station(BASE), 3, [est], [s], far, t6={"T6N"})[0]["timing_value"]
     v_near = menu(station(BASE), 3, [est], [s], near, t6={"T6N"})[0]["timing_value"]
     assert v_near == pytest.approx(2 * v_far) and v_far > 0
+
+
+def test_shared_t6_window_comes_from_the_rules():
+    chirps, sweeps, pos = pair()                  # T6X heard B two days ago
+    rows = by_key(menu(station(BASE), 3, chirps, sweeps, pos, t6={"T6X"}))
+    assert rows[KB]["shared_t6"] == 1
+    rows = by_key(menu(station(BASE), 3, chirps, sweeps, pos, t6={"T6X"},
+                       rules=with_menu(t6_recent_days=1)))
+    assert rows[KB]["shared_t6"] == 0
+    assert timing_order(rows.values()) == [KA, KB]
+
+
+def test_any_trusted_member_ends_the_lift():
+    # Channel B: its best member holds no trusted offset; a weaker member (heard only at
+    # 14Z, so 0.2 at 03Z) does.  B is shared with a T6 station, A is stronger and unshared.
+    p = dest(BASE, 0, 60)
+    a = crow("codar:A", "established", p, FA)
+    b1 = crow("codar:B1", "established", p, FB, offset_ns=900, offset_sigma_ns=500_000.0)
+    b2 = crow("codar:B2", "established", p, FB, offset_ns=500, offset_sigma_ns=50_000.0,
+              heard_hours=1 << 14)
+    sweeps = [sweep("NB", FA, at_hour(3), 30.0), sweep("NB", FB, at_hour(3), 8.0),
+              sweep("T6X", FB, at_hour(5, days_ago=2), 5.0)]
+    pos = {"NB": NEAR, "T6X": FAR_T6}
+    rows = by_key(menu(station(BASE), 3, [a, b1, b2], sweeps, pos, t6={"T6X"}))
+    assert rows[KB]["chirp_ids"] == ["codar:B1", "codar:B2"] and rows[KB]["shared_t6"] == 1
+    assert rows[KA]["timing_value"] > rows[KB]["timing_value"]
+    assert timing_order(rows.values()) == [KA, KB]
+    # Without B2's trusted offset the rule still lifts B.
+    rows = by_key(menu(station(BASE), 3, [a, b1], sweeps, pos, t6={"T6X"}))
+    assert timing_order(rows.values()) == [KB, KA]
+
+
+def test_unparsed_t6_group_keys_are_counted():
+    est = crow("codar:E", "established", dest(BASE, 0, 50), FA)
+    t = NOW - timedelta(days=1)
+    arr = [dict(time=t, reporter_id="T6N", group_key="junk", delay_ns=1),
+           dict(time=t, reporter_id="T6N", group_key=None, delay_ns=1),
+           dict(time=t, reporter_id="T6N", group_key=est["group_key"], delay_ns=1)]
+    h = chirp_menu.prepare_hearing([est], [], RULES, NOW, positions={}, t6_arrivals=arr)
+    assert h.unparsed_t6 == 2
+    assert h.hearers["codar:E"] == {"T6N"}

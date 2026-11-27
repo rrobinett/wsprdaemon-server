@@ -104,6 +104,7 @@ class MenuRules:
     unknown_snr_factor: float
     skywave_timing_weight: float
     offset_trusted_sigma_us: float
+    t6_recent_days: float
     shared_t6_override: bool
     state_weight: Mapping[str, float]
     cost: Mapping[str, float]

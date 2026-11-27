@@ -52,6 +52,7 @@ snr_full_db = 23
 unknown_snr_factor = 0.25
 skywave_timing_weight = 0.3
 offset_trusted_sigma_us = 100
+t6_recent_days = 7           # "T6 stations" and shared_t6: T6 evidence or hearing within these days
 shared_t6_override = true   # emergency off switch only; the rule lapses per channel by itself
 state_weight = { candidate = 1.0, probing = 0.8, established = 0.3, dormant = 0.3 }
 cost = { codar = 1.0, ionosonde = 1.0, oth = 1.0, unknown = 1.0 }

@@ -34,9 +34,6 @@ from sigmondb.receivers import grid_to_latlon
 
 LIVE_STATES = ("candidate", "probing", "established", "dormant")
 TIMING_STATES = ("established", "dormant")
-# The brief's window for "T6 stations" and "heard in the last 7 days" (shared_t6).
-T6_RECENT_DAYS = 7
-
 
 class MenuRow(TypedDict):
     channel_key: str
@@ -88,12 +85,40 @@ class Hearing:
       SNRs in that UTC hour over menu.history_days.
     hearers: chirp_id -> set of reporters that heard it: a matching sweep within
       menu.history_days, or a matching T6 arrival.
-    heard_recent: chirp_id -> set of reporters that heard it in the last T6_RECENT_DAYS days.
-    n_probers: chirp_id -> distinct reporters with matching capture_recent rows."""
+    heard_recent: chirp_id -> set of reporters that heard it in the last menu.t6_recent_days
+      days.
+    n_probers: chirp_id -> distinct reporters with matching capture_recent rows.
+    geometry: chirp_id -> _Geometry, what does not depend on the station: the chirp's scoring
+      position, and per located hearer its grid6 position, path kind to the chirp and bearing
+      from it.
+    unparsed_t6: T6 arrival rows whose group_key did not parse; they count for no chirp."""
 
     def __init__(self):
         self.positions, self.site_snr, self.hearers = {}, {}, {}
-        self.heard_recent, self.n_probers = {}, {}
+        self.heard_recent, self.n_probers, self.geometry = {}, {}, {}
+        self.unparsed_t6 = 0
+
+
+class _Geometry:
+    """One chirp's station-independent geometry.  pos: chirp_position(); located: [(reporter,
+    (lat, lon), path kind to the chirp or None, bearing from the chirp or None)], sorted by
+    reporter, for every located hearer; ground: the located hearers within ground range."""
+
+    def __init__(self, c, hearers, positions):
+        self.pos = pos = chirp_position(c)
+        centre = c["centre_hz"]
+        self.located, self.ground = [], set()
+        for r in sorted(hearers):
+            p = positions.get(r)
+            if p is None:
+                continue
+            if pos is None:
+                self.located.append((r, p, None, None))
+                continue
+            kind = path_kind(gc_km(p, pos), centre)
+            self.located.append((r, p, kind, _bearing(pos, p)))
+            if kind == "ground_range":
+                self.ground.add(r)
 
 
 def prepare_hearing(chirps, sweep_rows, rules, now, *, positions=None, coherence=None,
@@ -110,7 +135,7 @@ def prepare_hearing(chirps, sweep_rows, rules, now, *, positions=None, coherence
     h.positions = {r: grid6_centre(*p[:2]) for r, p in (positions or {}).items()
                    if p is not None and p[0] is not None and p[1] is not None}
     since = now - timedelta(days=rules.menu.history_days)
-    recent = now - timedelta(days=T6_RECENT_DAYS)
+    recent = now - timedelta(days=rules.menu.t6_recent_days)
     sweeps = [s for s in sweep_rows or () if s["hour"] >= min(since, recent)]
     t6_last = {}                                  # (reporter, group_key) -> latest time
     for a in t6_arrivals or ():
@@ -126,12 +151,16 @@ def prepare_hearing(chirps, sweep_rows, rules, now, *, positions=None, coherence
     caps = list(captures or ())
     cap_ix = ce._ByCentre([ce.Signature(p["centre_hz"], p["rate_hz_per_s"], 1.0) for p in caps],
                           rules)
-    t6_keys = []
-    for (rid, gk), t in sorted(t6_last.items()):
-        try:
-            t6_keys.append((rid, ce._key_centre_rate(gk), t))
-        except (ValueError, IndexError):
-            continue
+    t6_keys, parsed = [], {}
+    for (rid, gk), t in sorted(t6_last.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
+        if gk not in parsed:
+            try:
+                parsed[gk] = ce._key_centre_rate(gk)
+            except (ValueError, IndexError, TypeError):
+                parsed[gk] = None
+        if parsed[gk] is not None:
+            t6_keys.append((rid, parsed[gk], t))
+    h.unparsed_t6 = sum(1 for a in t6_arrivals or () if parsed.get(a["group_key"]) is None)
 
     for c in chirps:
         cid, sig = c["chirp_id"], ce.chirp_signature(c)
@@ -159,6 +188,7 @@ def prepare_hearing(chirps, sweep_rows, rules, now, *, positions=None, coherence
                                 for st, v in sorted(by.items()) if st in h.positions]
                            for hr, by in snrs.items()}
         h.hearers[cid] = hearers
+        h.geometry[cid] = _Geometry(c, hearers, h.positions)
         h.heard_recent[cid] = heard_recent
         h.n_probers[cid] = len({caps[i]["reporter_id"] for i in cap_ix.candidates(sig)
                                 if matches(sig, ce._sig_like(caps[i]["centre_hz"],
@@ -183,14 +213,17 @@ def _angle(b1, b2):
     return abs((b1 - b2 + 180.0) % 360.0 - 180.0)
 
 
-def _member(c, st, me, is_t6, hour_utc, hearing, t6_stations, rules):
-    """One chirp's values for this station and hour."""
+def _member(c, st, me, is_t6, hour_utc, hearing, t6_stations, rules, dist):
+    """One chirp's values for this station and hour.  dist(p): km from the station to a
+    hearer's grid6 position, memoised per call (hearers recur across chirps)."""
     m = rules.menu
     cid, state, centre = c["chirp_id"], c["state"], c["centre_hz"]
-    pos = chirp_position(c)
+    geo = hearing.geometry.get(cid) or _Geometry(c, hearing.hearers.get(cid, ()),
+                                                 hearing.positions)
+    pos = geo.pos
     path = None if pos is None else path_kind(gc_km(st, pos), centre)
     near = [snr for p, snr in hearing.site_snr.get(cid, {}).get(hour_utc, ())
-            if gc_km(st, p) <= m.near_km]
+            if dist(p) <= m.near_km]
     snr = statistics.median(near) if near else None
     hearers = hearing.hearers.get(cid, set())
 
@@ -211,26 +244,24 @@ def _member(c, st, me, is_t6, hour_utc, hearing, t6_stations, rules):
         if pos is None:
             reach = bool(t6_hearers)
         else:
-            reach = any(r in hearing.positions
-                        and path_kind(gc_km(hearing.positions[r], pos), centre) == "ground_range"
-                        for r in t6_hearers)
+            reach = any(r in geo.ground for r in t6_hearers)
             reach = reach or (is_t6 and path == "ground_range")
         reach_f = 1.0 if reach else 0.5
         bits = int(c.get("heard_hours") or 0)
         sched_f = 1.0 if bits == 0 or (bits >> hour_utc) & 1 else 0.2
         timing = path_w * snr_f * offset_f * reach_f * sched_f
 
-    others = [hearing.positions[r] for r in sorted(hearers) if r != me and r in hearing.positions]
+    others = [g for g in geo.located if g[0] != me]
     if not others:
         novelty = 1.0          # no other located hearer: any look from here is new
     else:
-        novelty = _clamp(min(gc_km(st, p) for p in others) / 1000.0)
+        novelty = _clamp(min(dist(p) for _r, p, _k, _b in others) / 1000.0)
         if pos is not None:
-            if all(path_kind(gc_km(p, pos), centre) != path for p in others):
+            if all(kind != path for _r, _p, kind, _b in others):
                 novelty = 1.0  # path novelty: no other hearer shares this station's path
             mine = _bearing(pos, st)
-            novelty = max(novelty, _clamp(min(_angle(mine, _bearing(pos, p))
-                                              for p in others) / 90.0))
+            novelty = max(novelty, _clamp(min(_angle(mine, b) for _r, _p, _k, b in others)
+                                          / 90.0))
     explore = (m.state_weight.get(state, 0.0) * novelty
                / (1 + hearing.n_probers.get(cid, 0)))
 
@@ -249,10 +280,11 @@ def channel_menu(station: dict, hour_utc: int, chirps, hearing: Hearing, t6_stat
     chirps: chirp rows; only candidate, probing, established and dormant ones, never HFDL,
       count.  One channel per group_key, listing every such chirp with that key; each value
       takes its best member (largest timing and exploration value, largest expected SNR,
-      lowest cost, any ground-range path); `trusted` comes from the member with the best
-      timing value.
+      lowest cost, any ground-range path).  The channel counts as trusted when ANY member
+      holds a trusted offset (ruling R28): the shared-T6-first rule lapses once the channel
+      holds one.
     hearing: prepare_hearing() over the same chirps.
-    t6_stations: reporters with T6 evidence in the last T6_RECENT_DAYS days.
+    t6_stations: reporters with T6 evidence in the last menu.t6_recent_days days.
     is_t6: a T6 station on a ground-range path to the chirp is itself the T6 reference in
       reach (reach_f = 1).
 
@@ -268,14 +300,22 @@ def channel_menu(station: dict, hour_utc: int, chirps, hearing: Hearing, t6_stat
     is_t6 = bool(station.get("is_t6"))
     m = rules.menu
 
+    memo = {}
+
+    def dist(p):
+        d = memo.get(p)
+        if d is None:
+            d = memo[p] = gc_km(st, p)
+        return d
+
     groups = {}
     for c in chirps:
         if c.get("state") in LIVE_STATES and not _hfdl(c):
             groups.setdefault(c["group_key"], []).append(c)
     rows = []
-    for key, members in sorted(groups.items()):
+    for key, members in groups.items():         # input order: the rankings' keys decide
         members = sorted(members, key=lambda c: c["chirp_id"])
-        vals = [_member(c, st, me, is_t6, hour_utc, hearing, t6_stations, rules)
+        vals = [_member(c, st, me, is_t6, hour_utc, hearing, t6_stations, rules, dist)
                 for c in members]
         best_t = max(range(len(vals)), key=lambda i: (vals[i]["timing"], -i))
         snrs = [v["snr"] for v in vals if v["snr"] is not None]
@@ -292,7 +332,7 @@ def channel_menu(station: dict, hour_utc: int, chirps, hearing: Hearing, t6_stat
             expected_snr_db=max(snrs) if snrs else None,
             path=("ground_range" if "ground_range" in paths else "skywave" if paths else None),
             rank_timing=0, rank_explore=0,
-            _trusted=vals[best_t]["trusted"]))
+            _trusted=any(v["trusted"] for v in vals)))
 
     timing = sorted((r for r in rows if r["timing_value"] > 0),
                     key=lambda r: (0 if m.shared_t6_override and r["shared_t6"] > 0
