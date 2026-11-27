@@ -570,3 +570,48 @@ def test_nearest_prior_names_and_kinds_a_placed_chirp():
     assert row["prior_ids"] == ["giro:AAFAR", "hfrnet:NEAR"]
     assert (row["suggested_name"], row["kind"], row["state"]) == ("hfrnet:NEAR", "codar", "seen")
     assert res.log_rows == []
+
+
+# --- fix round 2: a discovered identity needs a position --------------------------------------
+
+def test_pinned_chirp_without_position_waits_then_gets_identity_once(monkeypatch):
+    """A person pinned P established; it has no position and no prior.  With no locate fix the
+    job writes no identity and counts it; once locate fixes it, identity goes out once."""
+    tables, aggs = probing_scene("P")
+    tables["chirp"] = [chirp_row("P", state="established", pin="pin", pin_by="rob")]
+    tables["chirp_log"] = [dict(log_row("P", "established", NOW - timedelta(days=1), "probing"),
+                                actor="rob")]
+
+    def no_fix(st_clusters, rxpos, period_ms, rules, **kw):
+        return {"status": "no_fit", "lat": None, "lon": None, "pos_sigma_m": None,
+                "spread_us": None, "n_stations": len(st_clusters), "stations": []}
+
+    monkeypatch.setattr(chirp_job, "locate", no_fix)
+    first = run(JobClient(tables, aggs))
+    assert first.transmitter_rows == [] and first.waveform_rows == []
+    assert first.identity_waiting_position == 1 and first.relocated == 0
+    assert any("identity_waiting_position 1" in ln for ln in first.lines)
+    assert all(r["tx_id"] == "" for r in first.chirp_rows)
+    apply(tables, first)
+
+    located(monkeypatch)
+    second = run(JobClient(tables, aggs))
+    assert [t["tx_id"] for t in second.transmitter_rows] == ["P"]
+    assert second.transmitter_rows[0]["lat"] is not None
+    assert [w["tx_id"] for w in second.waveform_rows] == ["P"]
+    assert (second.relocated, second.located, second.identity_waiting_position) == (1, 0, 0)
+    assert second.log_rows == []
+    apply(tables, second)
+    third = run(JobClient(tables, aggs))
+    assert third.transmitter_rows == [] and third.waveform_rows == []
+
+
+def test_located_counts_fresh_locates_and_relocated_recovery(monkeypatch):
+    located(monkeypatch)
+    tables, aggs = probing_scene()
+    first = run(JobClient(tables, aggs))
+    assert (first.located, first.relocated) == (1, 0)
+    log_only(tables, first)                       # crash: the position never reached the row
+    second = run(JobClient(tables, aggs))
+    assert (second.located, second.relocated) == (0, 1)
+    assert [t["tx_id"] for t in second.transmitter_rows] == [CID]

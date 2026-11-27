@@ -715,3 +715,16 @@ def test_attribution_inputs_admit_discovered(monkeypatch):
     assert "cand:20261127-abcdef" in {s["id"] for s in sites}
     tx_sql = next(k["sql"] for k in c.calls if " FROM sigmondb.transmitter " in k["sql"])
     assert "kind = 'codar' OR source = 'discovered'" in tx_sql
+
+
+def test_attribution_inputs_drop_a_discovered_site_without_position(monkeypatch):
+    nopos = valid_row("transmitter", tx_id="cand:20261127-000000", kind="unknown", lat=None,
+                      lon=None, valid_from=_VF, version=1, source="discovered",
+                      status="established")
+    nopos_wf = valid_row("waveform", tx_id="cand:20261127-000000", valid_from=_VF,
+                         centre_hz=5.3e6, rate_hz_per_s=-25_733.913, period_s=1.0,
+                         source="measured")
+    c = _db(monkeypatch, {"arrival": KFS_LIVE_ROWS[:2], "transmitter": TX + [nopos],
+                          "waveform": WF + [nopos_wf], "receiver": RX_ROWS})
+    _, sites, _, _ = cli._attribution_inputs(c, 30.0)
+    assert [s["id"] for s in sites] == ["hfrnet:TSTA", "hfrnet:TSTB"]   # codar rows as before

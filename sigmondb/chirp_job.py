@@ -14,7 +14,9 @@ insert heals on the next run with no second log row:
 - an established or dormant chirp with no tx_id gets its identity: the tx_id attribution
   names, or the discovered transmitter it already has, or else new discovered transmitter and
   measured waveform rows, unless a listed site matches it (prior_ids not empty: ruling R23,
-  it waits for attribution or a person);
+  it waits for attribution or a person).  New discovered rows need a located position (the
+  chirp's, or a fresh locate); without one the job writes nothing and counts the chirp as
+  identity_waiting_position, and a later run retries;
 - a chirp whose latest log row carries a local_reject gets that reject row unless one exists
   for the (reporter, chirp) pair, active or withdrawn (a person's withdrawal stands).
 
@@ -62,7 +64,9 @@ class JobResult:
     moves: dict = field(default_factory=dict)         # "from->to" -> count
     founded: int = 0
     rebuilt: int = 0
-    located: int = 0
+    located: int = 0                 # fresh locates of probing chirps
+    relocated: int = 0               # recovery re-locates of chirps that need an identity
+    identity_waiting_position: int = 0
     heard_while_rejected: int = 0
     errors: int = 0
 
@@ -424,11 +428,14 @@ def run(client, rules, now, out=print):
 
     for c in everyone:
         cid, ev = c["chirp_id"], evs[c["chirp_id"]]
-        def place(c=c, ev=ev):
+        def place(c=c, ev=ev, recovery=False):
             st_clusters, P = _station_clusters(c, inp["t6"], rxpos, coherence, site_of, rules)
             ev.position = locate(st_clusters, rxpos, P, rules)
             if ev.position.get("status") == "located":
-                res.located += 1
+                if recovery:
+                    res.relocated += 1
+                else:
+                    res.located += 1
                 c.update(lat=ev.position["lat"], lon=ev.position["lon"],
                          pos_sigma_m=ev.position["pos_sigma_m"], pos_source="located")
 
@@ -470,8 +477,10 @@ def run(client, rules, now, out=print):
         "%s=%d" % (s, res.states[s]) for s in STATES if res.states.get(s)) or "none"))
     out("chirp-state: moves %s" % (" ".join(
         "%s=%d" % kv for kv in sorted(res.moves.items())) or "none"))
-    out("chirp-state: founded %d, rebuilt %d, located %d, heard_while_rejected %d, errors %d"
-        % (res.founded, res.rebuilt, res.located, res.heard_while_rejected, res.errors))
+    out("chirp-state: founded %d, rebuilt %d, located %d, relocated %d, "
+        "identity_waiting_position %d, heard_while_rejected %d, errors %d"
+        % (res.founded, res.rebuilt, res.located, res.relocated, res.identity_waiting_position,
+           res.heard_while_rejected, res.errors))
     out("chirp-state: rows %s" % " ".join(
         "%s=%d" % (t, len(rows)) for t, rows in res.rows().items()))
     return res
@@ -521,8 +530,14 @@ def _reconcile(c, ev, last, inp, now, res, place):
     elif c.get("prior_ids"):
         pass    # R23: a listed site matches; attribution or a person names it, never the job
     else:
-        if c.get("lat") is None and c["state"] == "established":
-            place()                     # a recovery run: the moving run's position was lost
+        # A discovered site enters attribution's geometry, so it needs a position: the chirp's
+        # own, or a fresh locate (a recovery run, a pinned chirp, a dormant one).  Without one,
+        # write nothing; a later run retries.
+        if c.get("lat") is None or c.get("lon") is None:
+            place(recovery=True)
+        if c.get("lat") is None or c.get("lon") is None:
+            res.identity_waiting_position += 1
+            return
         c["tx_id"] = cid
         res.transmitter_rows.append(_transmitter(c, now))
         res.waveform_rows.append(_waveform(c, ev, now))
