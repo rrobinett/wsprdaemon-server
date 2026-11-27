@@ -122,11 +122,8 @@ def read_inputs(client, rules):
                       for r in cli._query(client, sql, params).result_rows]
 
     receivers = fetch("receiver")
-    t6 = fetch("arrival", cli._ATTR_ARRIVAL_COLS, cli._ATTR_WHERE, params)
-    for r in t6:
-        r["live"] = "sweep_repetition_hz" in (r.get("engineering") or {})
-    t6, _dropped = cli._carried(t6, cli._latest(receivers, "reporter_id"))
-    t6 = to_sweep_start(t6, ACTOR)
+    t6 = t6_evidence(fetch("arrival", cli._ATTR_ARRIVAL_COLS, cli._ATTR_WHERE, params),
+                     receivers)
 
     tx = [t for t in fetch("transmitter", where="WHERE source IN ('hfrnet', 'giro') "
                                                 "AND kind != 'hfdl'")
@@ -156,6 +153,18 @@ def read_inputs(client, rules):
                          if "attribution" in have else []),
         "priors": _prior_sites(tx, wf),
     }
+
+
+def t6_evidence(arrivals, receivers):
+    """T6 arrival rows (cli._ATTR_WHERE, cli._ATTR_ARRIVAL_COLS) made ready to count: each
+    marked live, counted at its radiod (cli._carried, against the latest receiver row per
+    reporter), and its delay counted from the sweep start.  The chirp-state job and the
+    publisher's channel menu both read T6 evidence through here."""
+    t6 = [_naive_row(r) for r in arrivals]
+    for r in t6:
+        r["live"] = "sweep_repetition_hz" in (r.get("engineering") or {})
+    t6, _dropped = cli._carried(t6, cli._latest(receivers, "reporter_id"))
+    return to_sweep_start(t6, ACTOR)
 
 
 def latest_log_rows(log_rows, people=None):

@@ -29,7 +29,7 @@ from sigmondb import chirp_evidence as ce
 from sigmondb.attribution import gc_km
 from sigmondb.chirp import matches
 from sigmondb.paths import path_kind
-from sigmondb.publish import latlon_to_grid6
+from sigmondb.publish import latlon_to_grid4, latlon_to_grid6
 from sigmondb.receivers import grid_to_latlon
 
 LIVE_STATES = ("candidate", "probing", "established", "dormant")
@@ -68,7 +68,7 @@ def chirp_position(c):
         return None
     if _named(c):
         return (c["lat"], c["lon"])
-    return grid_to_latlon(latlon_to_grid6(c["lat"], c["lon"])[:4])
+    return grid_to_latlon(latlon_to_grid4(c["lat"], c["lon"]))
 
 
 def _hfdl(c):
@@ -195,6 +195,22 @@ def prepare_hearing(chirps, sweep_rows, rules, now, *, positions=None, coherence
                                                              caps[i]["rate_hz_per_s"], sig),
                                            rules)})
     return h
+
+
+def fleet_hearing(chirps, sweep_rows, captures, t6_arrivals, receivers, rules, now):
+    """(Hearing, T6 stations) for menus run at `now` (naive UTC): the one gathering the menu
+    verb and the publisher share.  T6 stations: the reporters with a T6 arrival in the last
+    menu.t6_recent_days days; only those arrivals reach prepare_hearing.  receivers: the
+    latest receiver row per reporter; their positions are snapped to grid6 centres in
+    prepare_hearing, and their coherence groups judge independence."""
+    recent = now - timedelta(days=rules.menu.t6_recent_days)
+    t6 = [r for r in t6_arrivals or () if r["time"] >= recent]
+    positions = {r["reporter_id"]: (r["lat"], r["lon"]) for r in receivers
+                 if r.get("lat") is not None and r.get("lon") is not None}
+    coherence = {r["reporter_id"]: r.get("coherence_group") or "" for r in receivers}
+    hearing = prepare_hearing(chirps, sweep_rows or [], rules, now, positions=positions,
+                              coherence=coherence, captures=captures or [], t6_arrivals=t6)
+    return hearing, {r["reporter_id"] for r in t6}
 
 
 def _clamp(x, lo=0.0, hi=1.0):

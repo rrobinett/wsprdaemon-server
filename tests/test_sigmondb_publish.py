@@ -3,6 +3,7 @@ public host.  No ClickHouse: a fake source client stands for wd30's sigmondb, an
 urlopen stands for each public server's HTTP interface."""
 import base64
 import json
+import math
 import os
 import re
 import sys
@@ -33,12 +34,14 @@ class FakeSource:
     def __init__(self, **tables):
         self.tables = tables
         self.sql = []
+        self.params = []
 
     def query(self, sql, parameters=None, query_tz=None):
         self.sql.append(sql)
+        self.params.append(parameters)
         m = re.match(r"\s*/\* agg:(\w+) \*/", sql)
         if m:
-            cols = publish.AGG_QUERIES[m.group(1)][0]
+            cols = dict(publish.AGG_QUERIES, **publish.CHIRP_AGG_QUERIES)[m.group(1)][0]
             return _Result([tuple(r.get(c) for c in cols)
                             for r in self.tables.get("agg:" + m.group(1), [])])
         m = re.match(r"\s*SELECT (.+?) FROM sigmondb\.(\w+) FINAL", sql)
@@ -410,7 +413,7 @@ def test_ionosphere_nulls_stay_null():
 
 
 def test_ionosphere_schema_and_table_order():
-    assert publish.TABLES[-1] == "ionosphere_hourly"
+    assert publish.TABLES[7] == "ionosphere_hourly"
     assert ("midpoints", "Array(Tuple(Float64, Float64))") in publish.SCHEMAS["ionosphere_hourly"]
     assert "agg:ionosphere" in publish.AGG_QUERIES["ionosphere"][1] or \
         publish.AGG_QUERIES["ionosphere"][1].startswith("/* agg:ionosphere */")
@@ -424,7 +427,7 @@ def test_build_all_reads_final_and_t3_calibration_is_empty():
     tables = publish.build_all(publish.read_source(src), BUILT)
     assert list(tables) == list(publish.TABLES)
     assert tables["t3_calibration"] == []
-    assert [len(tables[t]) for t in publish.TABLES] == [1, 1, 1, 1, 0, 0, 0, 0]
+    assert [len(tables[t]) for t in publish.TABLES] == [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
     assert all(" FINAL" in s for s in src.sql if not s.startswith("/* agg:"))
     for t in publish.TABLES:
         for r in tables[t]:
@@ -451,7 +454,8 @@ def _core_tables():
 
 
 def _tables():
-    return dict(_core_tables(), groups=[], heard=[], ionosphere_hourly=[])
+    return dict(_core_tables(), groups=[], heard=[], ionosphere_hourly=[], chirps=[],
+                chirp_reject_local=[], chirp_menu=[])
 
 
 def test_first_run_creates_then_renames():
@@ -716,6 +720,7 @@ def test_publish_creates_new_tables():
 # --- the map must not stop the core tables -------------------------------------------------
 
 CORE = ("transmitter_offsets", "trust", "receivers", "transmitters", "t3_calibration")
+CHIRP = {"chirps", "chirp_reject_local", "chirp_menu"}
 
 
 class _AggFails(FakeSource):
@@ -742,13 +747,13 @@ def test_failing_aggregate_read_still_yields_core_tables():
     assert "agg:heard" not in source and "agg:ionosphere" not in source
     assert len(logs) == 2 and "agg:heard" in logs[0] and "RuntimeError" in logs[0]
     tables = publish.build_all(source, BUILT, out=logs.append)
-    assert set(tables) == set(CORE)
+    assert set(tables) == set(CORE) | CHIRP
 
 
 def test_one_failing_aggregate_leaves_only_its_tables_out():
     src = _core_src(_AggFails, ("ionosphere",))
     tables = publish.build_all(publish.read_source(src, out=lambda s: None), BUILT)
-    assert set(tables) == set(CORE) | {"groups", "heard"}
+    assert set(tables) == set(CORE) | {"groups", "heard"} | CHIRP
 
 
 def test_a_failing_builder_leaves_only_its_tables_out(monkeypatch):
@@ -758,12 +763,12 @@ def test_a_failing_builder_leaves_only_its_tables_out(monkeypatch):
     logs = []
     monkeypatch.setattr(publish, "build_groups_heard", boom)
     t = publish.build_all(source, BUILT, out=logs.append)
-    assert set(t) == set(CORE) | {"ionosphere_hourly"}
+    assert set(t) == set(CORE) | {"ionosphere_hourly"} | CHIRP
     assert len(logs) == 1 and "groups/heard" in logs[0] and "ValueError: odd row" in logs[0]
     monkeypatch.undo()
     monkeypatch.setattr(publish, "build_ionosphere", boom)
     t = publish.build_all(source, BUILT, out=lambda s: None)
-    assert set(t) == set(CORE) | {"groups", "heard"}
+    assert set(t) == set(CORE) | {"groups", "heard"} | CHIRP
 
 
 def test_publish_skips_absent_tables_and_leaves_their_copy():
@@ -780,3 +785,211 @@ def test_publish_skips_absent_tables_and_leaves_their_copy():
 def test_agg_queries_read_final():
     for name, (cols, sql) in publish.AGG_QUERIES.items():
         assert "FROM sigmondb.arrival FINAL WHERE" in sql
+
+
+# --- chirps, local rejects and the channel menu ----------------------------------------------
+
+from sigmondb import chirp as chirp_rules  # noqa: E402
+from sigmondb.receivers import grid_pos_sigma_m, grid_to_latlon  # noqa: E402
+
+CHIRP_TABLES = ("chirps", "chirp_reject_local", "chirp_menu")
+
+
+def _chirp(cid, state="established", tx_id="", lat=None, lon=None, centre=4_450_500.0,
+           rate=-25_730.0, **kw):
+    r = dict(chirp_id=cid, group_key="%.4f %+.2f" % (centre / 1e6, rate / 1e3), kind="codar",
+             state=state, centre_hz=centre, span_hz=25_730.0, rate_hz_per_s=rate,
+             period_s=1.0, duration_s=1.0, gate_period_s=None, lat=lat, lon=lon,
+             pos_sigma_m=500.0, pos_source="locate", offset_ns=None, offset_sigma_ns=None,
+             last_heard=datetime(2026, 11, 12, 3), n_stations=2, heard_hours=0,
+             tx_id=tx_id, updated_at=datetime(2026, 11, 12, 4))
+    r.update(kw)
+    return r
+
+
+def _chirp_src(chirps=(), rejects=(), receivers=(), **kw):
+    return FakeSource(solution=kw.pop("solution", []), transmitter=kw.pop("transmitter", []),
+                      receiver=list(receivers), chirp=list(chirps),
+                      chirp_reject_local=list(rejects), **kw)
+
+
+def _built(src):
+    return publish.build_all(publish.read_source(src, out=lambda s: None), BUILT,
+                             out=lambda s: None)
+
+
+def test_chirps_only_established_and_dormant():
+    states = ("seen", "candidate", "probing", "established", "dormant", "retired",
+              "rejected", "dropped")
+    src = _chirp_src([_chirp("c-%s" % s, state=s, lat=30.25, lon=-80.5) for s in states])
+    rows = _built(src)["chirps"]
+    assert sorted(r["state"] for r in rows) == ["dormant", "established"]
+    assert set(rows[0]) == {c for c, _ in publish.SCHEMAS["chirps"]}
+
+
+def test_chirps_offset_sign_matches_transmitter_offsets():
+    sol = _sol("hfrnet:LATE", _utc(2026, 11, 12, 3), 2_500_000)
+    src = _chirp_src([_chirp("c1", tx_id="hfrnet:LATE", lat=30.25, lon=-80.5,
+                             offset_ns=2_500_000, offset_sigma_ns=100_000.0)],
+                     solution=[sol], transmitter=[_tx("hfrnet:LATE")])
+    t = publish.build_all(publish.read_source(src, out=lambda s: None),
+                          _utc(2026, 11, 12, 4).timestamp(), out=lambda s: None)
+    assert t["transmitter_offsets"][0]["offset_ms"] == pytest.approx(2.5)
+    assert t["chirps"][0]["offset_ms"] == t["transmitter_offsets"][0]["offset_ms"]
+    assert t["chirps"][0]["sigma_ms"] == pytest.approx(0.1)
+
+
+def test_reject_local_active_only():
+    rej = dict(reporter_id="W1XYZ", centre_hz=4_450_500.0, rate_hz_per_s=-25_730.0,
+               period_s=1.0, span_hz=25_730.0, chirp_id="c1", reason="local QRM",
+               set_by="someone", set_at=datetime(2026, 11, 10))
+    src = _chirp_src(rejects=[dict(rej, active=1),
+                              dict(rej, reporter_id="K0ABC", active=0)])
+    rows = _built(src)["chirp_reject_local"]
+    assert rows == [dict(reporter_id="W1XYZ", centre_mhz=pytest.approx(4.4505),
+                         rate_khz_s=pytest.approx(-25.73), period_s=1.0,
+                         span_khz=pytest.approx(25.73), chirp_id="c1", reason="local QRM",
+                         built_at_utc=BUILT)]
+    assert "set_by" not in {c for c, _ in publish.SCHEMAS["chirp_reject_local"]}
+
+
+GRID = "FN20kk"   # a made-up site: tests use grid centres only
+
+
+def _menu_rows(rows, rid):
+    return sorted(({k: v for k, v in r.items() if k != "reporter_id"}
+                   for r in rows if r["reporter_id"] == rid),
+                  key=lambda r: (r["hour_utc"], r["channel_key"]))
+
+
+def test_menu_from_grid_centre_only():
+    lat, lon = grid_to_latlon(GRID)
+    off = lon + 3.0 / (111.32 * math.cos(math.radians(lat)))   # 3 km east, same grid6
+    assert publish.latlon_to_grid6(lat, off) == GRID
+    chirps = [_chirp("c1", lat=40.5, lon=-73.0), _chirp("c2", state="candidate",
+                                                        centre=13_450_000.0, rate=-50_000.0)]
+    sweep = [dict(reporter_id="W1XYZ", centre_hz=4_450_500.0, rate_hz_per_s=-25_730.0,
+                  period_s=1.0, span_hz=25_730.0, duration_s=1.0, clipped=0,
+                  hour=datetime(2026, 11, 12, 3), n=10, snr_med=12.0, n_dwells=10)]
+    at_centre = _built(_chirp_src(chirps, receivers=[_rx("W1XYZ", lat=lat, lon=lon)],
+                                  **{"agg:sweep_hourly": sweep}))["chirp_menu"]
+    stored = _built(_chirp_src(chirps, receivers=[_rx("W1XYZ", lat=lat, lon=off)],
+                               **{"agg:sweep_hourly": sweep}))["chirp_menu"]
+    assert at_centre and _menu_rows(at_centre, "W1XYZ") == _menu_rows(stored, "W1XYZ")
+    assert {r["hour_utc"] for r in at_centre} == set(range(24))
+    assert set(at_centre[0]) == {c for c, _ in publish.SCHEMAS["chirp_menu"]}
+
+
+def test_no_station_coordinate_published():
+    for t in CHIRP_TABLES:
+        assert t in publish.TABLES
+        cols = {c for c, _ in publish.SCHEMAS[t]}
+        bad = cols & {"lat", "lon", "distance_km"}
+        assert bad == ({"lat", "lon"} if t == "chirps" else set()), t
+
+
+def test_chirp_tables_optional(monkeypatch):
+    def boom(*a, **k):
+        raise ValueError("odd chirp")
+    src = _chirp_src([_chirp("c1", lat=30.25, lon=-80.5)], receivers=[_rx("W1XYZ")],
+                     solution=[_sol("hfrnet:A", _utc(2026, 11, 12), 1_000_000)],
+                     transmitter=[_tx("hfrnet:A")])
+    source = publish.read_source(src, out=lambda s: None)
+    logs = []
+    monkeypatch.setattr(publish, "build_chirps", boom)
+    t = publish.build_all(source, _utc(2026, 11, 12, 1).timestamp(), out=logs.append)
+    assert "chirps" not in t and len(t["transmitter_offsets"]) == 1
+    assert "chirp_reject_local" in t and "chirp_menu" in t
+    assert any("chirps" in s and "ValueError: odd chirp" in s for s in logs)
+    monkeypatch.undo()
+    monkeypatch.setattr(publish, "build_chirp_menu", boom)
+    t = publish.build_all(source, BUILT, out=lambda s: None)
+    assert "chirp_menu" not in t and "chirps" in t
+
+
+def test_chirp_source_read_failing_leaves_only_chirp_tables_out():
+    class _ChirpFails(FakeSource):
+        def query(self, sql, parameters=None, query_tz=None):
+            if "FROM sigmondb.chirp FINAL" in sql:
+                raise RuntimeError("no such table")
+            return super().query(sql, parameters, query_tz)
+    logs = []
+    source = publish.read_source(_core_src(_ChirpFails), out=logs.append)
+    t = publish.build_all(source, BUILT, out=logs.append)
+    assert set(t) == set(CORE) | {"groups", "heard", "ionosphere_hourly",
+                                  "chirp_reject_local"}
+    assert any("chirp" in s and "RuntimeError" in s for s in logs)
+
+
+def test_chirp_aggregates_take_the_rules_hours():
+    src = _chirp_src()
+    publish.read_source(src, out=lambda s: None)
+    want = __import__("sigmondb.chirp_evidence", fromlist=["x"]).agg_params(
+        chirp_rules.load_rules())
+    for name in publish.CHIRP_AGG_QUERIES:
+        sql = [s for s in src.sql if s.startswith("/* agg:%s */" % name)]
+        assert sql and "{hours:UInt32}" in sql[0]
+    assert src.params[[i for i, s in enumerate(src.sql)
+                       if s.startswith("/* agg:sweep_hourly */")][0]] == want
+
+
+def test_menu_rows_bounded():
+    rules = chirp_rules.load_rules()
+    assert rules.menu.top_n == 20
+    chirps = [_chirp("c%02d" % i, state=("established", "candidate")[i % 2],
+                     centre=3_000_000.0 + i * 100_000.0, lat=30.0 + i * 0.1, lon=-80.0)
+              for i in range(60)]
+    rxs = [_rx("W1XYZ", *grid_to_latlon("FN20kk")), _rx("K0ABC", *grid_to_latlon("EM29qa"))]
+    rows = _built(_chirp_src(chirps, receivers=rxs))["chirp_menu"]
+    assert len(rows) <= 2 * 24 * 40
+    per = {}
+    for r in rows:
+        per[(r["reporter_id"], r["hour_utc"])] = per.get((r["reporter_id"], r["hour_utc"]), 0) + 1
+    assert len(per) == 48 and max(per.values()) <= 40 and min(per.values()) > 20
+
+
+def test_unnamed_chirp_position_grid4_only():
+    assert publish.latlon_to_grid4(38.123, -123.456) == "CM88"
+    src = _chirp_src(
+        [_chirp("c-cand", tx_id="cand:c-cand", lat=38.123, lon=-123.456, pos_sigma_m=800.0),
+         _chirp("c-named", tx_id="hfrnet:PREY", lat=38.123, lon=-123.456, pos_sigma_m=800.0,
+                centre=13_450_000.0)],
+        transmitter=[_tx("cand:c-cand", kind="unknown", source="discovered",
+                         lat=38.123, lon=-123.456, pos_sigma_m=800.0),
+                     _tx("hfrnet:PREY", source="hfrnet", lat=38.123, lon=-123.456)])
+    t = _built(src)
+    by = {r["chirp_id"]: r for r in t["chirps"]}
+    cand, named = by["c-cand"], by["c-named"]
+    assert (cand["lat"], cand["lon"]) == (pytest.approx(38.5), pytest.approx(-123.0))
+    assert cand["pos_precision"] == "grid4"
+    assert cand["pos_sigma_m"] >= grid_pos_sigma_m("CM88") > 800.0
+    assert (named["lat"], named["lon"]) == (38.123, -123.456)
+    assert named["pos_precision"] == "full" and named["pos_sigma_m"] == 800.0
+    tx = {r["tx_id"]: r for r in t["transmitters"]}
+    assert (tx["cand:c-cand"]["lat"], tx["cand:c-cand"]["lon"]) == (pytest.approx(38.5),
+                                                                    pytest.approx(-123.0))
+    assert tx["cand:c-cand"]["pos_sigma_m"] >= grid_pos_sigma_m("CM88")
+    assert (tx["hfrnet:PREY"]["lat"], tx["hfrnet:PREY"]["lon"]) == (38.123, -123.456)
+
+
+def test_heard_places_a_discovered_transmitter_at_its_grid4_centre():
+    """heard.distance_km from several grid6 centres would locate a discovered transmitter as
+    well as its position: it too counts from the grid4 centre."""
+    rx = _rx("W1XYZ", *grid_to_latlon("CM87xx"))
+    src = _src([_heard_row(reporter="W1XYZ", tx_id="cand:c-cand")], [rx],
+               transmitter=[_tx("cand:c-cand", kind="unknown", source="discovered",
+                                lat=38.123, lon=-123.456)])
+    h = publish.build_all(src, BUILT, out=lambda s: None)["heard"][0]
+    st = grid_to_latlon("CM87xx")
+    assert h["distance_km"] == pytest.approx(
+        publish.great_circle_m(st[0], st[1], 38.5, -123.0) / 1000.0)
+
+
+def test_chirp_queries_keep_hfdl_out():
+    src = _chirp_src([_chirp("h1", kind="hfdl", lat=30.0, lon=-80.0),
+                      _chirp("h2", tx_id="hfdl:13", lat=30.0, lon=-80.0)])
+    assert _built(src)["chirps"] == []
+    chirp_sql = [s for s in src.sql if "FROM sigmondb.chirp FINAL" in s][0]
+    assert "kind != 'hfdl'" in chirp_sql and "'hfdl:%'" in chirp_sql
+    t6 = publish.CHIRP_AGG_QUERIES["t6_arrival"][1]
+    assert "startsWith(group_key, 'hfdl')" in t6 and "origin = 't6_anchor'" in t6

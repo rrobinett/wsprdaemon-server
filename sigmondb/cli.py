@@ -797,20 +797,12 @@ def cmd_menu(a):
                      "chirp_id"):
         st = states.get(c["chirp_id"])
         chirps.append(dict(c, state=st[0] if st else c["state"]))
-    recent = now - timedelta(days=rules.menu.t6_recent_days)
-    t6 = [r for r in inp["t6"] if r["time"] >= recent]
-    rx = _latest(inp["receivers"], "reporter_id")
-    positions = {r["reporter_id"]: (r["lat"], r["lon"]) for r in rx
-                 if r.get("lat") is not None and r.get("lon") is not None}
-    coherence = {r["reporter_id"]: r.get("coherence_group") or "" for r in rx}
-    hearing = chirp_menu.prepare_hearing(
-        chirps, inp["aggs"].get("sweep_hourly") or [], rules, now, positions=positions,
-        coherence=coherence, captures=inp["aggs"].get("capture_recent") or [],
-        t6_arrivals=t6)
+    hearing, t6_stations = chirp_menu.fleet_hearing(
+        chirps, inp["aggs"].get("sweep_hourly"), inp["aggs"].get("capture_recent"),
+        inp["t6"], _latest(inp["receivers"], "reporter_id"), rules, now)
     lat, lon = grid_to_latlon(a.grid)
     rows = chirp_menu.channel_menu(dict(reporter_id=None, lat=lat, lon=lon, is_t6=a.t6),
-                                   a.hour, chirps, hearing, {r["reporter_id"] for r in t6},
-                                   rules)
+                                   a.hour, chirps, hearing, t6_stations, rules)
     print("menu %s %02dZ%s  rules %s" % (a.grid, a.hour, "  (T6 station)" if a.t6 else "",
                                          rules.rules_version))
     if hearing.unparsed_t6:

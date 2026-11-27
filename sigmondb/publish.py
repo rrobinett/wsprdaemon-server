@@ -1,6 +1,6 @@
-"""Build the five sigmondb_public tables and replace each one WHOLE on every public host.
+"""Build the sigmondb_public tables and replace each one WHOLE on every public host.
 
-wd30 runs this hourly (sigmondb-publish.timer).  It reads wd30's own sigmondb, builds five
+wd30 runs this hourly (sigmondb-publish.timer).  It reads wd30's own sigmondb, builds the
 small tables, and swaps each into sigmondb_public on WD10 and WD20, where stations read them
 anonymously.  A station never sees half an update: each table is built under <t>__new and
 then exchanged with <t> in one step.  hf-timestd's T3 Phase B consumes them
@@ -39,7 +39,26 @@ receivers: PRIVACY.  Stations sit at operators' homes.  Position goes out only a
   6-character Maidenhead square and that square's centre, never the stored lat/lon.
   A receiver with no position is left out.
 
-transmitters: the latest version per tx_id, at full precision (public infrastructure).
+transmitters: the latest version per tx_id, at full precision (public infrastructure),
+  except a row the chirp-state job discovered (source = 'discovered'): its position goes out
+  only as the centre of its 4-character grid square, as for an unnamed chirp, so this table
+  cannot leak what chirps hides.  groups, heard and ionosphere_hourly place such a
+  transmitter at that same centre.
+
+chirps: the established and dormant chirps, never HFDL.  A named chirp (tx_id present and not
+  starting "cand:") publishes its position at full precision, pos_precision "full".  An
+  unnamed one publishes the centre of its 4-character grid square, pos_precision "grid4", and
+  a pos_sigma_m no smaller than that square's half-diagonal.  offset_ms keeps the sign of
+  transmitter_offsets: emission minus UTC.
+
+chirp_reject_local: the active local rejects; who set one stays on wd30.
+
+chirp_menu: each receiver's channel menu (chirp_menu.channel_menu) for every UTC hour 0-23,
+  built from the receiver's grid6 centre, never its stored position.  The rows carry no
+  position and no distance.
+
+The three chirp tables build through _optional: a failure leaves the public hosts' last copy
+in place and never stops the core tables.
 
 t3_calibration: no source yet; published EMPTY with its schema so clients see a valid table.
 
@@ -55,15 +74,17 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
+from sigmondb import chirp_evidence as ce
+from sigmondb.cli import _ATTR_ARRIVAL_COLS, _ATTR_WHERE
 from sigmondb.groundwave import _latest, great_circle_m
 from sigmondb.half_sweep import period_and_sweep
 from sigmondb.paths import gc_midpoint, match_group, path_kind
-from sigmondb.receivers import grid_to_latlon
+from sigmondb.receivers import grid_pos_sigma_m, grid_to_latlon
 from sigmondb.set_aside import not_set_aside, solution_not_set_aside
 
 DATABASE = "sigmondb_public"
 TABLES = ("transmitter_offsets", "trust", "receivers", "transmitters", "groups", "heard",
-          "t3_calibration", "ionosphere_hourly")
+          "t3_calibration", "ionosphere_hourly", "chirps", "chirp_reject_local", "chirp_menu")
 NF64 = "Nullable(Float64)"
 SCHEMAS = {
     "transmitter_offsets": [
@@ -103,6 +124,26 @@ SCHEMAS = {
         ("doppler_med", NF64), ("doppler_iqr", NF64), ("s4_med", NF64), ("s4_iqr", NF64),
         ("sphi_med", NF64), ("sphi_iqr", NF64), ("level_med", NF64), ("level_iqr", NF64),
         ("built_at_utc", "Float64")],
+    "chirps": [
+        ("chirp_id", "String"), ("group_key", "String"), ("kind", "String"),
+        ("class", "String"), ("family", "String"), ("state", "String"),
+        ("centre_mhz", "Float64"), ("span_khz", NF64), ("rate_khz_s", "Float64"),
+        ("period_s", NF64), ("duration_s", NF64), ("lat", NF64), ("lon", NF64),
+        ("pos_sigma_m", NF64), ("pos_source", "String"), ("pos_precision", "String"),
+        ("offset_ms", NF64), ("sigma_ms", NF64), ("last_heard_utc", NF64),
+        ("n_stations", "UInt16"), ("heard_hours", "UInt32"), ("tx_id", "String"),
+        ("built_at_utc", "Float64")],
+    "chirp_reject_local": [
+        ("reporter_id", "String"), ("centre_mhz", "Float64"), ("rate_khz_s", "Float64"),
+        ("period_s", "Float64"), ("span_khz", NF64), ("chirp_id", "String"),
+        ("reason", "String"), ("built_at_utc", "Float64")],
+    "chirp_menu": [
+        ("reporter_id", "String"), ("hour_utc", "UInt8"), ("channel_key", "String"),
+        ("centre_mhz", "Float64"), ("rate_khz_s", "Float64"), ("period_s", NF64),
+        ("chirp_ids", "Array(String)"), ("states", "Array(String)"),
+        ("timing_value", "Float64"), ("exploration_value", "Float64"), ("cost", "Float64"),
+        ("shared_t6", "UInt16"), ("expected_snr_db", NF64), ("path", "Nullable(String)"),
+        ("rank_timing", "UInt16"), ("rank_explore", "UInt16"), ("built_at_utc", "Float64")],
 }
 
 # What read_source() takes from wd30's sigmondb, each table read FINAL.
@@ -110,14 +151,27 @@ SOURCE_COLUMNS = {
     "solution": ("tx_id", "solve_id", "window_to", "offset_ns", "offset_sigma_ns",
                  "n_stations", "reporter_ids", "cluster_key"),
     "transmitter": ("tx_id", "kind", "network", "name", "status", "lat", "lon",
-                    "pos_sigma_m", "valid_from", "version"),
-    "receiver": ("reporter_id", "lat", "lon", "a_level", "valid_from", "version"),
+                    "pos_sigma_m", "source", "valid_from", "version"),
+    "receiver": ("reporter_id", "lat", "lon", "a_level", "radiod_id", "coherence_group",
+                 "valid_from", "version"),
     "waveform": ("tx_id", "centre_hz", "rate_hz_per_s", "valid_from"),
+    "chirp": ("chirp_id", "group_key", "kind", "state", "centre_hz", "span_hz",
+              "rate_hz_per_s", "period_s", "duration_s", "gate_period_s", "lat", "lon",
+              "pos_sigma_m", "pos_source", "offset_ns", "offset_sigma_ns", "last_heard",
+              "n_stations", "heard_hours", "tx_id"),
+    "chirp_reject_local": ("reporter_id", "centre_hz", "rate_hz_per_s", "period_s", "span_hz",
+                           "chirp_id", "reason", "active"),
 }
+# A failed read of one of these leaves only the chirp tables out of the run.
+OPTIONAL_SOURCES = ("chirp", "chirp_reject_local")
 # A solution any of whose reporters holds an active 'codar' or 'all' set-aside window over the
 # solution's span never reaches transmitter_offsets (sigmondb/set_aside.py).
 SOURCE_WHERE = {"solution": "WHERE offset_ns IS NOT NULL AND tx_id != '' AND "
-                            + solution_not_set_aside("codar")}
+                            + solution_not_set_aside("codar"),
+                "chirp": "WHERE state IN ('candidate', 'probing', 'established', 'dormant') "
+                         "AND kind != 'hfdl' AND NOT startsWith(group_key, 'hfdl') "
+                         "AND tx_id NOT LIKE 'hfdl:%'",
+                "chirp_reject_local": "WHERE active = 1"}
 
 # Aggregates read_source runs on wd30: name -> (columns, SQL).  HFDL stays out of every one,
 # and so does every arrival inside an active 'codar' or 'all' set-aside window.
@@ -147,6 +201,19 @@ AGG_QUERIES = {
         "quantilesIf(0.25, 0.5, 0.75)(level_db, isNotNull(level_db)) AS lq "
         "FROM sigmondb.arrival FINAL WHERE time > now() - INTERVAL 24 HOUR AND " + _CODAR_KEPT +
         " GROUP BY reporter_id, tx_id, group_key, hour"),
+}
+
+# The channel menu's aggregates, read in the same loop with chirp_evidence.agg_params(rules)
+# as their {hours:UInt32}: the sweep and capture aggregates the chirp-state job reads, and the
+# T6 arrivals it reads (cli._ATTR_WHERE), HFDL kept out.
+CHIRP_AGG_QUERIES = {
+    "sweep_hourly": ce.AGG_SQL["sweep_hourly"],
+    "capture_recent": ce.AGG_SQL["capture_recent"],
+    "t6_arrival": (
+        _ATTR_ARRIVAL_COLS,
+        "/* agg:t6_arrival */ SELECT %s FROM sigmondb.arrival FINAL %s AND "
+        "NOT startsWith(group_key, 'hfdl') AND tx_id NOT LIKE 'hfdl:%%'"
+        % (", ".join(_ATTR_ARRIVAL_COLS), _ATTR_WHERE)),
 }
 
 
@@ -183,6 +250,24 @@ def latlon_to_grid6(lat, lon):
     sx, sy = int((x % 20) // 2), int(y % 10)
     ux, uy = int((x % 2) * 12), int((y % 1) * 24)
     return "%s%s%d%d%s%s" % (chr(65 + fx), chr(65 + fy), sx, sy, chr(97 + ux), chr(97 + uy))
+
+
+def latlon_to_grid4(lat, lon):
+    """The 4-character Maidenhead square holding (lat, lon)."""
+    return latlon_to_grid6(lat, lon)[:4]
+
+
+def named(tx_id):
+    """A chirp or transmitter is named when its tx_id exists and does not start "cand:"."""
+    return bool(tx_id) and not str(tx_id).startswith("cand:")
+
+
+def grid4_position(lat, lon, pos_sigma_m):
+    """(lat, lon, pos_sigma_m) as an unnamed position leaves wd30: the centre of its grid4
+    square, and a sigma no smaller than that square's half-diagonal at its centre latitude."""
+    g = latlon_to_grid4(lat, lon)
+    clat, clon = grid_to_latlon(g)
+    return clat, clon, max(float(pos_sigma_m or 0.0), grid_pos_sigma_m(g))
 
 
 # --- builders -----------------------------------------------------------------------------
@@ -264,18 +349,27 @@ def _latest_waveforms(waveforms):
     return latest_wf
 
 
+def public_position(t):
+    """A transmitter row's (lat, lon, pos_sigma_m) as published: a discovered row's at its
+    grid4 centre (grid4_position), any other at full precision."""
+    lat, lon, sig = t.get("lat"), t.get("lon"), t.get("pos_sigma_m")
+    if t.get("source") == "discovered" and lat is not None and lon is not None:
+        return grid4_position(lat, lon, sig)
+    return lat, lon, sig
+
+
 def build_transmitters(transmitters, built_at, waveforms=()):
     latest_wf = _latest_waveforms(waveforms)
     out = []
     for tx_id, t in sorted(_latest(transmitters or [], "tx_id").items()):
-        sig = t.get("pos_sigma_m")
+        lat, lon, sig = public_position(t)
         kind = t.get("kind") or ""
         cls, family = class_family(kind, t.get("network") or "")
         wf = latest_wf.get(tx_id) or {}
         centre, rate = wf.get("centre_hz"), wf.get("rate_hz_per_s")
         out.append({"tx_id": tx_id, "kind": kind, "network": t.get("network") or "",
                     "name": t.get("name") or "", "status": t.get("status") or "",
-                    "lat": t.get("lat"), "lon": t.get("lon"),
+                    "lat": lat, "lon": lon,
                     "pos_sigma_m": None if sig is None else float(sig),
                     "class": cls, "family": family,
                     "centre_mhz": None if centre is None else float(centre) / 1e6,
@@ -295,7 +389,10 @@ def build_index(source):
         if r.get("lat") is None or r.get("lon") is None:
             continue
         stations[rid] = grid_to_latlon(latlon_to_grid6(r["lat"], r["lon"]))
-    txs = _latest(source.get("transmitter") or [], "tx_id")
+    txs = {}
+    for tx_id, t in _latest(source.get("transmitter") or [], "tx_id").items():
+        lat, lon, _sig = public_position(t)
+        txs[tx_id] = dict(t, lat=lat, lon=lon)
     wfs = _latest_waveforms(source.get("waveform"))
     codar = []
     for tx_id, t in sorted(txs.items()):
@@ -418,6 +515,105 @@ def build_ionosphere(source, built_at, out=print):
     return [rows[k] for k in sorted(rows)]
 
 
+CHIRP_PUBLISHED_STATES = ("established", "dormant")
+
+
+def _hfdl_chirp(c):
+    return (c.get("kind") == "hfdl" or str(c.get("group_key") or "").startswith("hfdl")
+            or str(c.get("tx_id") or "").startswith("hfdl:"))
+
+
+def _scaled(v, k):
+    return None if v is None else float(v) / k
+
+
+def build_chirps(chirps, built_at):
+    """chirps rows: established and dormant chirps, never HFDL, by chirp_id."""
+    out = []
+    for c in sorted(chirps or (), key=lambda c: c["chirp_id"]):
+        if c.get("state") not in CHIRP_PUBLISHED_STATES or _hfdl_chirp(c):
+            continue
+        kind = c.get("kind") or ""
+        cls, family = class_family(kind, "")
+        lat, lon, sig = c.get("lat"), c.get("lon"), c.get("pos_sigma_m")
+        if named(c.get("tx_id")):
+            precision = "full"
+        else:
+            precision = "grid4"
+            if lat is not None and lon is not None:
+                lat, lon, sig = grid4_position(lat, lon, sig)
+            else:
+                lat = lon = None
+        off = c.get("offset_ns")
+        last = c.get("last_heard")
+        out.append({
+            "chirp_id": c["chirp_id"], "group_key": c.get("group_key") or "", "kind": kind,
+            "class": cls, "family": family, "state": c["state"],
+            "centre_mhz": float(c["centre_hz"]) / 1e6, "span_khz": _scaled(c.get("span_hz"), 1e3),
+            "rate_khz_s": float(c["rate_hz_per_s"]) / 1e3, "period_s": c.get("period_s"),
+            "duration_s": c.get("duration_s"), "lat": lat, "lon": lon,
+            "pos_sigma_m": None if sig is None else float(sig),
+            "pos_source": c.get("pos_source") or "", "pos_precision": precision,
+            "offset_ms": None if off is None else emission_minus_utc_ms(off),
+            "sigma_ms": _scaled(c.get("offset_sigma_ns"), 1e6),
+            "last_heard_utc": None if last is None else _unix(last),
+            "n_stations": int(c.get("n_stations") or 0),
+            "heard_hours": int(c.get("heard_hours") or 0),
+            "tx_id": c.get("tx_id") or "", "built_at_utc": built_at})
+    return out
+
+
+def build_chirp_reject_local(rejects, built_at):
+    """chirp_reject_local rows: the active rejects; who set one is not published."""
+    out = []
+    for r in rejects or ():
+        if not r.get("active", 1):
+            continue
+        out.append({"reporter_id": r["reporter_id"],
+                    "centre_mhz": float(r["centre_hz"]) / 1e6,
+                    "rate_khz_s": float(r["rate_hz_per_s"]) / 1e3,
+                    "period_s": float(r["period_s"]), "span_khz": _scaled(r.get("span_hz"), 1e3),
+                    "chirp_id": r.get("chirp_id") or "", "reason": r.get("reason") or "",
+                    "built_at_utc": built_at})
+    return sorted(out, key=lambda r: (r["reporter_id"], r["centre_mhz"], r["rate_khz_s"],
+                                      r["period_s"]))
+
+
+def build_chirp_menu(source, built_at, out=print):
+    """chirp_menu rows: each published receiver's menu (build_receivers: its grid6 centre) for
+    UTC hours 0-23.  One Hearing per run, gathered as the menu verb gathers it."""
+    from sigmondb import chirp, chirp_job, chirp_menu
+    rules = chirp.load_rules()
+    now = datetime.fromtimestamp(built_at, timezone.utc).replace(tzinfo=None)
+    naive = chirp_job._naive_row
+    chirps = [naive(c) for c in source.get("chirp") or ()]
+    rx = list(_latest(source.get("receiver") or [], "reporter_id").values())
+    hearing, t6_stations = chirp_menu.fleet_hearing(
+        chirps, [naive(r) for r in source.get("agg:sweep_hourly") or ()],
+        [naive(r) for r in source.get("agg:capture_recent") or ()],
+        chirp_job.t6_evidence(source.get("agg:t6_arrival") or (), rx), rx, rules, now)
+    if hearing.unparsed_t6:
+        out("chirp_menu: %d T6 arrival(s) with a group_key that did not parse count for no "
+            "chirp" % hearing.unparsed_t6)
+    rows = []
+    for st in build_receivers(source.get("receiver"), built_at):
+        rid = st["reporter_id"]
+        station = dict(reporter_id=rid, lat=st["lat"], lon=st["lon"], is_t6=rid in t6_stations)
+        for hour in range(24):
+            for m in chirp_menu.channel_menu(station, hour, chirps, hearing, t6_stations, rules):
+                rows.append({
+                    "reporter_id": rid, "hour_utc": hour, "channel_key": m["channel_key"],
+                    "centre_mhz": float(m["centre_hz"]) / 1e6,
+                    "rate_khz_s": float(m["rate_hz_per_s"]) / 1e3, "period_s": m["period_s"],
+                    "chirp_ids": list(m["chirp_ids"]), "states": list(m["states"]),
+                    "timing_value": m["timing_value"],
+                    "exploration_value": m["exploration_value"], "cost": m["cost"],
+                    "shared_t6": m["shared_t6"], "expected_snr_db": m["expected_snr_db"],
+                    "path": m["path"], "rank_timing": m["rank_timing"],
+                    "rank_explore": m["rank_explore"], "built_at_utc": built_at})
+    return rows
+
+
 def _optional(tables, names, build, out):
     """Run a map builder on its own.  A failure logs one line and leaves its tables OUT of
     `tables`, so publish() skips them and the public hosts keep their last copy."""
@@ -432,8 +628,9 @@ def _optional(tables, names, build, out):
 
 
 def build_all(source, built_at, out=print):
-    """{table: rows} in TABLES order.  groups, heard and ionosphere_hourly are left out when
-    their aggregate was not read or their builder fails; the core tables always build."""
+    """{table: rows} in TABLES order.  groups, heard, ionosphere_hourly and the three chirp
+    tables are left out when their source or aggregate was not read or their builder fails;
+    the core tables always build."""
     core = {
         "transmitter_offsets": build_transmitter_offsets(
             source["solution"], source["transmitter"], built_at),
@@ -450,27 +647,54 @@ def build_all(source, built_at, out=print):
     if "agg:ionosphere" in source:
         _optional(extra, ("ionosphere_hourly",),
                   lambda: (build_ionosphere(source, built_at, out),), out)
+    if "chirp" in source:
+        _optional(extra, ("chirps",), lambda: (build_chirps(source["chirp"], built_at),), out)
+    if "chirp_reject_local" in source:
+        _optional(extra, ("chirp_reject_local",),
+                  lambda: (build_chirp_reject_local(source["chirp_reject_local"], built_at),),
+                  out)
+    if "chirp" in source and all("agg:" + n in source for n in CHIRP_AGG_QUERIES):
+        _optional(extra, ("chirp_menu",),
+                  lambda: (build_chirp_menu(source, built_at, out),), out)
     core.update(extra)
     return {t: core[t] for t in TABLES if t in core}
 
 
 def read_source(client, out=print):
-    """{solution, transmitter, receiver} rows from wd30's sigmondb, every table FINAL."""
+    """The SOURCE_COLUMNS tables from wd30's sigmondb, every table FINAL, and the aggregates
+    as "agg:<name>".  A failed aggregate, or a failed read of an OPTIONAL_SOURCES table, is
+    logged and left out; the chirp aggregates take chirp_evidence.agg_params(rules)."""
     log, out = out, {}
+    hours = {}
 
-    def run(sql):
+    def run(sql, params=None):
+        kw = {} if params is None else {"parameters": params}
         try:
-            return client.query(sql, query_tz="UTC")
+            return client.query(sql, query_tz="UTC", **kw)
         except TypeError:   # clickhouse-connect without query_tz; _unix() treats naive as UTC
-            return client.query(sql)
+            return client.query(sql, **kw)
+
+    def params_for(sql):
+        if "{hours:UInt32}" not in sql:
+            return None
+        if not hours:
+            from sigmondb.chirp import load_rules
+            hours.update(ce.agg_params(load_rules()))
+        return hours
 
     for table, cols in SOURCE_COLUMNS.items():
         sql = "SELECT %s FROM sigmondb.%s FINAL %s" % (
             ", ".join(cols), table, SOURCE_WHERE.get(table, ""))
-        out[table] = [dict(zip(cols, r)) for r in run(sql).result_rows]
-    for name, (cols, sql) in AGG_QUERIES.items():
         try:
-            out_rows = [dict(zip(cols, r)) for r in run(sql).result_rows]
+            out[table] = [dict(zip(cols, r)) for r in run(sql).result_rows]
+        except Exception as e:
+            if table not in OPTIONAL_SOURCES:
+                raise
+            log("%s: read FAILED, table(s) built from it not published this run: %s: %s" % (
+                table, type(e).__name__, e))
+    for name, (cols, sql) in list(AGG_QUERIES.items()) + list(CHIRP_AGG_QUERIES.items()):
+        try:
+            out_rows = [dict(zip(cols, r)) for r in run(sql, params_for(sql)).result_rows]
         except Exception as e:   # the map must not stop the core tables
             log("agg:%s: read FAILED, table(s) not published this run: %s: %s" % (
                 name, type(e).__name__, e))
