@@ -1,0 +1,57 @@
+rules_version = "chirp-rules-1"
+[match]            # paths.MATCH_FREQ_HZ and paths.match_rate_tol, plus period and span
+centre_tol_hz = 3000
+rate_tol_frac = 0.005
+rate_tol_min_hz_s = 500
+period_tol_frac = 0.01
+span_overlap_min = 0.5    # fraction of the narrower span, for sweeps wider than 100 kHz
+wide_span_hz = 100000
+[independence]
+co_site_km = 50           # attribution.CO_SITE_KM; reporters this close, or one coherence_group, count once
+[seen]
+drop_after_h = 48
+max_new_per_reporter_per_run = 5
+[candidate]
+min_hours = 6             # one station: heard in 6 distinct UTC hours ...
+min_dwells = 3            # ... in 3 dwells at least 1 h apart
+min_stations = 2          # or 2 independent stations within window_h
+window_h = 24
+drop_after_days = 7
+[local]
+min_neighbours = 2        # independent stations within neighbour_km that dwelled over it ...
+neighbour_km = 800
+min_covered_dwells = 6    # ... each at least this often, and never heard it
+after_h = 24
+[probing]
+min_capture_stations = 1  # chirp-recorder capture rows matching the chirp
+max_days = 28             # unsettled after this long: back to candidate (Michael, 11-19)
+[established]
+min_waveform_stations = 3 # independent stations whose sweeps agree on rate and period
+min_t6_stations = 3       # for a position by triangulation (the 11-13 finding)
+min_steady_stations = 2   # T6 stations whose arrival cluster holds steady ...
+min_steady_h = 24         # ... for this long ...
+max_cluster_mad_us = 150  # ... within this MAD
+max_pos_sigma_km = 50
+[rejected]
+min_probe_stations = 3
+min_probing_h = 72
+[dormant]
+after_h = 24
+min_covered_dwells = 6
+history_days = 14
+[retired]
+after_days = 21
+[people]
+allowed = ["michael", "rob"]
+[menu]
+top_n = 20
+near_km = 500
+history_days = 14
+snr_floor_db = 3
+snr_full_db = 23
+unknown_snr_factor = 0.25
+skywave_timing_weight = 0.3
+offset_trusted_sigma_us = 100
+shared_t6_override = true   # emergency off switch only; the rule lapses per channel by itself
+state_weight = { candidate = 1.0, probing = 0.8, established = 0.3, dormant = 0.3 }
+cost = { codar = 1.0, ionosonde = 1.0, oth = 1.0, unknown = 1.0 }
