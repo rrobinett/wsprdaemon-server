@@ -1,6 +1,7 @@
 """Evidence per chirp: pure functions over already-fetched rows.  No ClickHouse.
 Positions are made-up sites, never a real station's."""
 import dataclasses
+import re
 import os
 import random
 import sys
@@ -277,3 +278,87 @@ def test_centre_buckets_change_nothing(monkeypatch):
                         lambda self, sigs, rules: setattr(self, "n", len(sigs)))
     assert ce.gather(*args) == fast
     assert any(ev.hearers for ev in fast.values())
+
+
+# --- final review: query-wide aliases ---------------------------------------------------------
+
+def _top_level_split(text):
+    """text split on commas outside parentheses and quotes."""
+    out, depth, quote, cur = [], 0, None, []
+    for ch in text:
+        if quote:
+            quote = None if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            out.append("".join(cur))
+            cur = []
+            continue
+        cur.append(ch)
+    out.append("".join(cur))
+    return out
+
+
+def _uses(name, expr):
+    """True when expr names `name` as a bare identifier (not a function, not in quotes)."""
+    expr = re.sub(r"'[^']*'", "''", expr)
+    return re.search(r"(?<![\w.])%s(?![\w(])" % re.escape(name), expr) is not None
+
+
+def alias_shadowing(sql):
+    """[(alias, where it is used)] for each `<expr> AS <alias>` whose alias appears as a bare
+    identifier in another SELECT expression or in WHERE.  ClickHouse aliases are query-wide,
+    so such a use reads the aliased expression, not the column (an aggregate there is
+    Code 184 ILLEGAL_AGGREGATION).  GROUP BY may use an alias: it means to."""
+    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.S).strip()
+    head, tail = re.split(r"\s+FROM\s+", sql.split("SELECT", 1)[1], maxsplit=1)
+    where = ""
+    if " WHERE " in " " + tail:
+        where = re.split(r"\s+GROUP BY\s+|\s+ORDER BY\s+", tail.split("WHERE", 1)[1])[0]
+    items = []
+    for item in _top_level_split(head):
+        m = re.match(r"(?s)(.*\S)\s+AS\s+(\w+)\s*$", item.strip())
+        items.append((m.group(1), m.group(2)) if m else (item.strip(), None))
+    bad = []
+    for i, (_expr, alias) in enumerate(items):
+        if alias is None:
+            continue
+        for j, (other, _a) in enumerate(items):
+            if j != i and _uses(alias, other):
+                bad.append((alias, other))
+        if _uses(alias, where):
+            bad.append((alias, "WHERE"))
+    return bad
+
+
+def _all_agg_sql():
+    from sigmondb import publish
+    out = {"chirp_evidence." + n: sql for n, (_c, sql) in ce.AGG_SQL.items()}
+    out.update(("publish." + n, sql) for n, (_c, sql) in publish.AGG_QUERIES.items())
+    out.update(("publish." + n, sql) for n, (_c, sql) in publish.chirp_agg_queries().items())
+    return out
+
+
+def test_alias_shadowing_check_catches_the_known_faults():
+    nested = ("SELECT medianIf(span_hz, clipped = 0) AS span_hz, min(clipped) AS clipped "
+              "FROM sigmondb.sweep FINAL WHERE time > now() GROUP BY reporter_id")
+    assert alias_shadowing(nested) == [("clipped", "medianIf(span_hz, clipped = 0)")]
+    in_where = ("SELECT round(rate_hz_per_s, 0) AS rate_hz_per_s FROM sigmondb.capture FINAL "
+                "WHERE rate_hz_per_s != 0 GROUP BY rate_hz_per_s")
+    assert alias_shadowing(in_where) == [("rate_hz_per_s", "WHERE")]
+    # Self-reference and GROUP BY are fine.
+    assert alias_shadowing("SELECT round(centre_hz, -2) AS centre_hz FROM sigmondb.sweep "
+                           "WHERE 1 GROUP BY centre_hz") == []
+
+
+def test_no_alias_shadows_a_column_another_expression_uses():
+    sqls = _all_agg_sql()
+    assert {"chirp_evidence.sweep_hourly", "chirp_evidence.capture_recent",
+            "publish.heard", "publish.t6_arrival"} <= set(sqls)
+    assert {n: alias_shadowing(sql) for n, sql in sqls.items()
+            if alias_shadowing(sql)} == {}
+    assert "min(clipped) AS all_clipped" in ce.AGG_SQL["sweep_hourly"][1]

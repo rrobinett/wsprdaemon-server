@@ -31,6 +31,12 @@ from sigmondb.set_aside import not_set_aside
 # group_key and tx_id, sweep by matched_key, capture (which has no group_key) by its rate,
 # as set_aside.dry_run_queries tells CODAR from HFDL captures.  scout_dwell carries no HFDL
 # marker; a dwell says only where a scout listened.
+#
+# ClickHouse aliases are query-wide: an alias that names a column replaces that column in
+# every other expression and in WHERE.  So no alias here may appear in another SELECT
+# expression or in WHERE (min(clipped) AS clipped once nested an aggregate inside
+# medianIf(..., clipped = 0)); GROUP BY uses the aliases on purpose.  The columns tuples are
+# positional, so a row's keys never depend on an alias.
 _SINCE = "time > now() - INTERVAL {hours:UInt32} HOUR AND "
 _KEPT = not_set_aside("codar")
 _ARRIVAL_KEPT = ("NOT startsWith(group_key, 'hfdl') AND tx_id NOT LIKE 'hfdl:%' AND " + _KEPT)
@@ -43,7 +49,7 @@ AGG_SQL = {
         "round(rate_hz_per_s, 0) AS rate_hz_per_s, round(period_s, 3) AS period_s, "
         "medianIf(span_hz, clipped = 0) AS span_hz, "
         "medianIf(duration_s, clipped = 0) AS duration_s, "
-        "min(clipped) AS clipped, toStartOfHour(time) AS hour, count() AS n, "
+        "min(clipped) AS all_clipped, toStartOfHour(time) AS hour, count() AS n, "
         "median(snr_db) AS snr_med, uniqExact(time) AS n_dwells "
         "FROM sigmondb.sweep FINAL WHERE " + _SINCE +
         "NOT startsWith(matched_key, 'hfdl') AND " + _KEPT +
@@ -57,10 +63,10 @@ AGG_SQL = {
     "capture_recent": (
         ("reporter_id", "centre_hz", "rate_hz_per_s", "first_t", "last_t", "n", "n_found"),
         "/* agg:capture_recent */ SELECT reporter_id, round(centre_hz, -2) AS centre_hz, "
-        "round(rate_hz_per_s, 0) AS rate_hz_per_s, min(time) AS first_t, max(time) AS last_t, "
+        "round(rate_hz_per_s, 0) AS rate_rounded, min(time) AS first_t, max(time) AS last_t, "
         "count() AS n, countIf(n_found > 0) AS n_found "
         "FROM sigmondb.capture FINAL WHERE " + _SINCE + "rate_hz_per_s != 0 AND " + _KEPT +
-        " GROUP BY reporter_id, centre_hz, rate_hz_per_s"),
+        " GROUP BY reporter_id, centre_hz, rate_rounded"),
     "arrival_hourly": (
         ("reporter_id", "centre_hz", "rate_hz_per_s", "hour", "n", "n_t6"),
         "/* agg:arrival_hourly */ SELECT reporter_id, round(centre_hz, -2) AS centre_hz, "
