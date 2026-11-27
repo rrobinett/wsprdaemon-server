@@ -8,7 +8,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sigmondb import chirp_job, cli  # noqa: E402
-from test_sigmondb_cli import QueryClient  # noqa: E402
+from test_sigmondb_chirp_job import JobClient  # noqa: E402
 
 T0 = datetime(2026, 11, 20, 12, 0, 0)
 
@@ -30,8 +30,8 @@ def _log(at, to, frm="", actor="chirp-state", why="w", cid="cand:1", ev=None):
                 evidence=ev or {}, reporter_ids=["R1"], rules_version="rv1")
 
 
-def _run(monkeypatch, tables, *argv):
-    client = QueryClient(tables)
+def _run(monkeypatch, tables, *argv, have=None):
+    client = JobClient(tables, have=have)
     monkeypatch.setattr(cli, "connect", lambda conf: client)
     monkeypatch.setattr(cli, "_now_s", lambda: datetime(2026, 11, 21, 8, 0, 0))
     rc = cli.main(["chirp", *argv])
@@ -189,3 +189,77 @@ def test_at_not_bumped_when_now_is_later(monkeypatch):
     t = {"chirp": [_chirp()], "chirp_log": [_log(T0, "candidate", actor="rob")]}
     _, c = _run(monkeypatch, t, "pin", "--chirp", "cand:1", "--by", "rob", "--why", "x")
     assert _at(c) == NOW
+
+
+# --- final review -----------------------------------------------------------------------------
+
+def test_reject_local_with_no_period_blocks_that_reporters_sweeps(monkeypatch):
+    """Important 6: a chirp with no period counts as a 1 s sweep (group_key, gather), so a
+    hand reject stores period 1.0 and then blocks the reporter's 1 s sweeps."""
+    from sigmondb import chirp, chirp_evidence as ce
+    t = {"chirp": [_chirp(period_s=None)], "chirp_log": [_log(T0, "candidate")]}
+    rc, c = _run(monkeypatch, t, "reject-local", "--reporter", "R1", "--chirp", "cand:1",
+                 "--by", "rob", "--why", "local birdie")
+    assert rc == 0
+    rej = c.inserted[0][1]
+    assert rej["period_s"] == 1.0
+    sw = dict(reporter_id="R1", centre_hz=4.463e6, rate_hz_per_s=-25733.9, period_s=1.0,
+              span_hz=50e3, duration_s=None, clipped=0, hour=T0, n=3, snr_med=10.0, n_dwells=1)
+    ev = ce.gather([_chirp(period_s=None)], {"sweep_hourly": [sw]}, [], [], [],
+                   chirp.load_rules(), T0 + timedelta(hours=1), rejects=[rej])["cand:1"]
+    assert ev.hearers == {}
+
+
+def _rejected_tables(last_heard):
+    since = T0 + timedelta(hours=1)
+    return {"chirp": [_chirp("rejected", state_since=since, last_heard=last_heard,
+                             pin="veto", pin_by="rob", pin_why="no")],
+            "chirp_log": [_log(T0, "candidate"),
+                          _log(since, "rejected", "candidate", "rob", "no")]}
+
+
+def test_person_row_records_heard_while_rejected(monkeypatch):
+    """Important 7: the next log row a person writes on a rejected chirp heard since its
+    rejection carries heard_while_rejected=<last_heard>."""
+    heard = T0 + timedelta(hours=5)
+    rc, c = _run(monkeypatch, _rejected_tables(heard), "unpin", "--chirp", "cand:1",
+                 "--by", "rob")
+    assert rc == 0
+    assert c.inserted[0][1]["evidence"] == {"heard_while_rejected": "2026-11-20 17:00:00"}
+    # Last heard before the rejection: nothing to record.
+    rc, c = _run(monkeypatch, _rejected_tables(T0), "unpin", "--chirp", "cand:1", "--by", "rob")
+    assert rc == 0 and c.inserted[0][1]["evidence"] == {}
+
+
+def test_show_on_a_host_without_the_tables(monkeypatch, capsys):
+    """Minor 14: before chirp-state's tables exist, show says unknown chirp and exits 1."""
+    rc, c = _run(monkeypatch, {}, "show", "--chirp", "cand:1",
+                 have={"transmitter", "waveform", "receiver", "arrival", "solution"})
+    err = capsys.readouterr().err
+    assert rc == 1 and c.inserted == [] and c.commands == []
+    assert err.strip() == "chirp show: unknown chirp cand:1"
+
+
+def test_chirp_state_refuses_while_another_run_holds_the_lock(monkeypatch, tmp_path, capsys):
+    """Important 3: a second writing run prints one line, writes nothing and exits 1; a dry
+    run never takes the lock."""
+    import fcntl
+    lock = tmp_path / "chirp-state.lock"
+    monkeypatch.setattr(cli, "CHIRP_STATE_LOCK", str(lock))
+    conf = tmp_path / "c.conf"
+    conf.write_text('CLICKHOUSE_HOST="h"\nCLICKHOUSE_PORT="1"\nCLICKHOUSE_ROOT_ADMIN_USER="u"\n'
+                    'CLICKHOUSE_ROOT_ADMIN_PASSWORD="p"\n')
+    client = JobClient({})
+    monkeypatch.setattr(cli, "connect", lambda c: client)
+    monkeypatch.setattr(cli, "_now_s", lambda: T0)
+    with open(lock, "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert cli.main(["chirp-state", "--conf", str(conf)]) == 1
+        err = capsys.readouterr().err
+        assert err.count("\n") == 1 and "another run holds" in err
+        assert client.calls == [] and client.commands == [] and client.inserted == []
+        assert cli.main(["chirp-state", "--dry-run", "--out", str(tmp_path / "o"),
+                         "--conf", str(conf)]) == 0
+    capsys.readouterr()
+    assert cli.main(["chirp-state", "--conf", str(conf)]) == 0     # released: it runs
+    assert client.commands

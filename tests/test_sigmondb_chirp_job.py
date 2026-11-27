@@ -22,6 +22,12 @@ CENTRE, RATE = 4_537_000.0, -25_730.0
 GK = chirp.group_key(CENTRE, RATE, 1.0)
 
 
+@pytest.fixture(autouse=True)
+def _lock_in_tmp(monkeypatch, tmp_path):
+    """A writing chirp-state run takes cli.CHIRP_STATE_LOCK; tests keep it in tmp_path."""
+    monkeypatch.setattr(cli, "CHIRP_STATE_LOCK", str(tmp_path / "chirp-state.lock"))
+
+
 def H(k):
     """The hour start k hours before NOW."""
     return NOW - timedelta(hours=k)

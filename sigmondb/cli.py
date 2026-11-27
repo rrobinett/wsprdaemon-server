@@ -519,21 +519,52 @@ def cmd_chirp_seed(a):
     return 0
 
 
+# Two runs that write at once would each log the same moves.  /run/lock is world-writable
+# (mode 1777) on the Debian hosts, so the wsprdaemon user the unit runs as can take it; no
+# other sigmondb verb holds a lock.
+CHIRP_STATE_LOCK = "/run/lock/sigmondb-chirp-state.lock"
+
+
+def _try_lock(path):
+    """An open file holding an exclusive non-blocking flock on path, or None when another
+    process holds it.  The lock lasts until the file closes (or the process exits)."""
+    import fcntl
+    fh = open(path, "a")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return None
+    return fh
+
+
 def cmd_chirp_state(a):
     """Move every chirp on the fleet's evidence (chirp_job).  The log rows go in first, the
     chirp rows last.  --dry-run writes every row set as JSON Lines into --out and leaves the
-    database alone, even on a host whose chirp tables do not exist yet.  Prints counts only,
-    never a coordinate."""
+    database alone, even on a host whose chirp tables do not exist yet.  A run that writes
+    holds CHIRP_STATE_LOCK; while another holds it, the run prints one line, writes nothing
+    and exits 1.  Prints counts only, never a coordinate."""
     from sigmondb import chirp, chirp_job
-    client = connect(a.conf)
+    lock = None
     if not a.dry_run:
-        ddl.ensure_schema(client)
-    res = chirp_job.run(client, chirp.load_rules(), _now_s())
-    if a.dry_run:
-        chirp_job.write_files(_out_dir(a.out), res)
-    else:
-        chirp_job.write(client, res)
-    return 0
+        lock = _try_lock(CHIRP_STATE_LOCK)
+        if lock is None:
+            print("chirp-state: another run holds %s; nothing written" % CHIRP_STATE_LOCK,
+                  file=sys.stderr)
+            return 1
+    try:
+        client = connect(a.conf)
+        if not a.dry_run:
+            ddl.ensure_schema(client)
+        res = chirp_job.run(client, chirp.load_rules(), _now_s())
+        if a.dry_run:
+            chirp_job.write_files(_out_dir(a.out), res)
+        else:
+            chirp_job.write(client, res)
+        return 0
+    finally:
+        if lock is not None:
+            lock.close()
 
 
 def cmd_publish(a):
@@ -664,18 +695,22 @@ def _after(t, *prior):
 
 
 def _chirp_current(client, cid):
-    """(chirp row, its log rows, current state), or None for an unknown chirp."""
+    """(chirp row, its log rows, current state, when it entered that state), or None for an
+    unknown chirp, as on a host whose chirp tables do not exist yet."""
     from sigmondb import chirp_job
+    have = chirp_job._tables(client)
+    if "chirp" not in have:
+        return None
     rows = [r for r in _fetch(client, "chirp", _CHIRP_COLS, _CHIRP_WHERE, {"cid": cid})
             if r["chirp_id"] == cid]
     if not rows:
         return None
     row = max(rows, key=lambda r: r["updated_at"])
-    logs = [r for r in _fetch(client, "chirp_log", ddl.COLUMNS["chirp_log"],
-                              _CHIRP_WHERE + " ORDER BY at", {"cid": cid})
-            if r["chirp_id"] == cid]
+    logs = ([r for r in _fetch(client, "chirp_log", ddl.COLUMNS["chirp_log"],
+                               _CHIRP_WHERE + " ORDER BY at", {"cid": cid})
+             if r["chirp_id"] == cid] if "chirp_log" in have else [])
     cur = chirp_job.current_states(logs).get(cid)
-    return row, logs, (cur[0] if cur else row["state"])
+    return row, logs, (cur[0] if cur else row["state"]), (cur[1] if cur else row["state_since"])
 
 
 def cmd_chirp(a):
@@ -698,7 +733,7 @@ def cmd_chirp(a):
     if found is None:
         print("chirp %s: unknown chirp %s" % (a.action, a.chirp), file=sys.stderr)
         return 1
-    row, logs, state = found
+    row, logs, state, state_since = found
     if a.action == "show":
         print("chirp %s" % a.chirp)
         print(_fmt_chirp(row))
@@ -717,7 +752,9 @@ def cmd_chirp(a):
         last = max(cur, key=lambda r: r["set_at"]) if cur else None
         if a.action == "reject-local":
             out = dict(reporter_id=a.reporter, centre_hz=row["centre_hz"],
-                       rate_hz_per_s=row["rate_hz_per_s"], period_s=row["period_s"] or 0.0,
+                       rate_hz_per_s=row["rate_hz_per_s"],
+                       # No period counts as a 1 s sweep, as group_key and gather's match do.
+                       period_s=1.0 if row["period_s"] is None else row["period_s"],
                        span_hz=row["span_hz"], chirp_id=a.chirp, reason=a.why, set_by=a.by,
                        set_at=_after(now, *(r["set_at"] for r in cur)), active=1)
         else:
@@ -736,8 +773,14 @@ def cmd_chirp(a):
     target, pin = {"pin": ("established", "pin"), "veto": ("rejected", "veto"),
                    "unpin": (state, "")}[a.action]
     why = a.why or ("unpin" if a.action == "unpin" else "")
+    evidence = {}
+    heard = row.get("last_heard")
+    if state == "rejected" and heard is not None and state_since is not None \
+            and heard > state_since:
+        # The job never moves a rejected chirp; a person's next row records that it was heard.
+        evidence["heard_while_rejected"] = heard.isoformat(sep=" ")
     log = dict(at=at, chirp_id=a.chirp, from_state=state, to_state=target, actor=a.by, why=why,
-               evidence={}, reporter_ids=list(row.get("reporter_ids") or []),
+               evidence=evidence, reporter_ids=list(row.get("reporter_ids") or []),
                rules_version=rules.rules_version)
     new = dict(row, state=target, pin=pin, pin_by=a.by if pin else "",
                pin_why=why if pin else "", rules_version=rules.rules_version, updated_at=at)
