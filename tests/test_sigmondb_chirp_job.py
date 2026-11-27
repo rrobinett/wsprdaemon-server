@@ -727,3 +727,36 @@ def test_one_chirps_fault_skips_that_chirp_alone(monkeypatch):
     assert res.errors == 1 and res.moves == {"seen->candidate": 1}
     assert "chirp-state: A: RuntimeError; skipped" in res.lines
     assert not any("boom" in ln for ln in res.lines)
+
+
+def test_end_to_end_shared_signature_uncovered_band_and_jittered_founding():
+    """Minor 12, through run(): two established chirps share one signature and both take
+    S1's sweep; an established chirp on a band no scout dwells over stays established though
+    unheard for days; whole sweeps jittered 1.5 kHz apart found one chirp, while clipped
+    sweeps 10 kHz off found none."""
+    est = NOW - timedelta(days=9)
+    tables = {"chirp": [chirp_row("P", state="established", tx_id="SITE-P"),
+                        chirp_row("Q", state="established", tx_id="SITE-Q"),
+                        chirp_row("U", state="established", tx_id="SITE-U",
+                                  centre=9_000_000.0)],
+              "chirp_log": [log_row(c, "established", est) for c in ("P", "Q", "U")],
+              "receiver": list(RX)}
+    jitter = [6_000_000.0, 6_001_500.0, 6_003_000.0]
+    aggs = {"sweep_hourly": [sweep("S1", H(1))]
+            + [sweep("S3", H(k + 1), centre=f) for k, f in enumerate(jitter)]
+            + [sweep("S3", H(k), centre=6_010_000.0, clipped=1) for k in (1, 2, 3)],
+            "dwell_hourly": [dict(reporter_id="S2", centre_hz=CENTRE, span_hz=200_000.0,
+                                  hour=H(k), n=2) for k in range(2, 12)],
+            "arrival_hourly": [dict(reporter_id="S2", centre_hz=9_000_000.0,
+                                    rate_hz_per_s=RATE, hour=H(80), n=4, n_t6=0)]}
+    res = run(JobClient(tables, aggs))
+    founded = [r for r in res.log_rows if r["to_state"] == "seen"]
+    assert len(founded) == 1 and res.founded == 1
+    assert [r["to_state"] for r in res.log_rows] == ["seen"]          # nothing else moves
+    by = {r["chirp_id"]: r for r in res.chirp_rows}
+    new = by[founded[0]["chirp_id"]]
+    assert new["centre_hz"] == 6_001_500.0 and new["state"] == "seen"
+    assert not any(abs(r["centre_hz"] - 6_010_000.0) < 1 for r in res.chirp_rows)
+    assert by["P"]["reporter_ids"] == by["Q"]["reporter_ids"] == ["S1"]
+    assert "U" not in by or by["U"]["state"] == "established"
+    assert res.states == {"seen": 1, "established": 3}
