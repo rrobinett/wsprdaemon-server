@@ -212,3 +212,36 @@ def test_station_drift_reporter_rule_applies(tmp_path):
 def test_station_drift_row_carries_sender():
     t = chirp_row("station_drift", DRIFT, received_at=RA, fallback_reporter="AC0G/B2")
     assert t[list(ddl.COLUMN_TYPES["station_drift"]).index("sender")] == "AC0G/B2"
+
+
+SWEEP = dict(
+    time="2026-11-10T17:46:58.461Z", reporter_id="AC0G/B4", view="wide", centre_hz=8.9e6,
+    span_hz=3000.0, rate_hz_per_s=-125.5, period_s=10.0, duration_s=None, snr_db=14.5,
+    n_sweeps=3, fit_score=0.97, clipped=True, matched_key="", bin_hz=11.7, frame_s=0.08,
+    detector_version="v1", schema_version=1, engineering={"n_streaks": 4})
+DWELL = dict(
+    time="2026-11-10T17:46:00Z", reporter_id="", view="wide", centre_hz=8.9e6, span_hz=3000.0,
+    bin_hz=11.7, frame_s=0.08, duration_s=60.0, n_frames=750, noise_db=None, n_streaks=2,
+    detector_version="v1", schema_version=1, engineering={})
+
+
+def test_sweep_row_round_trip():
+    t = chirp_row("sweep", SWEEP, received_at=RA, fallback_reporter="AC0G/B4")
+    i = lambda c: idx(c, "sweep")
+    assert len(t) == len(ddl.COLUMNS["sweep"])
+    assert t[i("received_at")] == RA and t[i("clipped")] == 1 and t[i("view")] == "wide"
+    assert t[i("time")] == datetime(2026, 11, 10, 17, 46, 58, 461000)
+    assert t[i("rate_hz_per_s")] == -125.5 and t[i("duration_s")] is None
+    assert t[i("n_sweeps")] == 3 and t[i("engineering")] == {"n_streaks": "4"}
+
+
+def test_sweep_rejects_bad_rate():
+    with pytest.raises(ValueError):
+        chirp_row("sweep", dict(SWEEP, rate_hz_per_s="fast"), received_at=RA,
+                  fallback_reporter="AC0G/B4")
+
+
+def test_dwell_empty_reporter_files_under_sender():
+    t = chirp_row("scout_dwell", DWELL, received_at=RA, fallback_reporter="AC0G/B4")
+    assert t[idx("reporter_id", "scout_dwell")] == "AC0G/B4"
+    assert len(t) == len(ddl.COLUMNS["scout_dwell"])

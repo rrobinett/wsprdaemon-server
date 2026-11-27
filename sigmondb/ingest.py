@@ -17,7 +17,7 @@ from sigmondb.rows import DATETIME_KEYS
 
 log = logging.getLogger(__name__)
 
-CHIRP_TABLES = ("arrival", "capture", "station_drift")
+CHIRP_TABLES = ("arrival", "capture", "station_drift", "sweep", "scout_dwell")
 
 
 def _naive_utc(v):
@@ -106,6 +106,9 @@ def chirp_row(table, row, *, received_at, fallback_reporter, warned=None):
             if c == "engineering":
                 v = ({str(k): "" if x is None else str(x) for k, x in v.items()}
                      if isinstance(v, dict) else {})
+            elif c == "clipped":
+                # The scout writes a JSON boolean; the column is UInt8.
+                v = int(v) if isinstance(v, bool) else v
             elif c == "expected":
                 v = ({str(k): float(x) for k, x in v.items()} if isinstance(v, dict) else {})
             elif c in DATETIME_KEYS and v is not None:

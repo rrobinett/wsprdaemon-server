@@ -23,6 +23,8 @@ from sigmondb.ingest import insert_sql  # noqa: E402
 MTIME = 1794340800
 A = "chirp/AC0G=B4_EM38ww/AC0G_B4/arrival.jsonl"
 C = "chirp/AC0G=B4_EM38ww/AC0G_B4/capture.jsonl"
+SW = "chirp/AC0G=B4_EM38ww/AC0G_B4/sweep.jsonl"
+DW = "chirp/AC0G=B4_EM38ww/AC0G_B4/scout_dwell.jsonl"
 SPOT_PATH = "wspr/spots/AC0G=ND_EN16ov/KA9Q_DXE/20/260518_1230_spots.txt"
 SPOT_LINE = (
     b'260518 1230 5 -12 0.3 14.097150 K1ABC FN42 33 0 '
@@ -123,3 +125,33 @@ def test_insert_chirp_rows_per_table_and_false_on_error():
 def test_gate_defaults_off():
     assert ws.DEFAULT_CONFIG['ingest_chirp'] is False
     assert ws.DEFAULT_CONFIG['chirp_subdir'] == 'chirp'
+
+
+SWEEP = dict(
+    time="2026-11-10T17:46:58Z", reporter_id="AC0G/B4", view="wide", centre_hz=8.9e6,
+    span_hz=3000.0, rate_hz_per_s=-125.5, period_s=10.0, duration_s=None, snr_db=14.5,
+    n_sweeps=3, fit_score=0.97, clipped=0, matched_key="", bin_hz=11.7, frame_s=0.08,
+    detector_version="v1", schema_version=1, engineering={})
+DWELL = dict(
+    time="2026-11-10T17:46:00Z", reporter_id="", view="wide", centre_hz=8.9e6, span_hz=3000.0,
+    bin_hz=11.7, frame_s=0.08, duration_s=60.0, n_frames=750, noise_db=None, n_streaks=2,
+    detector_version="v1", schema_version=1, engineering={})
+
+
+def test_scout_files_ingest_beside_arrivals(tmp_path):
+    r = ws.extract_and_parse_tbz(
+        _tar(tmp_path, {A: _jsonl([ARR]), SW: _jsonl([SWEEP]), DW: _jsonl([DWELL])}),
+        tmp_path / "x", None, None, "chirp")
+    rows = r[5]
+    assert {"arrival", "sweep", "scout_dwell"} <= set(rows)
+    want = datetime.utcfromtimestamp(MTIME)
+    for t in ("arrival", "sweep", "scout_dwell"):
+        assert len(rows[t]) == 1 and rows[t][0][idx("received_at", t)] == want
+    assert rows["scout_dwell"][0][idx("reporter_id", "scout_dwell")] == "AC0G/B4"
+
+
+def test_bad_sweep_never_costs_spots(tmp_path):
+    r = ws.extract_and_parse_tbz(
+        _tar(tmp_path, {SPOT_PATH: SPOT_LINE, A: _jsonl([ARR]), SW: b"\x00garbage\n"}),
+        tmp_path / "x", None, None, "chirp")
+    assert len(r[1]) == 1 and len(r[5]["arrival"]) == 1 and r[5].get("sweep", []) == []

@@ -161,7 +161,11 @@ sudo systemctl edit wsprdaemon_server@wsprdaemon   # Environment=WSPRDAEMON_INGE
 
 The `chirp/` peer subdir (HFDL squitter arrivals and captures, in
 `chirp/<RX_SITE>/<RECEIVER>/{arrival,capture}.jsonl`) feeds `sigmondb.arrival`
-and `sigmondb.capture` the same way.  Off by default:
+and `sigmondb.capture` the same way.  The station scout adds two more files in
+the same directory, `sweep.jsonl` (one row per streak) and `scout_dwell.jsonl`
+(one row per dwell), which feed `sigmondb.sweep` and `sigmondb.scout_dwell`.
+The scout's rows carry no timing fields.  Their `time` places a dwell for
+bookkeeping only and never feeds an offset.  Off by default:
 
 ```bash
 sudo systemctl edit wsprdaemon_server@wsprdaemon   # Environment=WSPRDAEMON_INGEST_CHIRP=1
