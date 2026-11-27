@@ -7,7 +7,7 @@ transmitters (an online list's site with neither) stay weak priors and get no ro
 from datetime import datetime, timedelta, timezone
 
 from sigmondb import chirp
-from sigmondb.attribution import NAMED_STATUSES
+from sigmondb.attribution import row_names
 
 SOLUTION_MAX_AGE = timedelta(days=30)
 
@@ -34,15 +34,16 @@ def seed_with_counts(transmitters, waveforms, solutions, attributions, existing_
     """(chirp rows, chirp_log rows, counts); counts hold seeded, skipped_existing,
     skipped_no_waveform and skipped_listed_only.  HFDL transmitters count nowhere."""
     txs = _latest(transmitters, lambda r: (r.get("valid_from") or datetime.min, r.get("version") or 0))
-    wfs = _latest(waveforms, lambda r: r.get("valid_from") or datetime.min)
+    # Ties on valid_from (one tx may hold several centre_hz) break on the larger centre_hz.
+    wfs = _latest(waveforms, lambda r: (r.get("valid_from") or datetime.min, r.get("centre_hz") or 0.0))
     sols = _latest([s for s in solutions
                     if s.get("offset_ns") is not None and s.get("window_to") is not None
                     and now - s["window_to"] <= SOLUTION_MAX_AGE],
                    lambda r: r["window_to"])
     names = {}
     for a in attributions:
-        if (a.get("status") in NAMED_STATUSES and a.get("mode_policy") == "default"
-                and a.get("tx_id") and not str(a["tx_id"]).startswith("cand:")):
+        if (row_names(a, now) and a.get("tx_id")
+                and not str(a["tx_id"]).startswith("cand:")):
             names.setdefault(a["tx_id"], a)
     counts = dict(seeded=0, skipped_existing=0, skipped_no_waveform=0, skipped_listed_only=0)
     rows, logs = [], []
@@ -70,7 +71,7 @@ def seed_with_counts(transmitters, waveforms, solutions, attributions, existing_
             rate_hz_per_s=w["rate_hz_per_s"], period_s=period, duration_s=w.get("duration_s"),
             gate_period_s=w.get("gate_period_s"),
             lat=t.get("lat"), lon=t.get("lon"), pos_sigma_m=t.get("pos_sigma_m"),
-            pos_source="listed",
+            pos_source="listed" if t.get("lat") is not None and t.get("lon") is not None else "",
             offset_ns=s["offset_ns"] if s else None, offset_sigma_ns=s.get("offset_sigma_ns") if s else None,
             first_heard=now, last_heard=None, reporter_ids=[], n_stations=0, heard_hours=0,
             tx_id=tx_id, prior_ids=[], suggested_name="", pin="", pin_by="", pin_why="",

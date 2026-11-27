@@ -490,7 +490,11 @@ def cmd_chirp_seed(a):
     client = connect(a.conf)
     if not a.out:
         ddl.ensure_schema(client)
-    existing = {r["chirp_id"] for r in _fetch(client, "chirp", ["chirp_id"])}
+    # On the --out path the table may not exist yet, and nothing here creates it.
+    have = client.query("SELECT name FROM system.tables WHERE database = {db:String} "
+                        "AND name = 'chirp'", parameters={"db": ddl.DATABASE}).result_rows
+    existing = ({r["chirp_id"] for r in _fetch(client, "chirp", ["chirp_id"])} if have
+                else set())
     tx = _fetch(client, "transmitter", ddl.COLUMNS["transmitter"])
     wf = _fetch(client, "waveform", ddl.COLUMNS["waveform"])
     sols = _fetch(client, "solution", ["tx_id", "solve_id", "offset_ns", "offset_sigma_ns", "window_to"])

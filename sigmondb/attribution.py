@@ -739,6 +739,19 @@ def _period_gap(a, b, period):
     return d
 
 
+def null_passed(r):
+    pn = r.get("p_null")
+    return pn is not None and pn <= P_NULL_MAX       # NaN fails the comparison too
+
+
+def row_names(r, now, max_age_h=ATTRIB_MAX_AGE_H):
+    """True when attribution row r may name a transmitter: default policy, a NAMED status, a
+    passed null test, and a run_at within max_age_h of now (naive UTC)."""
+    t = _naive_utc(r.get("run_at"))
+    return (r.get("mode_policy") == "default" and r.get("status") in NAMED_STATUSES
+            and null_passed(r) and t is not None and t >= now - timedelta(hours=max_age_h))
+
+
 def apply_attribution(clusters, attributions, match_tol_ns=50_000, now=None,
                       max_age_h=ATTRIB_MAX_AGE_H):
     """Attach names from sigmondb.attribution rows to groundwave.fixed_clusters, in place.
@@ -754,19 +767,7 @@ def apply_attribution(clusters, attributions, match_tol_ns=50_000, now=None,
     unnamed.  A cluster the station already named differently stays as it is.
     Returns {cluster_key: reason} for each matched cluster left unnamed."""
     now = _naive_utc(now) or datetime.now(timezone.utc).replace(tzinfo=None)
-    oldest = now - timedelta(hours=max_age_h)
-
-    def fresh(r):
-        t = _naive_utc(r.get("run_at"))
-        return t is not None and t >= oldest
-
-    def null_passed(r):
-        pn = r.get("p_null")
-        return pn is not None and pn <= P_NULL_MAX       # NaN fails the comparison too
-
-    rows = [r for r in attributions
-            if r.get("mode_policy") == "default" and r.get("status") in NAMED_STATUSES
-            and null_passed(r) and fresh(r)]
+    rows = [r for r in attributions if row_names(r, now, max_age_h)]
     reasons = {}
     for c in clusters:
         if len(c["reporter_ids"]) != 1:
