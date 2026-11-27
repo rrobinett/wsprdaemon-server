@@ -1,5 +1,5 @@
 """python -m sigmondb: ddl, seed, backfill-codar, backfill-hfdl, load, attribute, receiver-positions, solve,
-chirp-seed, chirp-state, chirp, publish, set-aside.
+chirp-seed, chirp-state, chirp, menu, publish, set-aside.
 
 Credentials come from /etc/wsprdaemon/clickhouse.conf (--conf overrides the path in tests).
 No verb takes a password.  publish reads the public servers' credentials from the
@@ -749,6 +749,78 @@ def cmd_chirp(a):
     return 0
 
 
+def _grid6(text):
+    """argparse type: a 6-character Maidenhead square."""
+    from sigmondb.receivers import grid_to_latlon
+    g = text.strip()
+    try:
+        if len(g) != 6:
+            raise ValueError(g)
+        grid_to_latlon(g)
+    except (ValueError, IndexError):
+        raise argparse.ArgumentTypeError("want a 6-character grid square, got %r" % text)
+    return g[:2].upper() + g[2:4] + g[4:].lower()
+
+
+def _utc_hour(text):
+    """argparse type: a UTC hour, 0-23."""
+    try:
+        h = int(text)
+    except ValueError:
+        h = -1
+    if not 0 <= h <= 23:
+        raise argparse.ArgumentTypeError("want a UTC hour 0-23, got %r" % text)
+    return h
+
+
+def _fmt_menu_row(r, rank):
+    snr = "-" if r["expected_snr_db"] is None else "%.1f" % r["expected_snr_db"]
+    return ("  %2d  %-26s  timing=%.4f  explore=%.4f  snr=%s  path=%s  shared_t6=%d  "
+            "cost=%g  %s" % (rank, r["channel_key"], r["timing_value"], r["exploration_value"],
+                             snr, r["path"] or "-", r["shared_t6"], r["cost"],
+                             " ".join("%s(%s)" % cs for cs in zip(r["chirp_ids"], r["states"]))))
+
+
+def cmd_menu(a):
+    """Print a grid square's two rankings for one UTC hour, for review.  Reads the database
+    as chirp-state does (chirp_job.read_inputs); state comes from the log.  T6 stations: the
+    reporters with T6 arrivals in the last chirp_menu.T6_RECENT_DAYS days.  Writes nothing and
+    prints no station coordinate."""
+    from sigmondb import chirp, chirp_job, chirp_menu
+    from sigmondb.receivers import grid_to_latlon
+    rules = chirp.load_rules()
+    now = _now_s()
+    inp = chirp_job.read_inputs(connect(a.conf), rules)
+    states = chirp_job.current_states(inp["log"], rules.people.allowed)
+    chirps = []
+    for c in _latest([dict(c, valid_from=c.get("updated_at")) for c in inp["chirp"]],
+                     "chirp_id"):
+        st = states.get(c["chirp_id"])
+        chirps.append(dict(c, state=st[0] if st else c["state"]))
+    recent = now - timedelta(days=chirp_menu.T6_RECENT_DAYS)
+    t6 = [r for r in inp["t6"] if r["time"] >= recent]
+    rx = _latest(inp["receivers"], "reporter_id")
+    positions = {r["reporter_id"]: (r["lat"], r["lon"]) for r in rx
+                 if r.get("lat") is not None and r.get("lon") is not None}
+    coherence = {r["reporter_id"]: r.get("coherence_group") or "" for r in rx}
+    hearing = chirp_menu.prepare_hearing(
+        chirps, inp["aggs"].get("sweep_hourly") or [], rules, now, positions=positions,
+        coherence=coherence, captures=inp["aggs"].get("capture_recent") or [],
+        t6_arrivals=t6)
+    lat, lon = grid_to_latlon(a.grid)
+    rows = chirp_menu.channel_menu(dict(reporter_id=None, lat=lat, lon=lon, is_t6=a.t6),
+                                   a.hour, chirps, hearing, {r["reporter_id"] for r in t6},
+                                   rules)
+    print("menu %s %02dZ%s  rules %s" % (a.grid, a.hour, "  (T6 station)" if a.t6 else "",
+                                         rules.rules_version))
+    for name, rank in (("timing", "rank_timing"), ("exploration", "rank_explore")):
+        placed = sorted((r for r in rows if r[rank]), key=lambda r: r[rank])
+        print("%s (%d):" % (name, len(placed)))
+        for r in placed:
+            print(_fmt_menu_row(r, r[rank]))
+    return 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="python -m sigmondb")
     sub = p.add_subparsers(dest="verb", required=True)
@@ -828,6 +900,14 @@ def build_parser():
     s.add_argument("--out", metavar="DIR", help="with --dry-run: the directory for the rows")
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_chirp_state)
+    s = sub.add_parser("menu",
+                       help="print a grid square's channel menu for one UTC hour: the timing "
+                            "and the exploration rankings, apart")
+    s.add_argument("--grid", required=True, type=_grid6, help="the station's grid6 square")
+    s.add_argument("--hour", required=True, type=_utc_hour, help="UTC hour, 0-23")
+    s.add_argument("--t6", action="store_true", help="score as a T6 station")
+    s.add_argument("--conf", default=DEFAULT_CONF)
+    s.set_defaults(fn=cmd_menu)
     s = sub.add_parser("publish",
                        help="build sigmondb_public and replace each table whole on every "
                             "host in CH_PUB_HOSTS")
