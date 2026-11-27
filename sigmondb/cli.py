@@ -1,5 +1,5 @@
 """python -m sigmondb: ddl, seed, backfill-codar, backfill-hfdl, load, attribute, receiver-positions, solve,
-chirp-seed, chirp-state, publish, set-aside.
+chirp-seed, chirp-state, chirp, publish, set-aside.
 
 Credentials come from /etc/wsprdaemon/clickhouse.conf (--conf overrides the path in tests).
 No verb takes a password.  publish reads the public servers' credentials from the
@@ -9,7 +9,7 @@ EnvironmentFile= sets.  clickhouse_connect is imported only where a verb needs i
 import argparse
 import re
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from sigmondb import ddl
@@ -631,6 +631,124 @@ def cmd_set_aside(a):
     return 0
 
 
+# --- chirp: pins, vetoes and local rejects by hand ---------------------------------------------
+
+_CHIRP_COLS = ddl.COLUMNS["chirp"]
+_CHIRP_WHERE = "WHERE chirp_id = {cid:String}"
+
+
+def _chirp_unnamed(row):
+    tx = row.get("tx_id") or ""
+    return not tx or tx.startswith("cand:")
+
+
+def _fmt_chirp(row):
+    """The chirp row as text.  An unnamed chirp shows its 4-character grid square, never lat/lon."""
+    from sigmondb.publish import latlon_to_grid6
+    out = []
+    for c in _CHIRP_COLS:
+        v = row.get(c)
+        if c in ("lat", "lon") and _chirp_unnamed(row):
+            continue
+        out.append("%s=%s" % (c, v.isoformat(sep=" ") if isinstance(v, datetime) else v))
+    if _chirp_unnamed(row) and row.get("lat") is not None and row.get("lon") is not None:
+        out.append("grid4=%s" % latlon_to_grid6(row["lat"], row["lon"])[:4].upper())
+    return "\n".join("  " + x for x in out)
+
+
+def _after(t, *prior):
+    """t, moved one second past the latest of `prior` when it does not follow them, so a
+    person's row never ties with the row it answers."""
+    last = max((p for p in prior if p is not None), default=None)
+    return last + timedelta(seconds=1) if last is not None and t <= last else t
+
+
+def _chirp_current(client, cid):
+    """(chirp row, its log rows, current state), or None for an unknown chirp."""
+    from sigmondb import chirp_job
+    rows = [r for r in _fetch(client, "chirp", _CHIRP_COLS, _CHIRP_WHERE, {"cid": cid})
+            if r["chirp_id"] == cid]
+    if not rows:
+        return None
+    row = max(rows, key=lambda r: r["updated_at"])
+    logs = [r for r in _fetch(client, "chirp_log", ddl.COLUMNS["chirp_log"],
+                              _CHIRP_WHERE + " ORDER BY at", {"cid": cid})
+            if r["chirp_id"] == cid]
+    cur = chirp_job.current_states(logs).get(cid)
+    return row, logs, (cur[0] if cur else row["state"])
+
+
+def cmd_chirp(a):
+    """pin, veto, unpin, reject-local, withdraw-local and show.  Each action by a person on the
+    rules' list records who and why; nothing is deleted."""
+    from sigmondb import chirp, chirp_job
+    rules = chirp.load_rules()
+    if a.action != "show":
+        if a.by not in rules.people.allowed:
+            print("chirp %s: --by %r is not in the rules' list of people" % (a.action, a.by),
+                  file=sys.stderr)
+            return 2
+        if a.action in ("reject-local", "withdraw-local") and not a.reporter.strip():
+            print("chirp %s: --reporter must not be empty" % a.action, file=sys.stderr)
+            return 2
+    client = connect(a.conf)
+    if a.action != "show":
+        ddl.ensure_schema(client)
+    found = _chirp_current(client, a.chirp)
+    if found is None:
+        print("chirp %s: unknown chirp %s" % (a.action, a.chirp), file=sys.stderr)
+        return 1
+    row, logs, state = found
+    if a.action == "show":
+        print("chirp %s" % a.chirp)
+        print(_fmt_chirp(row))
+        for r in sorted(logs, key=lambda r: r["at"]):
+            ev = " ".join("%s=%s" % kv for kv in sorted((r.get("evidence") or {}).items()))
+            print("%s  %s -> %s  %s  %s  %s" % (
+                r["at"].isoformat(sep=" "), r.get("from_state") or "", r["to_state"],
+                r["actor"], r.get("why") or "", ev))
+        return 0
+    now = _now_s()
+    if a.action in ("reject-local", "withdraw-local"):
+        cur = [r for r in _fetch(client, "chirp_reject_local", ddl.COLUMNS["chirp_reject_local"],
+                                 "WHERE reporter_id = {rid:String} AND chirp_id = {cid:String}",
+                                 {"rid": a.reporter, "cid": a.chirp})
+               if r["reporter_id"] == a.reporter and r["chirp_id"] == a.chirp]
+        last = max(cur, key=lambda r: r["set_at"]) if cur else None
+        if a.action == "reject-local":
+            out = dict(reporter_id=a.reporter, centre_hz=row["centre_hz"],
+                       rate_hz_per_s=row["rate_hz_per_s"], period_s=row["period_s"] or 0.0,
+                       span_hz=row["span_hz"], chirp_id=a.chirp, reason=a.why, set_by=a.by,
+                       set_at=_after(now, *(r["set_at"] for r in cur)), active=1)
+        else:
+            if last is None or not last["active"]:
+                print("chirp withdraw-local: %s has no active local reject for %s"
+                      % (a.reporter, a.chirp), file=sys.stderr)
+                return 1
+            out = dict(last, set_by=a.by, set_at=_after(now, last["set_at"]), active=0)
+        insert_rows(client, "chirp_reject_local", [out])
+        print("%s: %s %s by %s" % (a.action, a.reporter, a.chirp, a.by))
+        return 0
+    people = rules.people.allowed
+    latest = chirp_job.latest_log_rows(logs, people).get(a.chirp)
+    at = _after(now, row["updated_at"],
+                latest["at"] if latest and latest["actor"] in people else None)
+    target, pin = {"pin": ("established", "pin"), "veto": ("rejected", "veto"),
+                   "unpin": (state, "")}[a.action]
+    why = a.why or ("unpin" if a.action == "unpin" else "")
+    log = dict(at=at, chirp_id=a.chirp, from_state=state, to_state=target, actor=a.by, why=why,
+               evidence={}, reporter_ids=list(row.get("reporter_ids") or []),
+               rules_version=rules.rules_version)
+    new = dict(row, state=target, pin=pin, pin_by=a.by if pin else "",
+               pin_why=why if pin else "", rules_version=rules.rules_version, updated_at=at)
+    if target != row["state"]:
+        new["state_since"] = at
+    insert_rows(client, "chirp_log", [log])
+    insert_rows(client, "chirp", [new])
+    print("%s: %s %s -> %s by %s" % (a.action, a.chirp, state, target, a.by))
+    return 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="python -m sigmondb")
     sub = p.add_subparsers(dest="verb", required=True)
@@ -741,6 +859,27 @@ def build_parser():
     x.add_argument("--by", help="who withdraws it (default: $SUDO_USER, else the login name)")
     x.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_set_aside)
+    s = sub.add_parser("chirp",
+                       help="pin, veto or unpin a chirp, reject or un-reject one locally, or "
+                            "show its history; each records who and why, nothing is deleted")
+    csub = s.add_subparsers(dest="action", required=True)
+    for name, hlp in (("pin", "hold the chirp established"), ("veto", "hold the chirp rejected"),
+                      ("unpin", "clear the pin; the job resumes next run"),
+                      ("reject-local", "one reporter refuses the chirp"),
+                      ("withdraw-local", "withdraw that refusal"),
+                      ("show", "the chirp row and its whole log")):
+        x = csub.add_parser(name, help=hlp)
+        x.add_argument("--chirp", required=True, help="chirp_id")
+        if name != "show":
+            x.add_argument("--by", required=True, help="a name from the rules' list of people")
+        if name in ("pin", "veto", "reject-local"):
+            x.add_argument("--why", required=True)
+        if name == "unpin":
+            x.add_argument("--why", default="")
+        if name in ("reject-local", "withdraw-local"):
+            x.add_argument("--reporter", required=True)
+        x.add_argument("--conf", default=DEFAULT_CONF)
+    s.set_defaults(fn=cmd_chirp)
     return p
 
 
