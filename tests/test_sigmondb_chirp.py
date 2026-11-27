@@ -166,3 +166,57 @@ def test_new_chirp_id_stable():
     assert a == chirp.new_chirp_id(list(reversed(cluster)), day)
     assert a.startswith("cand:20261119-") and len(a) == len("cand:20261119-") + 6
     assert a != chirp.new_chirp_id(cluster, date(2026, 11, 20))
+
+
+def _cluster_every_pair(sweeps, rules):
+    """cluster_sweeps as it was before the centre index: every pair tested."""
+    ordered = sorted(sweeps, key=chirp._order_key)
+    sigs = [chirp._sig(s) for s in ordered]
+    parent = list(range(len(ordered)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(ordered)):
+        for j in range(i + 1, len(ordered)):
+            if matches(sigs[i], sigs[j], rules):
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[max(ri, rj)] = min(ri, rj)
+    groups = {}
+    for i, s in enumerate(ordered):
+        groups.setdefault(find(i), []).append(s)
+    return [groups[k] for k in sorted(groups)]
+
+
+def test_founding_clusters_index_equals_full_scan():
+    """The centre index changes nothing: random sweeps near and across bucket edges, some
+    wide (span overlap), some with no span, mixed rates and periods, some clipped."""
+    r = load_rules()
+    tol = r.match.centre_tol_hz
+    rng = random.Random(23)
+    for trial in range(40):
+        rows = []
+        for k in range(rng.randrange(1, 120)):
+            span = rng.choice([None, 20e3, 25e3, r.match.wide_span_hz * rng.uniform(0.5, 40)])
+            rows.append(dict(
+                id=k, reporter_id="R%d" % rng.randrange(6),
+                centre_hz=rng.choice([4.5e6, 5e6, 16e6]) + rng.uniform(-6, 6) * tol,
+                rate_hz_per_s=rng.choice([-25730.0, -25000.0, 25730.0, 0.0, 100_000.0]),
+                period_s=rng.choice([1.0, 0.5, 1.02]), span_hz=span, duration_s=None,
+                clipped=rng.randrange(2)))
+        whole = [s for s in rows if not s["clipped"]]
+        assert chirp.founding_clusters(rows, r) == _cluster_every_pair(whole, r), trial
+        assert cluster_sweeps(rows, r) == _cluster_every_pair(rows, r), trial
+
+
+def test_centre_index_tests_only_nearby_rows():
+    r = load_rules()
+    sigs = [sig(4.5e6), sig(9e6), sig(4.5e6 + r.match.centre_tol_hz / 2),
+            sig(16e6, span=r.match.wide_span_hz * 10), sig(float("nan"))]
+    ix = chirp.CentreIndex(sigs, r)
+    assert ix.candidates(sig(4.5e6)) == [0, 2, 3, 4]
+    assert ix.candidates(sig(float("nan"))) == [0, 1, 2, 3, 4]

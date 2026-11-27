@@ -6,6 +6,7 @@ frozen dataclasses and decides whether two sweeps belong to one transmitter.
 import dataclasses
 import hashlib
 import json
+import math
 import statistics
 import tomllib
 import types
@@ -260,13 +261,47 @@ def _order_key(sweep: dict):
             json.dumps(sweep, sort_keys=True, default=str))
 
 
+class CentreIndex:
+    """Signature indices bucketed by centre, so a signature tests only those that can match it.
+
+    A narrow signature matches only within match.centre_tol_hz of another's centre, so it sits
+    in a bucket near it (two either side: float rounding at a bucket edge never hides a
+    match).  A signature whose span exceeds match.wide_span_hz may match a far centre by span
+    overlap, so those sit in a list every query tests, as does one whose centre is not a
+    finite number.  candidates() returns indices in input order, so a caller's results match
+    a scan of every signature."""
+
+    def __init__(self, sigs, rules):
+        self.width = max(float(rules.match.centre_tol_hz), 1.0)
+        self.wide_hz = rules.match.wide_span_hz
+        self.n = len(sigs)
+        self.buckets, self.wide = {}, []
+        for i, sg in enumerate(sigs):
+            if (sg.span_hz is not None and sg.span_hz > self.wide_hz) \
+                    or not math.isfinite(sg.centre_hz):
+                self.wide.append(i)
+            else:
+                self.buckets.setdefault(math.floor(sg.centre_hz / self.width), []).append(i)
+
+    def candidates(self, sig):
+        if not math.isfinite(sig.centre_hz):
+            return list(range(self.n))
+        k = math.floor(sig.centre_hz / self.width)
+        out = list(self.wide)
+        for b in range(k - 2, k + 3):
+            out.extend(self.buckets.get(b, ()))
+        return sorted(out)
+
+
 def cluster_sweeps(sweeps: list, rules: Rules) -> list:
     """Single-linkage clusters of sweep dicts under ``matches``.  Input is
     sorted by (centre_hz, rate_hz_per_s, period_s) and then a total tie-break (see _order_key); clusters come out ordered
-    by their first member, members in that sorted order."""
+    by their first member, members in that sorted order.  Each sweep tests only the sweeps
+    CentreIndex says can match it, which gives the same clusters as testing every pair."""
     ordered = sorted(sweeps, key=_order_key)
     sigs = [_sig(s) for s in ordered]
     parent = list(range(len(ordered)))
+    index = CentreIndex(sigs, rules)
 
     def find(i):
         while parent[i] != i:
@@ -275,8 +310,8 @@ def cluster_sweeps(sweeps: list, rules: Rules) -> list:
         return i
 
     for i in range(len(ordered)):
-        for j in range(i + 1, len(ordered)):
-            if matches(sigs[i], sigs[j], rules):
+        for j in index.candidates(sigs[i]):
+            if j > i and matches(sigs[i], sigs[j], rules):
                 ri, rj = find(i), find(j)
                 if ri != rj:
                     parent[max(ri, rj)] = min(ri, rj)

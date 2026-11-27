@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from sigmondb import attribution
-from sigmondb.chirp import Signature, matches, median_signature
+from sigmondb.chirp import CentreIndex, Signature, matches, median_signature
 from sigmondb.set_aside import not_set_aside
 
 # --- the aggregates ---------------------------------------------------------------------------
@@ -162,31 +162,8 @@ def _active_rejects(rejects):
     return out
 
 
-class _ByCentre:
-    """Row indices bucketed by centre, so a chirp tests only rows that can match it.
-
-    A narrow row matches only within match.centre_tol_hz of the chirp's centre, so it sits
-    in a bucket near the chirp's (two either side: float rounding at a bucket edge never
-    hides a match).  A row whose span exceeds match.wide_span_hz may match a far centre by
-    span overlap, so those rows sit in a list every chirp tests.  candidates() returns
-    indices in input order, so results match a scan of every row."""
-
-    def __init__(self, sigs, rules):
-        self.width = max(float(rules.match.centre_tol_hz), 1.0)
-        self.wide_hz = rules.match.wide_span_hz
-        self.buckets, self.wide = {}, []
-        for i, sg in enumerate(sigs):
-            if sg.span_hz is not None and sg.span_hz > self.wide_hz:
-                self.wide.append(i)
-            else:
-                self.buckets.setdefault(math.floor(sg.centre_hz / self.width), []).append(i)
-
-    def candidates(self, sig):
-        k = math.floor(sig.centre_hz / self.width)
-        out = list(self.wide)
-        for b in range(k - 2, k + 3):
-            out.extend(self.buckets.get(b, ()))
-        return sorted(out)
+# Row indices bucketed by centre, so a chirp tests only rows that can match it (chirp.py).
+_ByCentre = CentreIndex
 
 
 def _steady_hours(rows, P, max_mad_us):
