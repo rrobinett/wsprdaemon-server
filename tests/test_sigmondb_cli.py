@@ -700,3 +700,18 @@ def test_cli_receiver_positions_refuses_a_readable_file(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="mode"):
         cli.main(["receiver-positions", "--file", str(f)])
     assert c.inserted == []
+
+
+def test_attribution_inputs_admit_discovered(monkeypatch):
+    disc = valid_row("transmitter", tx_id="cand:20261127-abcdef", kind="unknown", lat=38.5,
+                     lon=-123.0, pos_source="located", valid_from=_VF, version=1,
+                     source="discovered", status="established")
+    disc_wf = valid_row("waveform", tx_id="cand:20261127-abcdef", valid_from=_VF,
+                        centre_hz=5.2e6, rate_hz_per_s=-25_733.913, period_s=1.0,
+                        source="measured")
+    c = _db(monkeypatch, {"arrival": KFS_LIVE_ROWS[:2], "transmitter": TX + [disc],
+                          "waveform": WF + [disc_wf], "receiver": RX_ROWS})
+    _, sites, _, _ = cli._attribution_inputs(c, 30.0)
+    assert "cand:20261127-abcdef" in {s["id"] for s in sites}
+    tx_sql = next(k["sql"] for k in c.calls if " FROM sigmondb.transmitter " in k["sql"])
+    assert "kind = 'codar' OR source = 'discovered'" in tx_sql

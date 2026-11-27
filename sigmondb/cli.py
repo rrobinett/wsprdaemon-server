@@ -1,5 +1,5 @@
 """python -m sigmondb: ddl, seed, backfill-codar, backfill-hfdl, load, attribute, receiver-positions, solve,
-publish, set-aside.
+chirp-seed, chirp-state, publish, set-aside.
 
 Credentials come from /etc/wsprdaemon/clickhouse.conf (--conf overrides the path in tests).
 No verb takes a password.  publish reads the public servers' credentials from the
@@ -303,7 +303,8 @@ def _attribution_inputs(client, days):
     'all' set-aside window; the latest detector per capture;
     live when engineering carries sweep_repetition_hz; counted at their radiod; codar-sounder
     rows before 0.8.0 half a sweep earlier, exactly as _from_db (half_sweep.py).
-    sites: the latest codar transmitter row per tx_id with a position, one site per waveform
+    sites: the latest codar or discovered (chirp-state) transmitter row per tx_id with a
+    position, one site per waveform
     (latest per centre); a transmitter with no waveform drops out.  Sorted by tx_id, so ties
     break the same way every run.
     rxpos: reporter_id -> (lat, lon, pos_source) from the latest receiver row with a position;
@@ -315,7 +316,7 @@ def _attribution_inputs(client, days):
         if eng.get("sweep_repetition_hz"):
             r["sweep_repetition_hz"] = eng["sweep_repetition_hz"]
     tx = _latest(_fetch(client, "transmitter", ddl.COLUMNS["transmitter"],
-                        "WHERE kind = 'codar' ORDER BY tx_id"), "tx_id")
+                        "WHERE kind = 'codar' OR source = 'discovered' ORDER BY tx_id"), "tx_id")
     wf = _fetch(client, "waveform", ddl.COLUMNS["waveform"], "ORDER BY tx_id")
     # The latest row per (tx_id, centre) among rows WITH a period; a centre with none keeps its
     # latest row, period None: analyse_group skips it for the period yet keeps it as a rival.
@@ -513,6 +514,23 @@ def cmd_chirp_seed(a):
     return 0
 
 
+def cmd_chirp_state(a):
+    """Move every chirp on the fleet's evidence (chirp_job).  The log rows go in first, the
+    chirp rows last.  --dry-run writes every row set as JSON Lines into --out and leaves the
+    database alone, even on a host whose chirp tables do not exist yet.  Prints counts only,
+    never a coordinate."""
+    from sigmondb import chirp, chirp_job
+    client = connect(a.conf)
+    if not a.dry_run:
+        ddl.ensure_schema(client)
+    res = chirp_job.run(client, chirp.load_rules(), _now_s())
+    if a.dry_run:
+        chirp_job.write_files(_out_dir(a.out), res)
+    else:
+        chirp_job.write(client, res)
+    return 0
+
+
 def cmd_publish(a):
     """Build sigmondb_public from this host's sigmondb and replace it on every public host.
     Exit 1 when any host+table failed, 2 when the environment lacks credentials."""
@@ -683,6 +701,14 @@ def build_parser():
                         "JSON Lines; leave the database alone")
     s.add_argument("--conf", default=DEFAULT_CONF)
     s.set_defaults(fn=cmd_chirp_seed)
+    s = sub.add_parser("chirp-state",
+                       help="move each chirp through its lifecycle on fleet evidence; write "
+                            "chirp_log first, then chirp rows")
+    s.add_argument("--dry-run", action="store_true",
+                   help="write every row set as JSON Lines into --out; leave the database alone")
+    s.add_argument("--out", metavar="DIR", help="with --dry-run: the directory for the rows")
+    s.add_argument("--conf", default=DEFAULT_CONF)
+    s.set_defaults(fn=cmd_chirp_state)
     s = sub.add_parser("publish",
                        help="build sigmondb_public and replace each table whole on every "
                             "host in CH_PUB_HOSTS")
@@ -728,6 +754,8 @@ def main(argv=None):
         if a.attributions and a.from_db:
             p.error("solve: --attributions works only with --arrivals; "
                     "--from-db reads sigmondb.attribution")
+    if a.verb == "chirp-state" and a.dry_run != bool(a.out):
+        p.error("chirp-state: --dry-run and --out go together")
     return a.fn(a)
 
 
