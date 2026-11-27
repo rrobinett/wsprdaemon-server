@@ -74,8 +74,6 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-from sigmondb import chirp_evidence as ce
-from sigmondb.cli import _ATTR_ARRIVAL_COLS, _ATTR_WHERE
 from sigmondb.groundwave import _latest, great_circle_m
 from sigmondb.half_sweep import period_and_sweep
 from sigmondb.paths import gc_midpoint, match_group, path_kind
@@ -171,7 +169,7 @@ SOURCE_WHERE = {"solution": "WHERE offset_ns IS NOT NULL AND tx_id != '' AND "
                 "chirp": "WHERE state IN ('candidate', 'probing', 'established', 'dormant') "
                          "AND kind != 'hfdl' AND NOT startsWith(group_key, 'hfdl') "
                          "AND tx_id NOT LIKE 'hfdl:%'",
-                "chirp_reject_local": "WHERE active = 1"}
+                "chirp_reject_local": "WHERE active = 1 AND chirp_id NOT LIKE 'hfdl:%'"}
 
 # Aggregates read_source runs on wd30: name -> (columns, SQL).  HFDL stays out of every one,
 # and so does every arrival inside an active 'codar' or 'all' set-aside window.
@@ -205,16 +203,25 @@ AGG_QUERIES = {
 
 # The channel menu's aggregates, read in the same loop with chirp_evidence.agg_params(rules)
 # as their {hours:UInt32}: the sweep and capture aggregates the chirp-state job reads, and the
-# T6 arrivals it reads (cli._ATTR_WHERE), HFDL kept out.
-CHIRP_AGG_QUERIES = {
-    "sweep_hourly": ce.AGG_SQL["sweep_hourly"],
-    "capture_recent": ce.AGG_SQL["capture_recent"],
-    "t6_arrival": (
-        _ATTR_ARRIVAL_COLS,
-        "/* agg:t6_arrival */ SELECT %s FROM sigmondb.arrival FINAL %s AND "
-        "NOT startsWith(group_key, 'hfdl') AND tx_id NOT LIKE 'hfdl:%%'"
-        % (", ".join(_ATTR_ARRIVAL_COLS), _ATTR_WHERE)),
-}
+# T6 arrivals it reads (cli._ATTR_WHERE), HFDL kept out.  Built by chirp_agg_queries(), which
+# imports the chirp modules only when called: a fault there can cost the chirp tables, never
+# the core ones.
+CHIRP_AGG_NAMES = ("sweep_hourly", "capture_recent", "t6_arrival")
+
+
+def chirp_agg_queries():
+    """{name: (columns, SQL)} for CHIRP_AGG_NAMES."""
+    from sigmondb import chirp_evidence as ce
+    from sigmondb.cli import _ATTR_ARRIVAL_COLS, _ATTR_WHERE
+    return {
+        "sweep_hourly": ce.AGG_SQL["sweep_hourly"],
+        "capture_recent": ce.AGG_SQL["capture_recent"],
+        "t6_arrival": (
+            _ATTR_ARRIVAL_COLS,
+            "/* agg:t6_arrival */ SELECT %s FROM sigmondb.arrival FINAL %s AND "
+            "NOT startsWith(group_key, 'hfdl') AND tx_id NOT LIKE 'hfdl:%%'"
+            % (", ".join(_ATTR_ARRIVAL_COLS), _ATTR_WHERE)),
+    }
 
 
 # --- conversions ----------------------------------------------------------------------------
@@ -258,8 +265,15 @@ def latlon_to_grid4(lat, lon):
 
 
 def named(tx_id):
-    """A chirp or transmitter is named when its tx_id exists and does not start "cand:"."""
+    """A chirp or transmitter is named when its tx_id exists and does not start "cand:".
+    The one definition: an unnamed chirp's position leaves wd30 only as its grid4 centre."""
     return bool(tx_id) and not str(tx_id).startswith("cand:")
+
+
+def is_hfdl_chirp(c):
+    """An HFDL chirp row, by kind, group_key or tx_id.  The one definition."""
+    return (c.get("kind") == "hfdl" or str(c.get("group_key") or "").startswith("hfdl")
+            or str(c.get("tx_id") or "").startswith("hfdl:"))
 
 
 def grid4_position(lat, lon, pos_sigma_m):
@@ -518,11 +532,6 @@ def build_ionosphere(source, built_at, out=print):
 CHIRP_PUBLISHED_STATES = ("established", "dormant")
 
 
-def _hfdl_chirp(c):
-    return (c.get("kind") == "hfdl" or str(c.get("group_key") or "").startswith("hfdl")
-            or str(c.get("tx_id") or "").startswith("hfdl:"))
-
-
 def _scaled(v, k):
     return None if v is None else float(v) / k
 
@@ -531,7 +540,7 @@ def build_chirps(chirps, built_at):
     """chirps rows: established and dormant chirps, never HFDL, by chirp_id."""
     out = []
     for c in sorted(chirps or (), key=lambda c: c["chirp_id"]):
-        if c.get("state") not in CHIRP_PUBLISHED_STATES or _hfdl_chirp(c):
+        if c.get("state") not in CHIRP_PUBLISHED_STATES or is_hfdl_chirp(c):
             continue
         kind = c.get("kind") or ""
         cls, family = class_family(kind, "")
@@ -567,7 +576,7 @@ def build_chirp_reject_local(rejects, built_at):
     """chirp_reject_local rows: the active rejects; who set one is not published."""
     out = []
     for r in rejects or ():
-        if not r.get("active", 1):
+        if not r.get("active", 1) or str(r.get("chirp_id") or "").startswith("hfdl:"):
             continue
         out.append({"reporter_id": r["reporter_id"],
                     "centre_mhz": float(r["centre_hz"]) / 1e6,
@@ -653,7 +662,7 @@ def build_all(source, built_at, out=print):
         _optional(extra, ("chirp_reject_local",),
                   lambda: (build_chirp_reject_local(source["chirp_reject_local"], built_at),),
                   out)
-    if "chirp" in source and all("agg:" + n in source for n in CHIRP_AGG_QUERIES):
+    if "chirp" in source and all("agg:" + n in source for n in CHIRP_AGG_NAMES):
         _optional(extra, ("chirp_menu",),
                   lambda: (build_chirp_menu(source, built_at, out),), out)
     core.update(extra)
@@ -679,7 +688,8 @@ def read_source(client, out=print):
             return None
         if not hours:
             from sigmondb.chirp import load_rules
-            hours.update(ce.agg_params(load_rules()))
+            from sigmondb.chirp_evidence import agg_params
+            hours.update(agg_params(load_rules()))
         return hours
 
     for table, cols in SOURCE_COLUMNS.items():
@@ -692,7 +702,13 @@ def read_source(client, out=print):
                 raise
             log("%s: read FAILED, table(s) built from it not published this run: %s: %s" % (
                 table, type(e).__name__, e))
-    for name, (cols, sql) in list(AGG_QUERIES.items()) + list(CHIRP_AGG_QUERIES.items()):
+    try:
+        chirp_aggs = list(chirp_agg_queries().items())
+    except Exception as e:   # the chirp modules must not stop the core tables
+        log("agg:%s: queries FAILED to build, chirp_menu not published this run: %s: %s" % (
+            "/".join(CHIRP_AGG_NAMES), type(e).__name__, e))
+        chirp_aggs = []
+    for name, (cols, sql) in list(AGG_QUERIES.items()) + chirp_aggs:
         try:
             out_rows = [dict(zip(cols, r)) for r in run(sql, params_for(sql)).result_rows]
         except Exception as e:   # the map must not stop the core tables

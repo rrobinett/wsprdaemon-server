@@ -41,7 +41,7 @@ class FakeSource:
         self.params.append(parameters)
         m = re.match(r"\s*/\* agg:(\w+) \*/", sql)
         if m:
-            cols = dict(publish.AGG_QUERIES, **publish.CHIRP_AGG_QUERIES)[m.group(1)][0]
+            cols = dict(publish.AGG_QUERIES, **publish.chirp_agg_queries())[m.group(1)][0]
             return _Result([tuple(r.get(c) for c in cols)
                             for r in self.tables.get("agg:" + m.group(1), [])])
         m = re.match(r"\s*SELECT (.+?) FROM sigmondb\.(\w+) FINAL", sql)
@@ -844,13 +844,16 @@ def test_reject_local_active_only():
                period_s=1.0, span_hz=25_730.0, chirp_id="c1", reason="local QRM",
                set_by="someone", set_at=datetime(2026, 11, 10))
     src = _chirp_src(rejects=[dict(rej, active=1),
-                              dict(rej, reporter_id="K0ABC", active=0)])
+                              dict(rej, reporter_id="K0ABC", active=0),
+                              dict(rej, reporter_id="N0DEF", chirp_id="hfdl:13", active=1)])
     rows = _built(src)["chirp_reject_local"]
     assert rows == [dict(reporter_id="W1XYZ", centre_mhz=pytest.approx(4.4505),
                          rate_khz_s=pytest.approx(-25.73), period_s=1.0,
                          span_khz=pytest.approx(25.73), chirp_id="c1", reason="local QRM",
                          built_at_utc=BUILT)]
     assert "set_by" not in {c for c, _ in publish.SCHEMAS["chirp_reject_local"]}
+    sql = [q for q in src.sql if "FROM sigmondb.chirp_reject_local FINAL" in q][0]
+    assert "active = 1" in sql and "chirp_id NOT LIKE 'hfdl:%'" in sql
 
 
 GRID = "FN20kk"   # a made-up site: tests use grid centres only
@@ -862,7 +865,14 @@ def _menu_rows(rows, rid):
                   key=lambda r: (r["hour_utc"], r["channel_key"]))
 
 
-def test_menu_from_grid_centre_only():
+def test_menu_from_grid_centre_only(monkeypatch):
+    from sigmondb import chirp_menu
+    seen, real = [], chirp_menu.channel_menu
+
+    def spy(station, *a, **k):
+        seen.append((station["lat"], station["lon"]))
+        return real(station, *a, **k)
+    monkeypatch.setattr(chirp_menu, "channel_menu", spy)
     lat, lon = grid_to_latlon(GRID)
     off = lon + 3.0 / (111.32 * math.cos(math.radians(lat)))   # 3 km east, same grid6
     assert publish.latlon_to_grid6(lat, off) == GRID
@@ -876,16 +886,21 @@ def test_menu_from_grid_centre_only():
     stored = _built(_chirp_src(chirps, receivers=[_rx("W1XYZ", lat=lat, lon=off)],
                                **{"agg:sweep_hourly": sweep}))["chirp_menu"]
     assert at_centre and _menu_rows(at_centre, "W1XYZ") == _menu_rows(stored, "W1XYZ")
+    assert len(seen) == 48 and set(seen) == {(lat, lon)}   # the grid6 centre, both runs
     assert {r["hour_utc"] for r in at_centre} == set(range(24))
     assert set(at_centre[0]) == {c for c, _ in publish.SCHEMAS["chirp_menu"]}
 
 
 def test_no_station_coordinate_published():
+    """chirps.lat, lon and pos_sigma_m place the transmitter; chirp_menu.path names only
+    ground range or skywave.  No other column may carry a position, distance or bearing."""
+    allowed = {("chirps", "lat"), ("chirps", "lon"), ("chirps", "pos_sigma_m"),
+               ("chirp_menu", "path")}
+    pat = re.compile(r"lat|lon|dist|range|km|bearing", re.I)
     for t in CHIRP_TABLES:
         assert t in publish.TABLES
-        cols = {c for c, _ in publish.SCHEMAS[t]}
-        bad = cols & {"lat", "lon", "distance_km"}
-        assert bad == ({"lat", "lon"} if t == "chirps" else set()), t
+        hits = {(t, c) for c, _ in publish.SCHEMAS[t] if pat.search(c)}
+        assert hits <= allowed, hits
 
 
 def test_chirp_tables_optional(monkeypatch):
@@ -926,7 +941,7 @@ def test_chirp_aggregates_take_the_rules_hours():
     publish.read_source(src, out=lambda s: None)
     want = __import__("sigmondb.chirp_evidence", fromlist=["x"]).agg_params(
         chirp_rules.load_rules())
-    for name in publish.CHIRP_AGG_QUERIES:
+    for name in publish.CHIRP_AGG_NAMES:
         sql = [s for s in src.sql if s.startswith("/* agg:%s */" % name)]
         assert sql and "{hours:UInt32}" in sql[0]
     assert src.params[[i for i, s in enumerate(src.sql)
@@ -991,5 +1006,56 @@ def test_chirp_queries_keep_hfdl_out():
     assert _built(src)["chirps"] == []
     chirp_sql = [s for s in src.sql if "FROM sigmondb.chirp FINAL" in s][0]
     assert "kind != 'hfdl'" in chirp_sql and "'hfdl:%'" in chirp_sql
-    t6 = publish.CHIRP_AGG_QUERIES["t6_arrival"][1]
+    t6 = publish.chirp_agg_queries()["t6_arrival"][1]
     assert "startsWith(group_key, 'hfdl')" in t6 and "origin = 't6_anchor'" in t6
+
+
+def test_core_tables_build_when_the_chirp_modules_fail_to_import(monkeypatch):
+    for mod in ("sigmondb.chirp_evidence", "sigmondb.chirp_menu", "sigmondb.chirp_job"):
+        monkeypatch.setitem(sys.modules, mod, None)   # any import of it raises ImportError
+    logs = []
+    source = publish.read_source(_core_src(), out=logs.append)
+    t = publish.build_all(source, _utc(2026, 11, 12, 1).timestamp(), out=logs.append)
+    assert set(CORE) <= set(t) and len(t["transmitter_offsets"]) == 1
+    assert "chirp_menu" not in t
+    assert not any("agg:" + n in source for n in publish.CHIRP_AGG_NAMES)
+    assert any("ModuleNotFoundError" in s for s in logs), logs
+
+
+def test_a_raising_reject_builder_leaves_only_that_table_out(monkeypatch):
+    def boom(*a, **k):
+        raise ValueError("odd reject")
+    source = publish.read_source(_core_src(), out=lambda s: None)
+    monkeypatch.setattr(publish, "build_chirp_reject_local", boom)
+    logs = []
+    t = publish.build_all(source, BUILT, out=logs.append)
+    assert set(t) == (set(CORE) | {"groups", "heard", "ionosphere_hourly"} | CHIRP) - {
+        "chirp_reject_local"}
+    assert any("chirp_reject_local" in s and "ValueError: odd reject" in s for s in logs)
+
+
+def test_a_failing_t6_read_drops_only_the_menu():
+    logs = []
+    source = publish.read_source(_core_src(_AggFails, ("t6_arrival",)), out=logs.append)
+    t = publish.build_all(source, BUILT, out=logs.append)
+    assert set(t) == (set(CORE) | {"groups", "heard", "ionosphere_hourly"} | CHIRP) - {
+        "chirp_menu"}
+    assert len(logs) == 1 and "agg:t6_arrival" in logs[0]
+
+
+def test_publish_imports_without_the_chirp_modules_or_cli():
+    """publish must import, and read and build its core tables, with the chirp modules and
+    cli unimportable: they load only inside the chirp paths."""
+    import subprocess
+    code = ("import sys\n"
+            "for m in ('sigmondb.cli', 'sigmondb.chirp', 'sigmondb.chirp_evidence',\n"
+            "          'sigmondb.chirp_menu', 'sigmondb.chirp_job'):\n"
+            "    sys.modules[m] = None\n"
+            "from sigmondb import publish\n"
+            "print(sorted(publish.build_all({'solution': [], 'transmitter': [],\n"
+            "                                'receiver': []}, 1.0, out=lambda s: None)))\n")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    res = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True,
+                         text=True, timeout=60)
+    assert res.returncode == 0, res.stderr
+    assert "transmitter_offsets" in res.stdout

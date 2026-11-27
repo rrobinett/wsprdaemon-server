@@ -29,7 +29,7 @@ from sigmondb import chirp_evidence as ce
 from sigmondb.attribution import gc_km
 from sigmondb.chirp import matches
 from sigmondb.paths import path_kind
-from sigmondb.publish import latlon_to_grid4, latlon_to_grid6
+from sigmondb.publish import is_hfdl_chirp, latlon_to_grid4, latlon_to_grid6, named
 from sigmondb.receivers import grid_to_latlon
 
 LIVE_STATES = ("candidate", "probing", "established", "dormant")
@@ -57,23 +57,13 @@ def grid6_centre(lat, lon):
     return grid_to_latlon(latlon_to_grid6(lat, lon))
 
 
-def _named(c):
-    tx = c.get("tx_id") or ""
-    return bool(tx) and not tx.startswith("cand:")
-
-
 def chirp_position(c):
     """The position a score may use: the stored one when named, else its grid4 centre."""
     if c.get("lat") is None or c.get("lon") is None:
         return None
-    if _named(c):
+    if named(c.get("tx_id")):
         return (c["lat"], c["lon"])
     return grid_to_latlon(latlon_to_grid4(c["lat"], c["lon"]))
-
-
-def _hfdl(c):
-    return (c.get("kind") == "hfdl" or str(c.get("group_key") or "").startswith("hfdl")
-            or str(c.get("tx_id") or "").startswith("hfdl:"))
 
 
 class Hearing:
@@ -326,7 +316,7 @@ def channel_menu(station: dict, hour_utc: int, chirps, hearing: Hearing, t6_stat
 
     groups = {}
     for c in chirps:
-        if c.get("state") in LIVE_STATES and not _hfdl(c):
+        if c.get("state") in LIVE_STATES and not is_hfdl_chirp(c):
             groups.setdefault(c["group_key"], []).append(c)
     rows = []
     for key, members in groups.items():         # input order: the rankings' keys decide

@@ -638,8 +638,8 @@ _CHIRP_WHERE = "WHERE chirp_id = {cid:String}"
 
 
 def _chirp_unnamed(row):
-    tx = row.get("tx_id") or ""
-    return not tx or tx.startswith("cand:")
+    from sigmondb.publish import named
+    return not named(row.get("tx_id"))
 
 
 def _fmt_chirp(row):
