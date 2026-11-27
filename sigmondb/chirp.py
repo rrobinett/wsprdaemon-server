@@ -6,9 +6,11 @@ frozen dataclasses and decides whether two sweeps belong to one transmitter.
 import dataclasses
 import hashlib
 import json
+import statistics
 import tomllib
 import types
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -281,3 +283,35 @@ def cluster_sweeps(sweeps: list, rules: Rules) -> list:
     for i, s in enumerate(ordered):
         groups.setdefault(find(i), []).append(s)
     return [groups[k] for k in sorted(groups)]
+
+
+def founding_clusters(unmatched: list, rules: Rules) -> list:
+    """Clusters of whole sweeps only.  A clipped sweep (clipped = 1 or True;
+    absent means not clipped) never founds a chirp."""
+    whole = [s for s in unmatched if not s.get("clipped")]
+    return cluster_sweeps(whole, rules)
+
+
+def _median_known(values: list) -> Optional[float]:
+    known = [v for v in values if v is not None]
+    return statistics.median(known) if known else None
+
+
+def median_signature(cluster: list) -> Signature:
+    """Per-field medians over a cluster.  span_hz and duration_s take the
+    median of the members that carry them, or None when none does."""
+    return Signature(
+        statistics.median(_need(s, "centre_hz") for s in cluster),
+        statistics.median(_need(s, "rate_hz_per_s") for s in cluster),
+        statistics.median(_need(s, "period_s") for s in cluster),
+        _median_known([s.get("span_hz") for s in cluster]),
+        _median_known([s.get("duration_s") for s in cluster]))
+
+
+def new_chirp_id(cluster: list, day: date) -> str:
+    """A candidate's name: the day plus six hex characters of the median
+    signature's group key, so a rerun on the same day names the same chirp
+    whatever the member order."""
+    m = median_signature(cluster)
+    key = group_key(m.centre_hz, m.rate_hz_per_s, m.period_s, m.duration_s)
+    return "cand:" + day.strftime("%Y%m%d") + "-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:6]

@@ -130,3 +130,39 @@ def test_cluster_sweeps_ties_are_order_independent():
 def test_cluster_sweeps_missing_key_names_it():
     with pytest.raises(ValueError, match="rate_hz_per_s"):
         cluster_sweeps([{"centre_hz": 1.0, "period_s": 1.0}], load_rules())
+
+
+def test_clipped_sweep_never_founds():
+    rules = load_rules()
+    assert chirp.founding_clusters([sweep(4.463e6, clipped=1)], rules) == []
+    assert chirp.founding_clusters([sweep(4.463e6, clipped=True), sweep(4.463e6, clipped=1)], rules) == []
+    kept = chirp.founding_clusters([sweep(4.463e6, clipped=1), sweep(4.463e6, clipped=0),
+                                    sweep(4.463e6)], rules)
+    assert len(kept) == 1 and len(kept[0]) == 2
+
+
+def test_jittered_centres_make_one_cluster():
+    rules = load_rules()
+    sweeps = [sweep(c) for c in (4.4630e6, 4.4645e6, 4.4655e6, 4.4670e6, 4.4685e6)]
+    clusters = chirp.founding_clusters(sweeps, rules)
+    assert len(clusters) == 1 and len(clusters[0]) == 5
+
+
+def test_median_signature_per_field():
+    cluster = [sweep(4.463e6, span_hz=None), sweep(4.465e6, span_hz=10.0, duration_s=0.5),
+               sweep(4.470e6, span_hz=30.0, duration_s=None)]
+    m = chirp.median_signature(cluster)
+    assert (m.centre_hz, m.span_hz, m.duration_s) == (4.465e6, 20.0, 0.5)
+    none = chirp.median_signature([sweep(4.463e6)])
+    assert none.span_hz is None and none.duration_s is None
+
+
+def test_new_chirp_id_stable():
+    from datetime import date
+    cluster = [sweep(c) for c in (4.4630e6, 4.4645e6, 4.4655e6)]
+    day = date(2026, 11, 19)
+    a = chirp.new_chirp_id(cluster, day)
+    assert a == chirp.new_chirp_id(cluster, day)
+    assert a == chirp.new_chirp_id(list(reversed(cluster)), day)
+    assert a.startswith("cand:20261119-") and len(a) == len("cand:20261119-") + 6
+    assert a != chirp.new_chirp_id(cluster, date(2026, 11, 20))
