@@ -136,8 +136,9 @@ def mad_us(xs):
     return 1.4826 * statistics.median(abs(x - m) for x in xs) * 1e3
 
 
-def clusters_of(rows, P):
-    """Gap clustering of delays (ms, mod P).  rows: (t, d_ms, level).  Returns (clusters, captures)."""
+def clusters_of(rows, P, members=False):
+    """Gap clustering of delays (ms, mod P).  rows: (t, d_ms, level).  Returns (clusters, captures).
+    members=True also gives each cluster its rows, under "rows"."""
     caps = len({t for t, _, _ in rows})
     if not rows:
         return [], 0
@@ -167,6 +168,8 @@ def clusters_of(rows, P):
         out.append({"D": med, "n": len(g), "caps": ncap, "mad_us": mad_us(xs),
                     "p10_90_us": (xs[int(0.9 * (len(xs) - 1))] - xs[int(0.1 * (len(xs) - 1))]) * 1e3,
                     "level": statistics.median(p[2] for p in g), "flags": []})
+        if members:
+            out[-1]["rows"] = list(g)
     return out, caps
 
 
@@ -253,16 +256,17 @@ def candidates_for(centre, rate, sites):
     return same_sign or exact, len(exact) - len(same_sign)
 
 
-def site_map(rows_by_group, rxpos, coherence):
+def site_map(rows_by_group, rxpos, coherence, co_site_km=None):
     """Each reporter's site representative, chosen once across every group.
 
     rows_by_group: group key -> {reporter: rows}.  Reporters that share a non-empty coherence
-    group, or stand within CO_SITE_KM of each other, form one site.  The site counts as the
+    group, or stand within co_site_km (default CO_SITE_KM) of each other, form one site.  The site counts as the
     member ranked highest by (has a position, position from its GPSDO, captures summed over all
     groups, name).  A GPSDO position keeps ground-wave reach.  One choice for all groups keeps
     flag_images, which pairs clusters across groups by reporter, comparing like with like.
     Returns {reporter: representative}."""
     coherence = coherence or {}
+    radius = CO_SITE_KM if co_site_km is None else co_site_km
     caps = {}
     for rows_by_st in rows_by_group.values():
         for st, rows in rows_by_st.items():
@@ -281,7 +285,7 @@ def site_map(rows_by_group, rxpos, coherence):
             ca, cb = coherence.get(a, ""), coherence.get(b, "")
             same = bool(ca) and ca == cb
             if not same and a in rxpos and b in rxpos:
-                same = gc_km(rxpos[a][:2], rxpos[b][:2]) <= CO_SITE_KM
+                same = gc_km(rxpos[a][:2], rxpos[b][:2]) <= radius
             if same:
                 parent[find(b)] = find(a)
     members = {}
